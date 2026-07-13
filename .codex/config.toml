@@ -1,2 +1,3 @@
 [mcp_servers.hyprland_background_computer_use]
-command = "./contrib/hyprland-background-computer-use/bin/same-session-computer-use-mcp"
+command = "bash"
+args = ["-lc", 'root="$(git rev-parse --show-toplevel)" && exec "$root/contrib/hyprland-background-computer-use/bin/same-session-computer-use-mcp"']

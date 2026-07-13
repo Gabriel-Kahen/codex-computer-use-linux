@@ -39,6 +39,22 @@ brew install --cask codex
 
 Then simply run `codex` to get started.
 
+### Experimental Linux Computer Use fork
+
+This fork includes an experimental Hyprland integration that lets Codex inspect and operate windows in your existing desktop session. The integration is packaged as a Codex plugin under `contrib/hyprland-background-computer-use/`; it is not a general Linux backend and has been tested against Hyprland 0.55.4.
+
+Install the bundled Computer Use plugin first. It supplies the accessibility and global-input tools. Then add this repository as a marketplace and install the Hyprland companion:
+
+```shell
+codex plugin add computer-use@openai-bundled
+codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
+  --sparse .agents/plugins \
+  --sparse contrib/hyprland-background-computer-use
+codex plugin add same-session-computer-use@codex-computer-use-linux
+```
+
+Start a new Codex task after installation so the new tools and skill are loaded. See the [Hyprland integration README](./contrib/hyprland-background-computer-use/README.md) for system requirements, updates, removal, and the safety boundary.
+
 <details>
 <summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
 

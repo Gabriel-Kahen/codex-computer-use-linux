@@ -1,11 +1,9 @@
-from __future__ import annotations
-
 import base64
-import fcntl
 import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,14 +11,19 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
-from contextlib import contextmanager
 
-ROOT = Path(__file__).resolve().parents[2]
-SERVER_INFO = {"name": "same-session-computer-use", "version": "0.1.0"}
+from .native_plugin import STATE_DIR
+from .native_plugin import ensure_native_input_safe
+from .native_plugin import ensure_target_pointer_plugin
+from .native_plugin import file_guard
+from .native_plugin import plugin_build_requirements
+
+
+SERVER_INFO = {"name": "same-session-computer-use", "version": "0.1.1"}
 PROTOCOL_VERSION = "2025-11-25"
-STATE_DIR = Path.home() / ".local/state/same-session-computer-use"
 LEASE_FILE = STATE_DIR / "coordinate-lease.json"
 LOCK_FILE = STATE_DIR / "coordinate-lease.lock"
+POINTER_LOCK_FILE = STATE_DIR / "pointer-transaction.lock"
 POINTER_LOCK = threading.Lock()
 _SESSION_ATTACHED = False
 
@@ -52,7 +55,7 @@ TOOLS = [
     },
     {
         "name": "send_window_shortcut",
-        "description": "Send a key or shortcut directly to one real window by Hyprland address without focusing it. Prefer accessibility actions for buttons and text fields; use this for discrete shortcuts or characters.",
+        "description": "Send a key or shortcut directly to one real window by Hyprland address without focusing it. Prefer accessibility actions from the separate Computer Use plugin for buttons and text fields; use this for discrete shortcuts or characters.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -62,7 +65,7 @@ TOOLS = [
             },
             "required": ["address", "key"],
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
     },
     {
         "name": "targeted_pointer_click",
@@ -115,7 +118,7 @@ TOOLS = [
             },
             "required": ["window", "acknowledge_interference"],
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
     },
     {
         "name": "capture_coordinate_desktop",
@@ -280,13 +283,8 @@ def save_lease(state: dict[str, Any]) -> None:
     temp.replace(LEASE_FILE)
 
 
-@contextmanager
 def lease_guard():
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with LOCK_FILE.open("a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try: yield
-        finally: fcntl.flock(handle, fcntl.LOCK_UN)
+    return file_guard(LOCK_FILE)
 
 
 def wait_for_monitor(name: str, *, present: bool, timeout: float = 5.0) -> dict[str, Any] | None:
@@ -321,6 +319,7 @@ def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("fullscreen_if_needed must be a boolean")
     if not selected.get("address"):
         raise RuntimeError("selected window has no Hyprland address")
+    ensure_native_input_safe()
     active = hypr_json(["activewindow"])
     active_workspace = hypr_json(["activeworkspace"])
     cursor = hypr_json(["cursorpos"])
@@ -411,14 +410,19 @@ def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
         else:
             try: wait_for_monitor(output, present=False)
             except Exception as exc: errors.append(str(exc))
-    cursor = original.get("cursor") or {}
-    if cursor.get("x") is not None and cursor.get("y") is not None:
-        try: hypr_dispatch(f"hl.dsp.cursor.move({{ x = {int(cursor['x'])}, y = {int(cursor['y'])} }})")
-        except Exception as exc: errors.append(f"pointer restore: {exc}")
     active_address = str(original.get("active_address") or "")
     if active_address and any(w.get("address") == active_address for w in hypr_windows()):
         try: hypr_dispatch(f"hl.dsp.focus({{ window = 'address:{active_address}' }})")
         except Exception as exc: errors.append(f"focus restore: {exc}")
+    else:
+        active_workspace = original.get("active_workspace")
+        if active_workspace is not None:
+            try: hypr_dispatch(f"hl.dsp.focus({{ workspace = {int(active_workspace)} }})")
+            except Exception as exc: errors.append(f"workspace restore: {exc}")
+    cursor = original.get("cursor") or {}
+    if cursor.get("x") is not None and cursor.get("y") is not None:
+        try: hypr_dispatch(f"hl.dsp.cursor.move({{ x = {int(cursor['x'])}, y = {int(cursor['y'])} }})")
+        except Exception as exc: errors.append(f"pointer restore: {exc}")
     if not errors: LEASE_FILE.unlink(missing_ok=True)
     return {
         "restored": not errors,
@@ -497,25 +501,6 @@ def window_coordinate_space(window: dict[str, Any], raw: bytes) -> dict[str, Any
     }
 
 
-def ensure_target_pointer_plugin() -> None:
-    plugin_name = "same-session-target-pointer"
-    listed = run(["hyprctl", "plugin", "list"])
-    if listed.returncode == 0 and plugin_name in listed.stdout: return
-    directory = ROOT / "hyprland"
-    library = directory / "same-session-target-pointer.so"
-    stamp = directory / ".built-for-hyprland"
-    version = run(["hyprctl", "version"])
-    if version.returncode: raise RuntimeError(version.stderr.strip() or "failed to read Hyprland version")
-    source_newer = not library.exists() or (directory / "target-pointer.cpp").stat().st_mtime > library.stat().st_mtime
-    if source_newer or not stamp.exists() or stamp.read_text() != version.stdout:
-        built = subprocess.run(["make", "clean", "all"], cwd=directory, text=True, capture_output=True, timeout=60, check=False)
-        if built.returncode: raise RuntimeError(built.stderr.strip() or built.stdout.strip() or "failed to build targeted-pointer plugin")
-        stamp.write_text(version.stdout)
-    loaded = run(["hyprctl", "plugin", "load", str(library)], timeout=20)
-    if loaded.returncode or "ok" not in loaded.stdout.lower():
-        raise RuntimeError(loaded.stderr.strip() or loaded.stdout.strip() or "failed to load targeted-pointer plugin")
-
-
 def resolve_xwindow_id(window: dict[str, Any]) -> str:
     pid = window.get("pid")
     if not pid: raise RuntimeError("XWayland window has no process ID")
@@ -552,6 +537,8 @@ def xdotool_target(window: dict[str, Any], command: list[str]) -> dict[str, Any]
 
 def _targeted_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
     window = resolve_window(str(arguments["window"]))
+    if window.get("xwayland"):
+        ensure_native_input_safe()
     before = physical_snapshot()
     button = str(arguments.get("button") or "left")
     button_number = {"left": "1", "middle": "2", "right": "3"}.get(button)
@@ -606,7 +593,8 @@ def targeted_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
     # Serialize transactions so simultaneous calls cannot interleave snapshot,
     # injection, and restoration.
     with POINTER_LOCK:
-        return _targeted_pointer(arguments, action)
+        with file_guard(POINTER_LOCK_FILE):
+            return _targeted_pointer(arguments, action)
 
 
 def text_result(value: Any) -> dict[str, Any]:
@@ -655,27 +643,45 @@ def capture_result(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def status() -> dict[str, Any]:
-    checks = {}
+    checks: dict[str, bool] = {}
     for binary in ("hyprctl", "grim", "xdotool"):
-        checks[binary] = subprocess.run(["sh", "-lc", f"command -v {binary}"], text=True, capture_output=True).returncode == 0
+        checks[binary] = shutil.which(binary) is not None
+    build_requirements = plugin_build_requirements()
+    native_buildable = all(build_requirements.values())
     exact_count = sum(1 for window in combine_windows() if window.get("capture_id")) if checks["hyprctl"] and checks["grim"] else 0
     plugin_loaded = False
+    safety_status = None
     if checks["hyprctl"]:
         plugins = run(["hyprctl", "plugin", "list"])
         plugin_loaded = plugins.returncode == 0 and "same-session-target-pointer" in plugins.stdout
+        if plugin_loaded:
+            probed = run(["hyprctl", "-j", "cutargetstatus"])
+            if probed.returncode == 0:
+                try:
+                    safety_status = json.loads(probed.stdout)
+                except json.JSONDecodeError:
+                    pass
+    native_available = checks["hyprctl"] and (plugin_loaded or native_buildable)
     return {
         "session": "real-current-login",
         "wayland_display": os.environ.get("WAYLAND_DISPLAY"),
         "hyprland_instance": bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")),
         "capabilities": {
             "exact_background_window_capture": exact_count > 0,
-            "targeted_background_shortcuts": checks["hyprctl"],
-            "background_semantic_actions": "use the bundled Computer Use AT-SPI tools",
-            "targeted_wayland_pointer": plugin_loaded,
-            "targeted_xwayland_pointer": checks["xdotool"],
+            "targeted_background_shortcuts": native_available,
+            "background_semantic_actions": False,
+            "targeted_wayland_pointer": native_available,
+            "targeted_xwayland_pointer": native_available and checks["xdotool"],
+            "native_input_currently_safe": bool(safety_status and safety_status.get("safe_to_inject") is True),
             "physical_pointer_seat_is_independent": False,
         },
         "checks": checks,
+        "requirements": {
+            "native_plugin_build": build_requirements,
+            "native_plugin_loaded": plugin_loaded,
+            "native_input_safety": safety_status,
+            "background_semantic_actions": "requires the separate Computer Use plugin and an enabled AT-SPI session",
+        },
         "exact_window_count": exact_count,
         "raw_pointer_note": "Hyprland still has one physical pointer seat, but normal coordinate actions bypass it by targeting a Wayland surface or XWayland's internal pointer. The physical cursor, keyboard focus, and workspace are preserved.",
     }
@@ -695,6 +701,7 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("key must be a Hyprland key name containing only letters, digits, underscore, plus, or hyphen")
         if not re.fullmatch(r"[A-Za-z ]*", modifiers):
             raise ValueError("modifiers may contain only modifier names and spaces")
+        ensure_native_input_safe()
         proc = run(["hyprctl", "dispatch", f"hl.dsp.send_shortcut({{ mods = '{modifiers}', key = '{key}', window = 'address:{address}' }})"])
         if proc.returncode or "ok" not in proc.stdout.lower():
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "targeted shortcut failed")
@@ -722,7 +729,7 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
     try:
         if method == "initialize":
             requested = (message.get("params") or {}).get("protocolVersion", PROTOCOL_VERSION)
-            result = {"protocolVersion": requested, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate the user's real logged-in Hyprland session. Capture exact windows here; use bundled Computer Use AT-SPI actions before any raw pointer fallback."}
+            result = {"protocolVersion": requested, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate the user's real logged-in Hyprland session. Capture exact windows here; semantic AT-SPI actions require the separate Computer Use plugin."}
         elif method == "tools/list": result = {"tools": TOOLS}
         elif method == "tools/call":
             params = message.get("params") or {}

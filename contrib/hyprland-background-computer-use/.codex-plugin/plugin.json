@@ -1,15 +1,26 @@
 {
   "name": "same-session-computer-use",
-  "version": "0.1.0+codex.20260710031024",
-  "description": "Operate the user's real logged-in Linux applications without creating a second profile or desktop session.",
+  "version": "0.1.1",
+  "description": "Add exact background capture and window-targeted input for Codex on Hyprland.",
   "author": {
-    "name": "Gabe"
+    "name": "Gabe",
+    "url": "https://github.com/Gabriel-Kahen"
   },
+  "homepage": "https://github.com/Gabriel-Kahen/codex-computer-use-linux/tree/main/contrib/hyprland-background-computer-use",
+  "repository": "https://github.com/Gabriel-Kahen/codex-computer-use-linux",
+  "license": "Apache-2.0",
+  "keywords": [
+    "computer-use",
+    "hyprland",
+    "linux",
+    "wayland",
+    "desktop-control"
+  ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Hyprland Codex Background Computer Use",
-    "shortDescription": "Control your real logged-in Linux apps.",
-    "longDescription": "Lets Codex inspect and operate existing windows in your current Hyprland login, preserving application processes, profiles, files, and signed-in state. It adds exact background capture, accessibility actions, targeted shortcuts, and window-local click, scroll, and drag controls that preserve your physical pointer, focus, and workspace.",
+    "shortDescription": "Background control for Hyprland apps.",
+    "longDescription": "Extends the bundled Computer Use plugin on Hyprland with exact background window capture, targeted shortcuts, and window-local click, scroll, and drag controls. It preserves existing application processes, profiles, files, signed-in state, physical pointer, focus, and workspace during normal targeted operations.",
     "developerName": "Gabe",
     "category": "Productivity",
     "capabilities": [

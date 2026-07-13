@@ -202,6 +202,20 @@ void ensureSafeToInject(PHLWINDOW window) {
     if (PROTO::data && PROTO::data->dndActive()) throw std::runtime_error("a drag-and-drop operation is active");
 }
 
+std::string handleStatus(eHyprCtlOutputFormat, std::string) {
+    const bool pointerSeat = g_pSeatManager && g_pSeatManager->m_mouse;
+    const bool inputManager = static_cast<bool>(g_pInputManager);
+    const bool sessionLocked = g_pSessionLockManager && g_pSessionLockManager->isSessionLocked();
+    const bool heldButtons = inputManager && g_pInputManager->hasHeldButtons();
+    const bool pointerConstrained = inputManager && g_pInputManager->isConstrained();
+    const bool pointerLocked = inputManager && g_pInputManager->isLocked();
+    const bool dndActive = PROTO::data && PROTO::data->dndActive();
+    const bool safe = pointerSeat && inputManager && !sessionLocked && !heldButtons && !pointerConstrained && !pointerLocked && !dndActive;
+    return std::format(
+        "{{\"ok\":true,\"safe_to_inject\":{},\"pointer_seat\":{},\"session_locked\":{},\"held_buttons\":{},\"pointer_constrained\":{},\"pointer_locked\":{},\"dnd_active\":{}}}",
+        safe, pointerSeat, sessionLocked, heldButtons, pointerConstrained, pointerLocked, dndActive);
+}
+
 std::string handleRequest(eHyprCtlOutputFormat, std::string request) {
     try {
         ParsedRequest parsed;
@@ -211,6 +225,8 @@ std::string handleRequest(eHyprCtlOutputFormat, std::string request) {
         ensureSafeToInject(window);
 
         if (window->m_isX11) throw std::runtime_error("XWayland targets must use the same-session broker's XTEST route");
+
+        if (parsed.action == "drag") resolveTarget(window, parsed.x2, parsed.y2, true);
 
         PointerFocusRestore restore;
         const auto now = static_cast<uint32_t>(Time::millis(Time::steadyNow()));
@@ -269,7 +285,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         PHANDLE, SHyprCtlCommand{.name = "cutarget", .exact = false, .fn = handleRequest});
     if (!command) throw std::runtime_error("same-session-target-pointer: failed to register cutarget command");
 
-    return {"same-session-target-pointer", "Atomic window-targeted pointer events without cursor movement", "Gabe", "0.1.0"};
+    const auto statusCommand = HyprlandAPI::registerHyprCtlCommand(
+        PHANDLE, SHyprCtlCommand{.name = "cutargetstatus", .exact = true, .fn = handleStatus});
+    if (!statusCommand) throw std::runtime_error("same-session-target-pointer: failed to register cutargetstatus command");
+
+    return {"same-session-target-pointer", "Atomic window-targeted pointer events without cursor movement", "Gabe", "0.1.1"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {}

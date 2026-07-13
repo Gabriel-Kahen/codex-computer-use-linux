@@ -35,6 +35,8 @@ class RepositorySmokeTests(TestCase):
         responses = {response["id"]: response for response in map(json.loads, proc.stdout.splitlines())}
 
         self.assertEqual(responses[1]["result"]["protocolVersion"], "2025-11-25")
+        self.assertEqual(responses[1]["result"]["serverInfo"]["version"], "0.1.1")
+        self.assertIn("separate Computer Use plugin", responses[1]["result"]["instructions"])
         self.assertEqual(responses[3]["result"], {})
         tools = responses[2]["result"]["tools"]
         names = [tool["name"] for tool in tools]
@@ -45,3 +47,10 @@ class RepositorySmokeTests(TestCase):
             self.assertEqual(schema["type"], "object")
             self.assertLessEqual(set(schema.get("required", [])), set(schema.get("properties", {})))
             self.assertIn("annotations", tool)
+
+        annotations = {tool["name"]: tool["annotations"] for tool in tools}
+        self.assertTrue(annotations["capture_session_window"]["destructiveHint"])
+        self.assertTrue(annotations["send_window_shortcut"]["destructiveHint"])
+        self.assertTrue(annotations["send_window_shortcut"]["openWorldHint"])
+        self.assertTrue(annotations["begin_coordinate_lease"]["destructiveHint"])
+        self.assertFalse(annotations["begin_coordinate_lease"]["openWorldHint"])
