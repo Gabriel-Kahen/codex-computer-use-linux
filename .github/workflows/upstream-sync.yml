@@ -104,19 +104,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          pr="$(gh pr list \
-            --state open \
-            --base main \
-            --head "$SYNC_BRANCH" \
-            --json number \
+          head="$GITHUB_REPOSITORY_OWNER:$SYNC_BRANCH"
+          pr="$(gh api \
+            --method GET \
+            "repos/$GITHUB_REPOSITORY/pulls" \
+            -f state=open \
+            -f base=main \
+            -f head="$head" \
             --jq '.[0].number // empty')"
           if [[ -z "$pr" ]]; then
-            url="$(gh pr create \
-              --base main \
-              --head "$SYNC_BRANCH" \
-              --title 'Merge upstream openai/codex main' \
-              --body 'Automated merge of the latest `openai/codex:main` into the Linux computer-use fork. Literal merge conflicts stop the workflow. Upstream changes involving computer use require manual review and cannot auto-merge.')"
-            pr="${url##*/}"
+            pr="$(gh api \
+              --method POST \
+              "repos/$GITHUB_REPOSITORY/pulls" \
+              -f base=main \
+              -f head="$head" \
+              -f title='Merge upstream openai/codex main' \
+              -f body='Automated merge of the latest `openai/codex:main` into the Linux computer-use fork. Literal merge conflicts stop the workflow. Upstream changes involving computer use require manual review and cannot auto-merge.' \
+              --jq .number)"
           fi
           echo "number=$pr" >> "$GITHUB_OUTPUT"
 
@@ -135,19 +139,39 @@ jobs:
         run: |
           set -euo pipefail
           label="upstream-computer-use-review"
-          gh label create "$label" \
-            --color B60205 \
-            --description 'Upstream computer-use changes require manual review' \
-            --force
-          gh pr edit "$PR" --add-label "$label"
-          gh pr merge "$PR" --disable-auto || true
+          if gh api "repos/$GITHUB_REPOSITORY/labels/$label" >/dev/null 2>&1; then
+            gh api \
+              --method PATCH \
+              "repos/$GITHUB_REPOSITORY/labels/$label" \
+              -f color=B60205 \
+              -f description='Upstream computer-use changes require manual review' \
+              >/dev/null
+          else
+            gh api \
+              --method POST \
+              "repos/$GITHUB_REPOSITORY/labels" \
+              -f name="$label" \
+              -f color=B60205 \
+              -f description='Upstream computer-use changes require manual review' \
+              >/dev/null
+          fi
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/$PR/labels" \
+            -f "labels[]=$label" \
+            >/dev/null
 
           paths="$(sed 's/^/- `/' "$RUNNER_TEMP/computer-use-review-files.txt" | sed 's/$/`/')"
-          gh pr comment "$PR" --body "Upstream changed computer-use-related code or text, so auto-merge is disabled. Review these paths and preserve the fork's Linux implementation before merging:
+          body="Upstream changed computer-use-related code or text, so automatic merging is disabled. Review these paths and preserve the fork's Linux implementation before merging:
 
           ${paths}"
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            -f body="$body" \
+            >/dev/null
 
-      - name: Enable auto-merge for unrelated upstream changes
+      - name: Merge unrelated upstream changes after CI
         if: >-
           steps.merge.outputs.changed == 'true' &&
           steps.merge.outputs.computer_use_review != 'true'
@@ -156,5 +180,35 @@ jobs:
           PR: ${{ steps.pull_request.outputs.number }}
         run: |
           set -euo pipefail
-          gh pr edit "$PR" --remove-label upstream-computer-use-review || true
-          gh pr merge "$PR" --auto --merge
+          gh api \
+            --method DELETE \
+            "repos/$GITHUB_REPOSITORY/issues/$PR/labels/upstream-computer-use-review" \
+            --silent || true
+
+          head_sha="$(git rev-parse HEAD)"
+          run=""
+          for _ in {1..15}; do
+            run="$(gh run list \
+              --workflow computer-use-ci.yml \
+              --branch "$SYNC_BRANCH" \
+              --event workflow_dispatch \
+              --limit 10 \
+              --json databaseId,headSha \
+              --jq ".[] | select(.headSha == \"$head_sha\") | .databaseId" \
+              | head -n 1)"
+            [[ -n "$run" ]] && break
+            sleep 2
+          done
+          if [[ -z "$run" ]]; then
+            echo "Could not find the dispatched computer-use CI run for $head_sha" >&2
+            exit 1
+          fi
+
+          gh run watch "$run" --exit-status
+          merged="$(gh api \
+            --method PUT \
+            "repos/$GITHUB_REPOSITORY/pulls/$PR/merge" \
+            -f merge_method=merge \
+            -f sha="$head_sha" \
+            --jq .merged)"
+          [[ "$merged" == true ]]
