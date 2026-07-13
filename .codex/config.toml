@@ -1,0 +1,2 @@
+[mcp_servers.hyprland_background_computer_use]
+command = "./contrib/hyprland-background-computer-use/bin/same-session-computer-use-mcp"
