@@ -10,6 +10,7 @@ permissions:
   contents: write
   issues: write
   pull-requests: write
+  statuses: write
 
 concurrency:
   group: upstream-sync
@@ -206,6 +207,15 @@ jobs:
           fi
 
           gh run watch "$run" --exit-status
+          run_url="$(gh run view "$run" --json url --jq .url)"
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/statuses/$head_sha" \
+            -f state=success \
+            -f context='Computer use CI' \
+            -f description='Fork computer-use tests passed' \
+            -f target_url="$run_url" \
+            >/dev/null
           merged="$(gh api \
             --method PUT \
             "repos/$GITHUB_REPOSITORY/pulls/$PR/merge" \
