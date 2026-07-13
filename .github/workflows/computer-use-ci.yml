@@ -1,0 +1,39 @@
+name: computer-use-ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: computer-use-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  computer-use:
+    name: Computer use CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Compile and test Hyprland computer use
+        env:
+          PYTHONPATH: contrib/hyprland-background-computer-use/src
+        run: |
+          python3 -m compileall -q \
+            contrib/hyprland-background-computer-use/src \
+            contrib/hyprland-background-computer-use/tests \
+            contrib/hyprland-background-computer-use/bin
+          python3 -m unittest discover \
+            -s contrib/hyprland-background-computer-use/tests \
+            -p 'test_*.py' \
+            -v
