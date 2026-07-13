@@ -47,6 +47,24 @@ jobs:
             exit 0
           fi
 
+          merge_base="$(git merge-base origin/main upstream/main)"
+          git diff --name-only "$merge_base"..upstream/main > "$RUNNER_TEMP/upstream-files.txt"
+          git diff --unified=0 "$merge_base"..upstream/main > "$RUNNER_TEMP/upstream.patch"
+          if grep -Eiq 'computer[ _-]?use' \
+            "$RUNNER_TEMP/upstream-files.txt" \
+            "$RUNNER_TEMP/upstream.patch"; then
+            echo "computer_use_review=true" >> "$GITHUB_OUTPUT"
+            {
+              grep -Ei 'computer[ _-]?use' "$RUNNER_TEMP/upstream-files.txt" || true
+              git diff \
+                --name-only \
+                -G'[Cc]omputer[ _-]?[Uu]se|COMPUTER[ _-]?USE' \
+                "$merge_base"..upstream/main
+            } | sort -u > "$RUNNER_TEMP/computer-use-review-files.txt"
+          else
+            echo "computer_use_review=false" >> "$GITHUB_OUTPUT"
+          fi
+
           git switch -C "$SYNC_BRANCH" origin/main
           if ! git merge --no-ff --no-edit upstream/main; then
             conflicts="$(git diff --name-only --diff-filter=U)"
@@ -79,7 +97,8 @@ jobs:
             git push origin "HEAD:refs/heads/$SYNC_BRANCH"
           fi
 
-      - name: Open pull request and enable auto-merge
+      - name: Open pull request and run computer-use CI
+        id: pull_request
         if: steps.merge.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -96,12 +115,46 @@ jobs:
               --base main \
               --head "$SYNC_BRANCH" \
               --title 'Merge upstream openai/codex main' \
-              --body 'Automated merge of the latest `openai/codex:main` into the Linux computer-use fork. This PR preserves the fork-specific implementation and stops for manual resolution if upstream changes overlap it.')"
+              --body 'Automated merge of the latest `openai/codex:main` into the Linux computer-use fork. Literal merge conflicts stop the workflow. Upstream changes involving computer use require manual review and cannot auto-merge.')"
             pr="${url##*/}"
           fi
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
 
           # Events created with GITHUB_TOKEN do not recursively start normal PR
           # workflows. workflow_dispatch is allowed, so explicitly run the
           # required fork-owned check on the sync branch.
           gh workflow run computer-use-ci.yml --ref "$SYNC_BRANCH"
-          gh pr merge "$pr" --auto --merge
+
+      - name: Require review for upstream computer-use changes
+        if: >-
+          steps.merge.outputs.changed == 'true' &&
+          steps.merge.outputs.computer_use_review == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pull_request.outputs.number }}
+        run: |
+          set -euo pipefail
+          label="upstream-computer-use-review"
+          gh label create "$label" \
+            --color B60205 \
+            --description 'Upstream computer-use changes require manual review' \
+            --force
+          gh pr edit "$PR" --add-label "$label"
+          gh pr merge "$PR" --disable-auto || true
+
+          paths="$(sed 's/^/- `/' "$RUNNER_TEMP/computer-use-review-files.txt" | sed 's/$/`/')"
+          gh pr comment "$PR" --body "Upstream changed computer-use-related code or text, so auto-merge is disabled. Review these paths and preserve the fork's Linux implementation before merging:
+
+          ${paths}"
+
+      - name: Enable auto-merge for unrelated upstream changes
+        if: >-
+          steps.merge.outputs.changed == 'true' &&
+          steps.merge.outputs.computer_use_review != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pull_request.outputs.number }}
+        run: |
+          set -euo pipefail
+          gh pr edit "$PR" --remove-label upstream-computer-use-review || true
+          gh pr merge "$PR" --auto --merge
