@@ -1,0 +1,38 @@
+{
+  "name": "x11-background-computer-use",
+  "version": "0.1.0",
+  "description": "Exact background capture and guarded same-session input for EWMH Xorg desktops.",
+  "author": {
+    "name": "Gabe",
+    "url": "https://github.com/Gabriel-Kahen"
+  },
+  "homepage": "https://github.com/Gabriel-Kahen/codex-computer-use-linux/tree/main/contrib/x11-background-computer-use",
+  "repository": "https://github.com/Gabriel-Kahen/codex-computer-use-linux",
+  "license": "Apache-2.0",
+  "keywords": [
+    "computer-use",
+    "x11",
+    "xorg",
+    "ewmh",
+    "desktop-control"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "X11 Codex Background Computer Use",
+    "shortDescription": "Background capture and guarded control for Xorg.",
+    "longDescription": "Extends Computer Use on local EWMH Xorg sessions with exact XComposite window capture, best-effort no-focus shortcuts, and an explicitly acknowledged, journaled focus/pointer lease for reliable XTEST input. Supports Xfce, Cinnamon, MATE, LXQt/Openbox, and legacy GNOME or KDE Xorg sessions when their window manager exposes EWMH.",
+    "developerName": "Gabe",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write",
+      "Local Desktop"
+    ],
+    "defaultPrompt": [
+      "Use my existing logged-in X11 app to complete this task.",
+      "Capture an exact unobscured screenshot of one of my real X11 windows.",
+      "Operate this Xorg app and restore my focus and pointer when finished."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

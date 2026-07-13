@@ -1,0 +1,116 @@
+import base64
+import os
+import sys
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from subprocess import CompletedProcess
+from unittest import TestCase
+from unittest.mock import patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from x11_session_computer_use import capture
+from x11_session_computer_use import server
+
+
+def png(width: int, height: int) -> bytes:
+    return b"\x89PNG\r\n\x1a\n" + b"\0" * 8 + width.to_bytes(4, "big") + height.to_bytes(4, "big")
+
+
+class CaptureBuildTests(TestCase):
+    def test_parallel_requests_compile_once_and_reuse_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            compile_count = 0
+            count_lock = threading.Lock()
+
+            def fake_run(args, **_kwargs):
+                nonlocal compile_count
+                if args[:2] == ["pkg-config", "--cflags"]:
+                    return CompletedProcess(args, 0, "-lX11 -lXcomposite -lpng\n", "")
+                if "-o" in args:
+                    with count_lock:
+                        compile_count += 1
+                    output = Path(args[args.index("-o") + 1])
+                    output.write_bytes(b"executable")
+                    return CompletedProcess(args, 0, "", "")
+                raise AssertionError(args)
+
+            with patch.object(capture, "CACHE_ROOT", Path(temporary)), patch.object(capture, "build_requirements", return_value={"all": True}), patch.object(capture.subprocess, "run", side_effect=fake_run):
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    results = list(executor.map(lambda _: capture.ensure_capture_helper(), range(4)))
+                repeated = capture.ensure_capture_helper()
+
+            self.assertEqual(compile_count, 1)
+            self.assertEqual(len(set(results)), 1)
+            self.assertEqual(repeated, results[0])
+            self.assertTrue(results[0].is_file())
+            self.assertTrue(os.access(results[0], os.X_OK))
+
+    def test_build_reports_missing_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(capture, "CACHE_ROOT", Path(temporary)), patch.object(capture, "build_requirements", return_value={"cc": False, "pkg-config": True}):
+            with self.assertRaisesRegex(RuntimeError, "cc"):
+                capture.ensure_capture_helper()
+
+
+class BrokerCaptureTests(TestCase):
+    def setUp(self) -> None:
+        self.window = {
+            "xid": "0x01200007",
+            "width": 640,
+            "height": 480,
+            "mapped": True,
+            "minimized": False,
+        }
+
+    def test_capture_returns_png_and_coordinate_metadata(self) -> None:
+        raw = png(1280, 960)
+
+        def fake_run(args, **_kwargs):
+            Path(args[2]).write_bytes(raw)
+            return CompletedProcess(args, 0, "", "")
+
+        with patch.object(server, "resolve_window", return_value=self.window), patch.object(server, "ensure_capture_helper", return_value=Path("/helper")), patch.object(server, "run", side_effect=fake_run):
+            result = server.capture({"window": self.window["xid"]})
+
+        self.assertEqual(base64.b64decode(result["content"][1]["data"]), raw)
+        self.assertEqual(result["structuredContent"]["coordinate_space"], {
+            "window_local": {"width": 640, "height": 480},
+            "screenshot_pixels": {"width": 1280, "height": 960},
+        })
+        self.assertEqual(result["structuredContent"]["capture_backend"], "XComposite named window pixmap")
+
+    def test_save_path_replaces_destination_only_after_capture_succeeds(self) -> None:
+        raw = png(640, 480)
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "capture.png"
+            destination.write_bytes(b"old")
+
+            def fake_run(args, **_kwargs):
+                self.assertEqual(destination.read_bytes(), b"old")
+                output = Path(args[2])
+                self.assertNotEqual(output, destination)
+                output.write_bytes(raw)
+                return CompletedProcess(args, 0, "", "")
+
+            with patch.object(server, "resolve_window", return_value=self.window), patch.object(server, "ensure_capture_helper", return_value=Path("/helper")), patch.object(server, "run", side_effect=fake_run):
+                result = server.capture({"window": self.window["xid"], "save_path": str(destination)})
+
+            self.assertEqual(destination.read_bytes(), raw)
+            self.assertEqual(result["structuredContent"]["saved_to"], str(destination))
+            self.assertEqual(list(Path(temporary).iterdir()), [destination])
+
+    def test_failed_capture_preserves_existing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "capture.png"
+            destination.write_bytes(b"old")
+            failed = CompletedProcess([], 1, "", "capture failed")
+
+            with patch.object(server, "resolve_window", return_value=self.window), patch.object(server, "ensure_capture_helper", return_value=Path("/helper")), patch.object(server, "run", return_value=failed):
+                with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                    server.capture({"window": self.window["xid"], "save_path": str(destination)})
+
+            self.assertEqual(destination.read_bytes(), b"old")
+            self.assertEqual(list(Path(temporary).iterdir()), [destination])
