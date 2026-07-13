@@ -16,6 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  GH_REPO: ${{ github.repository }}
   SYNC_BRANCH: automation/upstream-sync
   UPSTREAM_REPOSITORY: https://github.com/openai/codex.git
 
