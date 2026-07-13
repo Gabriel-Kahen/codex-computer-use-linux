@@ -41,7 +41,7 @@ Then simply run `codex` to get started.
 
 ### Experimental Linux Computer Use fork
 
-This fork includes an experimental Hyprland integration that lets Codex inspect and operate windows in your existing desktop session. The integration is packaged as a Codex plugin under `contrib/hyprland-background-computer-use/`; it is not a general Linux backend and has been tested against Hyprland 0.55.4.
+This fork includes experimental Hyprland and GNOME/Mutter integrations that let Codex inspect and operate windows in your existing desktop session. They are separate plugins with different capability and safety boundaries.
 
 Install the bundled Computer Use plugin first. It supplies the accessibility and global-input tools. Then add this repository as a marketplace and install the Hyprland companion:
 
@@ -54,6 +54,19 @@ codex plugin add same-session-computer-use@codex-computer-use-linux
 ```
 
 Start a new Codex task after installation so the new tools and skill are loaded. See the [Hyprland integration README](./contrib/hyprland-background-computer-use/README.md) for system requirements, updates, removal, and the safety boundary.
+
+The GNOME integration currently declares Shell 45 through a user-level bridge and companion plugin; later releases need compositor-session validation. GNOME uses a global input seat, so coordinate and keyboard operations use an explicitly acknowledged, journaled focus lease rather than claiming non-interfering background targeting:
+
+```shell
+./contrib/gnome-same-session-computer-use/bin/install-gnome-integration
+codex plugin add computer-use@openai-bundled
+codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
+  --sparse .agents/plugins \
+  --sparse contrib/gnome-same-session-computer-use
+codex plugin add gnome-same-session-computer-use@codex-computer-use-linux
+```
+
+See the [GNOME integration README](./contrib/gnome-same-session-computer-use/README.md) for its exact limitations and recovery workflow.
 
 <details>
 <summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
