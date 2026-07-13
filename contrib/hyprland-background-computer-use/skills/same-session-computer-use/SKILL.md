@@ -12,7 +12,7 @@ Operate the real logged-in session. Never substitute a VM, nested desktop, alter
 1. Call `session_status`, then `list_session_windows`.
 2. Reuse an existing matching window. Preserve its process, profile, login, open documents, workspace, and fullscreen state.
 3. Capture with `capture_session_window`. This uses the window's Hyprland stable ID and does not focus, move, or raise it.
-4. Inspect and act with the bundled Linux Computer Use accessibility tools. Refresh app state immediately before choosing an element.
+4. Inspect and act with the separate `computer-use@openai-bundled` plugin's accessibility tools. Refresh app state immediately before choosing an element. If those tools are absent, stop and ask the user to install that companion plugin.
 5. Prefer semantic AT-SPI operations in this order:
    - `perform_action` for buttons, links, menu items, and other actionable controls.
    - `set_value` or editable-text operations for text fields and sliders.
@@ -43,4 +43,4 @@ Native Wayland events are delivered atomically by a version-matched Hyprland plu
 
 ## Headless output
 
-A temporary Hyprland headless output is now an emergency compatibility fallback only. Use it when a client rejects both semantic accessibility actions and targeted pointer injection. Follow [architecture.md](references/architecture.md), obtain explicit interference acknowledgment, and leave `fullscreen_if_needed` enabled unless the task specifically requires the window's original fallback geometry. The broker fullscreens the target over the temporary screen and records its previous state. When using global fallback input, translate screenshot-local coordinates with the `coordinate_space` origin and scale returned by `capture_coordinate_desktop`. Always restore leased windows, focus, workspace, fullscreen state, and pointer position in a `finally`-style cleanup.
+A temporary Hyprland headless output is now an emergency compatibility fallback only. Use it when a client rejects both semantic accessibility actions and targeted pointer injection. Follow [architecture.md](references/architecture.md), obtain explicit interference acknowledgment from the user in the current task, and never treat the tool argument alone as proof of consent. Leave `fullscreen_if_needed` enabled unless the task specifically requires the window's original fallback geometry. The broker fullscreens the target over the temporary screen and records its previous state. When using the separate Computer Use plugin for global fallback input, translate screenshot-local coordinates with the `coordinate_space` origin and scale returned by `capture_coordinate_desktop`. Always restore leased windows, focus, workspace, fullscreen state, and pointer position in a `finally`-style cleanup.

@@ -11,7 +11,7 @@ This project lets an automation agent inspect and operate the applications that 
 - Send address-targeted keyboard shortcuts.
 - Click, scroll, and drag inside background native Wayland windows without moving the physical cursor.
 - Click, scroll, and drag inside background XWayland windows through XWayland's internal XTEST pointer.
-- Delegate semantic controls and text editing to AT-SPI accessibility tooling.
+- Work alongside the `computer-use@openai-bundled` plugin for AT-SPI semantic controls, text editing, and global-input fallback.
 - Fall back to a temporary headless output for focus-dependent applications.
 - Fullscreen a fallback-only window over the temporary screen when necessary, then restore its original fullscreen mode, workspace, focus, and cursor.
 - Recover compositor state after an interrupted fallback lease.
@@ -42,7 +42,7 @@ The fallback reuses the same application process. It does not create another pro
 
 ## Requirements
 
-The implementation is Hyprland-specific. It was developed and accepted against Hyprland 0.55.4. Native extensions must be rebuilt for the exact running Hyprland ABI.
+The implementation is Hyprland-specific and experimental. It was developed and accepted against Hyprland 0.55.4. Other releases are not currently supported. Native extensions must be rebuilt for the exact running Hyprland ABI.
 
 Runtime and build dependencies include:
 
@@ -51,10 +51,57 @@ Runtime and build dependencies include:
 - `pkg-config`
 - `grim`
 - `xdotool` with XTEST support
-- Python 3
+- Python 3.10 or newer
 - an enabled AT-SPI session for semantic accessibility actions
+- a Codex CLI release with `codex plugin` support
+- `computer-use@openai-bundled`, which provides the AT-SPI and global-input Computer Use tools that this plugin's skill coordinates with
 
-The broker builds and loads the native extension on demand when the loaded Hyprland version changes.
+The broker builds and loads the native extension on demand. Builds are cached outside the installed plugin under `${XDG_CACHE_HOME:-$HOME/.cache}/same-session-computer-use/` and keyed by the plugin source and running Hyprland version.
+
+## Install
+
+Install the bundled Computer Use plugin, add this Git repository as a marketplace, and install the Hyprland companion:
+
+```bash
+codex plugin add computer-use@openai-bundled
+codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
+  --sparse .agents/plugins \
+  --sparse contrib/hyprland-background-computer-use
+codex plugin add same-session-computer-use@codex-computer-use-linux
+```
+
+Start a new Codex task after installation. The bundled Computer Use plugin owns AT-SPI semantic actions and focus-dependent global input. This plugin adds exact Hyprland window capture, address-targeted shortcuts, native Wayland pointer targeting, XWayland pointer targeting, and the transactional headless-output lease.
+
+Check that Codex sees both plugins:
+
+```bash
+codex plugin list
+```
+
+## Update
+
+Refresh the Git marketplace snapshot and reinstall the plugin, then start a new Codex task. If the older native extension is already loaded, unload it before updating or restart Hyprland afterward.
+
+```bash
+codex plugin marketplace upgrade codex-computer-use-linux
+codex plugin add same-session-computer-use@codex-computer-use-linux
+```
+
+## Uninstall
+
+Unload the native Hyprland extension before removing the plugin. The broker stores ABI-specific builds in its external cache, so try each cached library and remove that cache after the loaded one is released:
+
+```bash
+PLUGIN_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/same-session-computer-use/hyprland"
+while IFS= read -r plugin; do
+  hyprctl plugin unload "$plugin" >/dev/null 2>&1 || true
+done < <(find "$PLUGIN_CACHE" -name same-session-target-pointer.so -type f 2>/dev/null)
+codex plugin remove same-session-computer-use@codex-computer-use-linux
+codex plugin marketplace remove codex-computer-use-linux
+rm -rf "$PLUGIN_CACHE"
+```
+
+The bundled Computer Use plugin is shared infrastructure. Keep it installed if you use it elsewhere; otherwise remove it separately with `codex plugin remove computer-use@openai-bundled`.
 
 ## Build the native extension
 
@@ -72,7 +119,7 @@ The generated shared object is intentionally excluded from Git. Build it on the 
 ./bin/same-session-computer-use-mcp
 ```
 
-The included Codex plugin manifest registers this broker and the included skill describes the accessibility-first control policy.
+The included Codex plugin manifest registers this broker. Its skill coordinates these Hyprland-specific tools with the separate bundled Computer Use plugin's accessibility-first controls.
 
 ## Safety boundary
 
