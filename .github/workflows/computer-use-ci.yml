@@ -37,3 +37,35 @@ jobs:
             -s contrib/hyprland-background-computer-use/tests \
             -p 'test_*.py' \
             -v
+
+      - name: Install Plasma computer use build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            dbus \
+            g++ \
+            pkg-config \
+            qt6-base-dev
+
+      - name: Compile and test Plasma computer use
+        env:
+          PYTHONPATH: contrib/plasma-same-session-computer-use/src
+        run: |
+          python3 -m compileall -q \
+            contrib/plasma-same-session-computer-use/src \
+            contrib/plasma-same-session-computer-use/tests \
+            contrib/plasma-same-session-computer-use/bin
+          python3 -m json.tool \
+            contrib/plasma-same-session-computer-use/.codex-plugin/plugin.json \
+            >/dev/null
+          python3 -m json.tool \
+            contrib/plasma-same-session-computer-use/.mcp.json \
+            >/dev/null
+          python3 -m unittest discover \
+            -s contrib/plasma-same-session-computer-use/tests \
+            -p 'test_*.py' \
+            -v
+          c++ -fPIC -Wall -Wextra -Wpedantic -std=c++17 \
+            contrib/plasma-same-session-computer-use/kwin/capture-helper.cpp \
+            -o /tmp/plasma-same-session-capture-test \
+            $(pkg-config --cflags --libs Qt6Core Qt6Gui Qt6DBus)
