@@ -223,3 +223,6 @@ jobs:
             -f sha="$head_sha" \
             --jq .merged)"
           [[ "$merged" == true ]]
+          if git ls-remote --exit-code --heads origin "refs/heads/$SYNC_BRANCH" >/dev/null; then
+            git push origin --delete "$SYNC_BRANCH"
+          fi
