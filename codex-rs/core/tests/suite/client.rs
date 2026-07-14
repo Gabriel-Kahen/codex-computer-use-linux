@@ -1224,7 +1224,7 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
     assert_eq!(request_authorization, "Bearer Test API Key");
     assert_eq!(
         request_body["prompt_cache_key"].as_str(),
-        Some(thread_id_string.as_str())
+        Some(session_id_string.as_str())
     );
     assert_codex_client_metadata(
         &request_body,
@@ -1581,6 +1581,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
         &config,
         auth_manager.clone(),
         codex_core::build_models_manager(&config, auth_manager),
+        codex_core::CodexAppsToolsCache::default(),
         SessionSource::Exec,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
         empty_extension_registry(),
