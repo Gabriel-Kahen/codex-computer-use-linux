@@ -1209,6 +1209,12 @@
             "string",
             "null"
           ]
+        },
+        "subErrorType": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -3063,6 +3069,13 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "spendControlReached": {
+          "description": "Backend-reported spend-control state. `None` is unavailable, not a sparse-update recovery.",
+          "type": [
+            "boolean",
+            "null"
           ]
         }
       },
