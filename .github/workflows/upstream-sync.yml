@@ -2,7 +2,7 @@ name: upstream-sync
 
 on:
   schedule:
-    - cron: "23 8 * * *"
+    - cron: "23 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -50,35 +50,37 @@ jobs:
           fi
 
           merge_base="$(git merge-base origin/main upstream/main)"
-          git diff --name-only "$merge_base"..upstream/main > "$RUNNER_TEMP/upstream-files.txt"
-          git diff --unified=0 "$merge_base"..upstream/main > "$RUNNER_TEMP/upstream.patch"
-          if grep -Eiq 'computer[ _-]?use' \
+          # Computer-use changes are safe to merge when they do not overlap
+          # paths changed by this fork. Same-path edits receive human review
+          # even when Git can combine them without a textual conflict.
+          git diff --name-only "$merge_base"..origin/main \
+            | sort -u > "$RUNNER_TEMP/fork-files.txt"
+          git diff --name-only "$merge_base"..upstream/main \
+            | sort -u > "$RUNNER_TEMP/upstream-files.txt"
+          comm -12 \
+            "$RUNNER_TEMP/fork-files.txt" \
             "$RUNNER_TEMP/upstream-files.txt" \
-            "$RUNNER_TEMP/upstream.patch"; then
-            echo "computer_use_review=true" >> "$GITHUB_OUTPUT"
-            {
-              grep -Ei 'computer[ _-]?use' "$RUNNER_TEMP/upstream-files.txt" || true
-              git diff \
-                --name-only \
-                -G'[Cc]omputer[ _-]?[Uu]se|COMPUTER[ _-]?USE' \
-                "$merge_base"..upstream/main
-            } | sort -u > "$RUNNER_TEMP/computer-use-review-files.txt"
+            > "$RUNNER_TEMP/overlap-files.txt"
+          if [[ -s "$RUNNER_TEMP/overlap-files.txt" ]]; then
+            echo "overlap_review=true" >> "$GITHUB_OUTPUT"
           else
-            echo "computer_use_review=false" >> "$GITHUB_OUTPUT"
+            echo "overlap_review=false" >> "$GITHUB_OUTPUT"
           fi
 
           git switch -C "$SYNC_BRANCH" origin/main
           if ! git merge --no-ff --no-edit upstream/main; then
             conflicts="$(git diff --name-only --diff-filter=U)"
             git merge --abort
-            title="Upstream Codex sync requires manual resolution"
-            body="The scheduled merge of \`openai/codex:main\` into this fork conflicted.\n\nConflicted paths:\n\n\`\`\`\n${conflicts}\n\`\`\`\n\nRun the upstream-sync workflow again after resolving the conflict."
-            issue="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
-            if [[ -n "$issue" ]]; then
-              gh issue comment "$issue" --body "$body"
-            else
-              gh issue create --title "$title" --body "$body"
-            fi
+            {
+              echo "## Upstream sync requires manual resolution"
+              echo
+              echo 'The merge of `openai/codex:main` into this fork has literal Git conflicts.'
+              echo
+              echo '```'
+              echo "$conflicts"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Upstream sync has merge conflicts: ${conflicts//$'\n'/, }"
             exit 1
           fi
 
@@ -107,6 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           head="$GITHUB_REPOSITORY_OWNER:$SYNC_BRANCH"
+          pr_body='Automated merge of the latest `openai/codex:main` into the Linux computer-use fork. Literal merge conflicts stop the workflow. Clean merges auto-merge after fork CI unless upstream and the fork changed the same paths, which requires manual review.'
           pr="$(gh api \
             --method GET \
             "repos/$GITHUB_REPOSITORY/pulls" \
@@ -121,8 +124,14 @@ jobs:
               -f base=main \
               -f head="$head" \
               -f title='Merge upstream openai/codex main' \
-              -f body='Automated merge of the latest `openai/codex:main` into the Linux computer-use fork. Literal merge conflicts stop the workflow. Upstream changes involving computer use require manual review and cannot auto-merge.' \
+              -f body="$pr_body" \
               --jq .number)"
+          else
+            gh api \
+              --method PATCH \
+              "repos/$GITHUB_REPOSITORY/pulls/$pr" \
+              -f body="$pr_body" \
+              >/dev/null
           fi
           echo "number=$pr" >> "$GITHUB_OUTPUT"
 
@@ -131,22 +140,22 @@ jobs:
           # required fork-owned check on the sync branch.
           gh workflow run computer-use-ci.yml --ref "$SYNC_BRANCH"
 
-      - name: Require review for upstream computer-use changes
+      - name: Require review for overlapping fork and upstream changes
         if: >-
           steps.merge.outputs.changed == 'true' &&
-          steps.merge.outputs.computer_use_review == 'true'
+          steps.merge.outputs.overlap_review == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ steps.pull_request.outputs.number }}
         run: |
           set -euo pipefail
-          label="upstream-computer-use-review"
+          label="upstream-fork-overlap"
           if gh api "repos/$GITHUB_REPOSITORY/labels/$label" >/dev/null 2>&1; then
             gh api \
               --method PATCH \
               "repos/$GITHUB_REPOSITORY/labels/$label" \
               -f color=B60205 \
-              -f description='Upstream computer-use changes require manual review' \
+              -f description='Upstream and the fork changed the same paths' \
               >/dev/null
           else
             gh api \
@@ -154,7 +163,7 @@ jobs:
               "repos/$GITHUB_REPOSITORY/labels" \
               -f name="$label" \
               -f color=B60205 \
-              -f description='Upstream computer-use changes require manual review' \
+              -f description='Upstream and the fork changed the same paths' \
               >/dev/null
           fi
           gh api \
@@ -162,26 +171,49 @@ jobs:
             "repos/$GITHUB_REPOSITORY/issues/$PR/labels" \
             -f "labels[]=$label" \
             >/dev/null
+          gh api \
+            --method DELETE \
+            "repos/$GITHUB_REPOSITORY/issues/$PR/labels/upstream-computer-use-review" \
+            --silent || true
 
-          paths="$(sed 's/^/- `/' "$RUNNER_TEMP/computer-use-review-files.txt" | sed 's/$/`/')"
-          body="Upstream changed computer-use-related code or text, so automatic merging is disabled. Review these paths and preserve the fork's Linux implementation before merging:
+          marker='<!-- upstream-sync-overlap -->'
+          paths="$(sed 's/^/- `/' "$RUNNER_TEMP/overlap-files.txt" | sed 's/$/`/')"
+          body="${marker}
+          Upstream and this fork both changed the paths below. Git merged them without textual conflicts and fork CI was dispatched, but automatic merging is disabled because the combined behavior needs manual review:
 
           ${paths}"
-          gh api \
-            --method POST \
+          comment_id="$(gh api \
+            --paginate \
             "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
-            -f body="$body" \
-            >/dev/null
+            --jq ".[] | select(.body | contains(\"$marker\")) | .id" \
+            | head -n 1)"
+          if [[ -n "$comment_id" ]]; then
+            gh api \
+              --method PATCH \
+              "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" \
+              -f body="$body" \
+              >/dev/null
+          else
+            gh api \
+              --method POST \
+              "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+              -f body="$body" \
+              >/dev/null
+          fi
 
-      - name: Merge unrelated upstream changes after CI
+      - name: Merge non-overlapping upstream changes after CI
         if: >-
           steps.merge.outputs.changed == 'true' &&
-          steps.merge.outputs.computer_use_review != 'true'
+          steps.merge.outputs.overlap_review != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ steps.pull_request.outputs.number }}
         run: |
           set -euo pipefail
+          gh api \
+            --method DELETE \
+            "repos/$GITHUB_REPOSITORY/issues/$PR/labels/upstream-fork-overlap" \
+            --silent || true
           gh api \
             --method DELETE \
             "repos/$GITHUB_REPOSITORY/issues/$PR/labels/upstream-computer-use-review" \
