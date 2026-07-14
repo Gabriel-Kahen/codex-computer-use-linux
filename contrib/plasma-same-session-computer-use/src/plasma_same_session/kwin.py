@@ -204,7 +204,10 @@ def build_capture_helper() -> Path:
     if not compiler:
         raise RuntimeError("CXX does not name a compiler")
     temporary = helper.with_suffix(f".{os.getpid()}.tmp")
-    proc = run([*compiler, "-O2", "-fPIC", "-std=c++17", str(source), "-o", str(temporary), *flags.stdout.split()], timeout=60)
+    proc = run(
+        [*compiler, "-O2", "-fPIC", "-std=c++17", str(source), "-o", str(temporary), *shlex.split(flags.stdout)],
+        timeout=60,
+    )
     if proc.returncode:
         temporary.unlink(missing_ok=True)
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "failed to build KWin capture helper")
@@ -225,7 +228,6 @@ def install_capture_desktop_file(helper: Path) -> None:
         "NoDisplay=true",
         f'Exec="{escaped_helper}" %U',
         "X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2",
-        "X-KDE-Wayland-Interfaces=org_kde_plasma_window_management;zkde_screencast_unstable_v1",
         "",
     ])
     if not desktop_file.is_file() or desktop_file.read_text() != contents:
@@ -249,12 +251,31 @@ def capture_window(window_id: str, output: Path) -> None:
     marker = STATE_DIR / "exact-capture-authorized"
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.parent.chmod(0o700)
-    marker.write_text(json.dumps({
-        "uid": os.getuid(),
-        "wayland_display": os.environ.get("WAYLAND_DISPLAY"),
-        "session_id": os.environ.get("XDG_SESSION_ID"),
-    }))
+    marker.write_text(json.dumps(_session_identity()))
     marker.chmod(0o600)
+
+
+def _session_identity() -> dict[str, Any]:
+    display = os.environ.get("WAYLAND_DISPLAY")
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    socket_identity = None
+    if display and runtime_dir:
+        try:
+            socket = (Path(runtime_dir) / display).stat()
+            socket_identity = {"device": socket.st_dev, "inode": socket.st_ino}
+        except OSError:
+            pass
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        boot_id = None
+    return {
+        "uid": os.getuid(),
+        "boot_id": boot_id,
+        "wayland_display": display,
+        "wayland_socket": socket_identity,
+        "session_id": os.environ.get("XDG_SESSION_ID"),
+    }
 
 
 def capture_authorized_in_current_session() -> bool:
@@ -263,8 +284,7 @@ def capture_authorized_in_current_session() -> bool:
         value = json.loads(marker.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return False
-    return value == {
-        "uid": os.getuid(),
-        "wayland_display": os.environ.get("WAYLAND_DISPLAY"),
-        "session_id": os.environ.get("XDG_SESSION_ID"),
-    }
+    current = _session_identity()
+    if not current["session_id"] and not current["wayland_socket"]:
+        return False
+    return value == current

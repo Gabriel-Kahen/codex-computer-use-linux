@@ -38,8 +38,11 @@ class LeaseTests(TestCase):
         self.lease_file = Path(self.directory.name) / "lease.json"
         self.patch = patch.object(server, "LEASE_FILE", self.lease_file)
         self.patch.start()
+        self.lock_patch = patch.object(kwin, "screen_locked", return_value=False)
+        self.lock_patch.start()
 
     def tearDown(self) -> None:
+        self.lock_patch.stop()
         self.patch.stop()
         self.directory.cleanup()
 
@@ -223,6 +226,20 @@ class LeaseTests(TestCase):
         self.assertTrue(result["journal_retained"])
         self.assertTrue(self.lease_file.exists())
 
+    @patch.object(kwin, "list_windows")
+    @patch.object(kwin, "screen_locked", return_value=True)
+    def test_restore_refuses_locked_session_and_retains_journal(self, _locked, list_windows) -> None:
+        state = {"target": WINDOW, "original": {"active_window": "{original}", "desktop": 1}}
+        self.lease_file.write_text(json.dumps(state))
+
+        result = server._restore(state)
+
+        self.assertFalse(result["recovery_complete"])
+        self.assertTrue(result["journal_retained"])
+        self.assertIn("session is locked", result["errors"][0])
+        self.assertTrue(self.lease_file.exists())
+        list_windows.assert_not_called()
+
     @patch.object(kwin, "pointer_position", return_value={"x": 99, "y": 100})
     @patch.object(kwin, "active_window_id", return_value="{original}")
     @patch.object(kwin, "current_desktop", return_value=1)
@@ -255,6 +272,27 @@ class LeaseTests(TestCase):
 
 
 class StatusTests(TestCase):
+    @patch.object(kwin, "list_windows")
+    def test_window_listing_is_paginated_and_truncates_model_visible_titles(self, list_windows) -> None:
+        list_windows.return_value = [
+            {**WINDOW, "id": f"{{{index}}}", "title": "t" * 700, "class": "c" * 300}
+            for index in range(3)
+        ]
+
+        result = server.call_tool("list_plasma_windows", {"offset": 1, "limit": 1})
+        value = result["structuredContent"]
+
+        self.assertEqual(value, {
+            "windows": [{
+                **WINDOW,
+                "id": "{1}",
+                "title": "t" * server.MAX_WINDOW_TITLE_CHARS,
+                "class": "c" * server.MAX_WINDOW_CLASS_CHARS,
+            }],
+            "total": 3,
+            "next_offset": 2,
+        })
+
     @patch.object(kwin, "screen_locked", return_value=False)
     @patch.object(kwin, "capture_authorized_in_current_session", return_value=True)
     @patch.object(kwin, "run", return_value=subprocess.CompletedProcess([], 0, "CaptureWindow", ""))

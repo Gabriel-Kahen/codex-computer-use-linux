@@ -43,9 +43,9 @@ public:
         const QVariantMap options = qdbus_cast<QVariantMap>(message.arguments().at(1));
         const auto descriptor = qvariant_cast<QDBusUnixFileDescriptor>(message.arguments().at(2));
         struct stat descriptorStat {};
-        const bool regularFile = descriptor.isValid()
+        const bool pipeFile = descriptor.isValid()
             && fstat(descriptor.fileDescriptor(), &descriptorStat) == 0
-            && S_ISREG(descriptorStat.st_mode);
+            && S_ISFIFO(descriptorStat.st_mode);
 
         QImage image(2, 2, QImage::Format_ARGB32_Premultiplied);
         image.fill(qRgba(10, 20, 30, 255));
@@ -56,7 +56,7 @@ public:
             {QStringLiteral("includeDecoration"), options.value(QStringLiteral("include-decoration")).toBool()},
             {QStringLiteral("includeShadow"), options.value(QStringLiteral("include-shadow")).toBool()},
             {QStringLiteral("nativeResolution"), options.value(QStringLiteral("native-resolution")).toBool()},
-            {QStringLiteral("regularFileDescriptor"), regularFile},
+            {QStringLiteral("pipeFileDescriptor"), pipeFile},
             {QStringLiteral("bytesWritten"), static_cast<qint64>(written)},
         };
         QFile traceFile(m_tracePath);
@@ -67,6 +67,7 @@ public:
         traceFile.close();
 
         QVariantMap result;
+        result.insert(QStringLiteral("type"), QStringLiteral("raw"));
         result.insert(QStringLiteral("width"), image.width());
         result.insert(QStringLiteral("height"), image.height());
         result.insert(QStringLiteral("stride"), image.bytesPerLine());

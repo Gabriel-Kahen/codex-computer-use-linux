@@ -18,7 +18,7 @@ class McpSmokeTests(TestCase):
 
     def test_initialize_tools_and_ping(self) -> None:
         requests = [
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}},
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "unsupported-version"}},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
             {"jsonrpc": "2.0", "id": 3, "method": "ping"},
         ]
@@ -32,6 +32,7 @@ class McpSmokeTests(TestCase):
         )
         responses = {response["id"]: response for response in map(json.loads, proc.stdout.splitlines())}
         self.assertEqual(responses[1]["result"]["serverInfo"], {"name": "plasma-same-session-computer-use", "version": "0.1.0"})
+        self.assertEqual(responses[1]["result"]["protocolVersion"], "2025-11-25")
         self.assertEqual(responses[3]["result"], {})
         tools = responses[2]["result"]["tools"]
         self.assertEqual(len(tools), 7)

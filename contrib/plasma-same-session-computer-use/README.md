@@ -34,6 +34,8 @@ Install `kdotool` from your distribution when available, or with `cargo install 
 
 The first capture compiles a small Qt D-Bus helper under `${XDG_CACHE_HOME:-$HOME/.cache}/plasma-same-session-computer-use/`. It also installs a `NoDisplay` desktop entry under `${XDG_DATA_HOME:-$HOME/.local/share}/applications/` declaring KWin's restricted screenshot interface. This is user-local and needs neither root nor a compositor restart. Some distributions may apply additional ScreenShot2 policy; in that case the tool returns KWin's authorization error and keeps exact capture disabled.
 
+The PNG returned to Codex is capped at 5 MiB so its base64-encoded MCP response remains below Codex's stdio transport limit. An oversized capture fails explicitly and does not replace `save_path`.
+
 ## Install
 
 ```bash
@@ -70,6 +72,6 @@ No KWin script is installed persistently: `kdotool` loads short-lived scripts ov
 
 ## Safety
 
-The broker refuses a new focus lease unless the standard Plasma screen-lock service positively reports the session unlocked and the original active window, target desktop, minimized state, and pointer can all be positively recorded. It verifies that KWin actually activated the target. It permits one restoration journal at a time, stores its private state directory as mode `0700` and journals as `0600`, preserves the target's minimized state, and provides explicit recovery after interruption.
+The broker refuses capture, focus changes, and restoration unless the standard Plasma screen-lock service positively reports the session unlocked. A new focus lease also requires the original active window, target desktop, minimized state, and pointer to be positively recorded. It verifies that KWin actually activated the target. It permits one restoration journal at a time, stores its private state directory as mode `0700` and journals as `0600`, preserves the target's minimized state, and provides explicit recovery after interruption. If the session locks before recovery, the journal is retained for a later unlocked recovery attempt.
 
 The duration is an advisory recovery deadline, not a background timer or input control: call `recover_plasma_focus_lease` after an expired or interrupted transaction. The backend retains its journal on material restoration or verification failures. If a recorded window has closed, recovery reports that full restoration was impossible instead of claiming success, then removes the no-longer-actionable journal after the remaining state is safely handled. The backend does not bypass authentication surfaces, application security controls, or capture exclusion requested by an application.

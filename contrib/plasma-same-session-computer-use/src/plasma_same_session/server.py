@@ -14,6 +14,11 @@ from . import kwin
 
 SERVER_INFO = {"name": "plasma-same-session-computer-use", "version": "0.1.0"}
 PROTOCOL_VERSION = "2025-11-25"
+# Base64 expansion must stay below the rmcp client's 8 MiB stdio line cap.
+MAX_CAPTURE_BYTES = 5 * 1024 * 1024
+MAX_LIST_WINDOWS = 10
+MAX_WINDOW_TITLE_CHARS = 160
+MAX_WINDOW_CLASS_CHARS = 96
 LEASE_FILE = kwin.STATE_DIR / "focus-lease.json"
 LEASE_LOCK = kwin.STATE_DIR / "focus-lease.lock"
 
@@ -26,8 +31,14 @@ TOOLS = [
     },
     {
         "name": "list_plasma_windows",
-        "description": "List windows in the current KWin session with stable internal UUIDs, desktops, processes, and exact-capture identifiers.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": "List a bounded page of windows in the current KWin session with stable internal UUIDs, desktops, processes, and exact-capture identifiers.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_WINDOWS, "default": 10},
+            },
+        },
         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     {
@@ -104,12 +115,64 @@ def _require_lease(token: str) -> dict[str, Any]:
     return state
 
 
+def _require_unlocked(operation: str) -> None:
+    locked = kwin.screen_locked()
+    if locked is not False:
+        state = "locked" if locked else "not verifiably unlocked"
+        raise RuntimeError(f"{operation} refused because the Plasma session is {state}")
+
+
+def _window_for_model(window: dict[str, Any]) -> dict[str, Any]:
+    bounded = dict(window)
+    bounded["title"] = str(window.get("title") or "")[:MAX_WINDOW_TITLE_CHARS]
+    bounded["class"] = str(window.get("class") or "")[:MAX_WINDOW_CLASS_CHARS]
+    return bounded
+
+
+def _finish_restore(
+    state: dict[str, Any],
+    errors: list[str],
+    missing_windows: list[str],
+    verified: dict[str, bool],
+    observed_pointer: dict[str, int] | None,
+) -> dict[str, Any]:
+    original = state.get("original") or {}
+    active_id = str(original.get("active_window") or "")
+    target_desktop = original.get("target_desktop")
+    recovery_complete = not errors
+    if recovery_complete:
+        LEASE_FILE.unlink(missing_ok=True)
+    return {
+        "restored": recovery_complete and not missing_windows,
+        "recovery_complete": recovery_complete,
+        "errors": errors,
+        "missing_windows": missing_windows,
+        "verified": verified,
+        "journal_retained": not recovery_complete,
+        "focus_restored_to": active_id if verified.get("focus") else None,
+        "desktop_restored_to": original.get("desktop") if verified.get("desktop") else None,
+        "target_desktop_restored_to": target_desktop if verified.get("target_desktop") else None,
+        "requested_focus_restore": active_id or None,
+        "requested_desktop_restore": original.get("desktop"),
+        "requested_target_desktop_restore": target_desktop,
+        "pointer_restore_required": original.get("pointer") is not None and not verified.get("pointer", False),
+        "pointer_restore_coordinate": original.get("pointer"),
+        "observed_pointer": observed_pointer,
+        "pointer_restored_by_this_backend": False,
+    }
+
+
 def _restore(state: dict[str, Any]) -> dict[str, Any]:
     original = state.get("original") or {}
     target = state.get("target") or {}
     errors: list[str] = []
     missing_windows: list[str] = []
     verified: dict[str, bool] = {}
+    try:
+        _require_unlocked("focus restoration")
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        return _finish_restore(state, errors, missing_windows, verified, None)
     try:
         live_ids = {window["id"] for window in kwin.list_windows()}
     except Exception as exc:
@@ -175,36 +238,13 @@ def _restore(state: dict[str, Any]) -> dict[str, Any]:
                 errors.append(f"pointer verification: expected {original_pointer}, observed {observed_pointer}")
         except Exception as exc:
             errors.append(f"pointer verification: {exc}")
-    recovery_complete = not errors
-    if recovery_complete:
-        LEASE_FILE.unlink(missing_ok=True)
-    return {
-        "restored": recovery_complete and not missing_windows,
-        "recovery_complete": recovery_complete,
-        "errors": errors,
-        "missing_windows": missing_windows,
-        "verified": verified,
-        "journal_retained": not recovery_complete,
-        "focus_restored_to": active_id if verified.get("focus") else None,
-        "desktop_restored_to": original.get("desktop") if verified.get("desktop") else None,
-        "target_desktop_restored_to": target_desktop if verified.get("target_desktop") else None,
-        "requested_focus_restore": active_id or None,
-        "requested_desktop_restore": original.get("desktop"),
-        "requested_target_desktop_restore": target_desktop,
-        "pointer_restore_required": original_pointer is not None and not verified.get("pointer", False),
-        "pointer_restore_coordinate": original_pointer,
-        "observed_pointer": observed_pointer,
-        "pointer_restored_by_this_backend": False,
-    }
+    return _finish_restore(state, errors, missing_windows, verified, observed_pointer)
 
 
 def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
     if arguments.get("acknowledge_interference") is not True:
         raise ValueError("acknowledge_interference must be true; Plasma exposes one shared input seat")
-    locked = kwin.screen_locked()
-    if locked is not False:
-        state = "locked" if locked else "could not be verified as unlocked"
-        raise RuntimeError(f"focus lease refused because the Plasma session is {state}")
+    _require_unlocked("focus lease")
     existing = _load_lease()
     if existing and time.time() > int(existing.get("expires_at") or 0):
         restored = _restore(existing)
@@ -306,6 +346,7 @@ def validate_focus_lease(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def capture_result(arguments: dict[str, Any]) -> dict[str, Any]:
+    _require_unlocked("window capture")
     selected = kwin.resolve_window(str(arguments["window"]))
     if selected.get("excluded_from_capture") is True:
         raise RuntimeError("the selected application asked KWin to exclude this window from capture")
@@ -325,13 +366,17 @@ def capture_result(arguments: dict[str, Any]) -> dict[str, Any]:
         before = {"focus": kwin.active_window_id(), "desktop": kwin.current_desktop(), "pointer": kwin.pointer_position()}
         kwin.capture_window(selected["id"], temporary)
         raw = temporary.read_bytes()
+        if len(raw) > MAX_CAPTURE_BYTES:
+            raise RuntimeError(f"captured PNG exceeds the {MAX_CAPTURE_BYTES}-byte safety limit")
+        if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise RuntimeError("KWin capture helper did not produce a PNG image")
         after = {"focus": kwin.active_window_id(), "desktop": kwin.current_desktop(), "pointer": kwin.pointer_position()}
         if output:
             temporary.replace(output)
     finally:
         temporary.unlink(missing_ok=True)
     metadata = {
-        "window": selected,
+        "window": _window_for_model(selected),
         "saved_to": str(output) if output else None,
         "compositor_capture": "org.kde.KWin.ScreenShot2.CaptureWindow",
         "observed_physical_state_unchanged": before == after,
@@ -343,7 +388,6 @@ def capture_result(arguments: dict[str, Any]) -> dict[str, Any]:
             {"type": "text", "text": json.dumps(metadata, indent=2)},
             {"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mimeType": "image/png"},
         ],
-        "structuredContent": metadata,
         "isError": False,
     }
 
@@ -407,7 +451,19 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "plasma_session_status":
         return text_result(session_status())
     if name == "list_plasma_windows":
-        return text_result({"windows": kwin.list_windows()})
+        offset = arguments.get("offset", 0)
+        limit = arguments.get("limit", 10)
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        if type(limit) is not int or not 1 <= limit <= MAX_LIST_WINDOWS:
+            raise ValueError(f"limit must be between 1 and {MAX_LIST_WINDOWS}")
+        windows = kwin.list_windows()
+        end = min(offset + limit, len(windows))
+        return text_result({
+            "windows": [_window_for_model(window) for window in windows[offset:end]],
+            "total": len(windows),
+            "next_offset": end if end < len(windows) else None,
+        })
     if name == "capture_plasma_window":
         return capture_result(arguments)
     with kwin.file_guard(LEASE_LOCK):
@@ -435,9 +491,8 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
     try:
         method = message.get("method")
         if method == "initialize":
-            requested = (message.get("params") or {}).get("protocolVersion", PROTOCOL_VERSION)
             result = {
-                "protocolVersion": requested,
+                "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": SERVER_INFO,
                 "instructions": (

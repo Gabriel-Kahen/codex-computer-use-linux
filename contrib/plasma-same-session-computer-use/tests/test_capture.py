@@ -41,12 +41,13 @@ WINDOW = {
 
 
 class BrokerCaptureTests(TestCase):
+    @patch.object(kwin, "screen_locked", return_value=False)
     @patch.object(kwin, "pointer_position", side_effect=[{"x": 4, "y": 5}, {"x": 4, "y": 5}])
     @patch.object(kwin, "current_desktop", side_effect=[2, 2])
     @patch.object(kwin, "active_window_id", side_effect=["{other}", "{other}"])
     @patch.object(kwin, "resolve_window", return_value=WINDOW)
     def test_capture_result_atomically_replaces_destination_and_returns_png_metadata(
-        self, _resolve, _active, _desktop, _pointer
+        self, _resolve, _active, _desktop, _pointer, _locked
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "capture.png"
@@ -63,14 +64,47 @@ class BrokerCaptureTests(TestCase):
 
             self.assertEqual(destination.read_bytes(), PNG)
             self.assertEqual(base64.b64decode(result["content"][1]["data"]), PNG)
-            self.assertEqual(result["structuredContent"], {
-                "window": WINDOW,
-                "saved_to": str(destination),
-                "compositor_capture": "org.kde.KWin.ScreenShot2.CaptureWindow",
-                "observed_physical_state_unchanged": True,
-                "physical_state_before": {"focus": "{other}", "desktop": 2, "pointer": {"x": 4, "y": 5}},
-                "physical_state_after": {"focus": "{other}", "desktop": 2, "pointer": {"x": 4, "y": 5}},
-            })
+            self.assertNotIn("structuredContent", result)
+            self.assertEqual(
+                json.loads(result["content"][0]["text"]),
+                {
+                    "window": WINDOW,
+                    "saved_to": str(destination),
+                    "compositor_capture": "org.kde.KWin.ScreenShot2.CaptureWindow",
+                    "observed_physical_state_unchanged": True,
+                    "physical_state_before": {"focus": "{other}", "desktop": 2, "pointer": {"x": 4, "y": 5}},
+                    "physical_state_after": {"focus": "{other}", "desktop": 2, "pointer": {"x": 4, "y": 5}},
+                },
+            )
+
+    @patch.object(kwin, "resolve_window")
+    @patch.object(kwin, "screen_locked", return_value=True)
+    def test_capture_refuses_locked_session(self, _locked, resolve) -> None:
+        with self.assertRaisesRegex(RuntimeError, "session is locked"):
+            server.capture_result({"window": "target"})
+        resolve.assert_not_called()
+
+    @patch.object(kwin, "pointer_position", return_value={"x": 4, "y": 5})
+    @patch.object(kwin, "current_desktop", return_value=2)
+    @patch.object(kwin, "active_window_id", return_value="{other}")
+    @patch.object(kwin, "resolve_window", return_value=WINDOW)
+    @patch.object(kwin, "screen_locked", return_value=False)
+    def test_capture_rejects_a_png_above_the_transport_limit(self, *_mocks) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "capture.png"
+            destination.write_bytes(b"old-image")
+
+            def write_capture(_window_id: str, temporary: Path) -> None:
+                temporary.write_bytes(PNG)
+
+            with (
+                patch.object(kwin, "capture_window", side_effect=write_capture),
+                patch.object(server, "MAX_CAPTURE_BYTES", len(PNG) - 1),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "safety limit"):
+                    server.capture_result({"window": "target", "save_path": str(destination)})
+
+            self.assertEqual(destination.read_bytes(), b"old-image")
 
 
 class KWinCaptureTests(TestCase):
@@ -82,7 +116,13 @@ class KWinCaptureTests(TestCase):
             helper.chmod(0o755)
             output = root / "window.png"
             state = root / "state"
-            environment = {"WAYLAND_DISPLAY": "wayland-test", "XDG_SESSION_ID": "session-test"}
+            identity = {
+                "uid": os.getuid(),
+                "boot_id": "boot-test",
+                "wayland_display": "wayland-test",
+                "wayland_socket": None,
+                "session_id": "session-test",
+            }
 
             def run_helper(args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
                 self.assertEqual(args, [str(helper), "target", str(output)])
@@ -94,18 +134,14 @@ class KWinCaptureTests(TestCase):
                 patch.object(kwin, "STATE_DIR", state),
                 patch.object(kwin, "build_capture_helper", return_value=helper),
                 patch.object(kwin, "run", side_effect=run_helper),
-                patch.dict(os.environ, environment, clear=False),
+                patch.object(kwin, "_session_identity", return_value=identity),
             ):
                 kwin.capture_window("{target}", output)
                 self.assertTrue(kwin.capture_authorized_in_current_session())
 
             marker = state / "exact-capture-authorized"
             self.assertEqual(output.read_bytes(), PNG)
-            self.assertEqual(json.loads(marker.read_text()), {
-                "uid": os.getuid(),
-                "wayland_display": "wayland-test",
-                "session_id": "session-test",
-            })
+            self.assertEqual(json.loads(marker.read_text()), identity)
             self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
 
@@ -128,7 +164,7 @@ class KWinCaptureTests(TestCase):
                 if args[:2] == ["pkg-config", "--exists"]:
                     return subprocess.CompletedProcess(args, 0, "", "")
                 if args[:2] == ["pkg-config", "--cflags"]:
-                    return subprocess.CompletedProcess(args, 0, "", "")
+                    return subprocess.CompletedProcess(args, 0, "-I'/tmp/qt include' -lQt6Core", "")
                 compile_commands.append(args)
                 self.assertEqual(timeout, 60)
                 output = Path(args[args.index("-o") + 1])
@@ -151,10 +187,32 @@ class KWinCaptureTests(TestCase):
             self.assertEqual(stat.S_IMODE(helper.stat().st_mode), 0o755)
             self.assertEqual(len(compile_commands), 1)
             self.assertIn(str(source), compile_commands[0])
+            self.assertIn("-I/tmp/qt include", compile_commands[0])
             desktop = data / "applications/plasma-same-session-capture.desktop"
             desktop_text = desktop.read_text()
             self.assertIn(f'Exec="{helper}" %U', desktop_text)
             self.assertIn("X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2", desktop_text)
+            self.assertNotIn("X-KDE-Wayland-Interfaces", desktop_text)
+
+    def test_authorization_marker_without_a_session_discriminator_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            identity = {
+                "uid": os.getuid(),
+                "boot_id": "boot-test",
+                "wayland_display": "wayland-0",
+                "wayland_socket": None,
+                "session_id": None,
+            }
+            marker = state / "exact-capture-authorized"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps(identity))
+
+            with (
+                patch.object(kwin, "STATE_DIR", state),
+                patch.object(kwin, "_session_identity", return_value=identity),
+            ):
+                self.assertFalse(kwin.capture_authorized_in_current_session())
 
 
 QT_DBUS_AVAILABLE = (
@@ -171,7 +229,7 @@ QT_DBUS_AVAILABLE = (
 
 @skipUnless(QT_DBUS_AVAILABLE, "Qt 6 DBus development files and dbus-run-session are required")
 class CaptureHelperIntegrationTests(TestCase):
-    def test_helper_uses_screenshot2_regular_fd_contract_and_writes_png(self) -> None:
+    def test_helper_uses_screenshot2_pipe_fd_contract_and_writes_png(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             directory_path = Path(directory)
             helper = directory_path / "capture-helper"
@@ -241,5 +299,5 @@ exit "$status"
                 "includeDecoration": False,
                 "includeShadow": False,
                 "nativeResolution": True,
-                "regularFileDescriptor": True,
+                "pipeFileDescriptor": True,
             })
