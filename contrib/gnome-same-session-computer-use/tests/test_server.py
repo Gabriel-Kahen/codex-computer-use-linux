@@ -153,6 +153,50 @@ class LeaseTests(TestCase):
         self.assertTrue(result["restored"])
         call.assert_called_once_with("RecoverLease", CAPABILITY)
 
+    def test_recovery_only_discards_expired_pending_journal_from_same_shell(self) -> None:
+        state = {
+            "token": CAPABILITY,
+            "phase": "prepared",
+            "shell_instance": "shell-1",
+            "target": {"id": "11"},
+        }
+        cases = (("shell-1", True), ("shell-2", False))
+        for current_shell, expected_restored in cases:
+            with self.subTest(current_shell=current_shell):
+                def call(method: str, *_args: str):
+                    if method == "RecoverLease":
+                        raise RuntimeError("invalid Shell lease capability")
+                    if method == "Status":
+                        return {"shell_instance": current_shell, "lease_phase": None}
+                    self.fail(f"unexpected D-Bus method {method}")
+
+                with TemporaryDirectory() as directory:
+                    with (
+                        patch.object(server, "LEASE_FILE", Path(directory) / "lease.json"),
+                        patch.object(server, "dbus_call", side_effect=call),
+                    ):
+                        server.LEASE_FILE.write_text("{}")
+                        result = server.restore_lease(state, recovery=True)
+                        remains = server.LEASE_FILE.exists()
+
+                expected_errors = [] if expected_restored else ["invalid Shell lease capability"]
+                self.assertEqual(
+                    result,
+                    {
+                        "restored": expected_restored,
+                        "errors": expected_errors,
+                        "post_restore_state": (
+                            {"shell_instance": current_shell, "lease_phase": None}
+                            if expected_restored
+                            else None
+                        ),
+                        "expired_pending_lease": expected_restored,
+                        "target": "11",
+                        "journal_retained": not expected_restored,
+                    },
+                )
+                self.assertEqual(remains, not expected_restored)
+
 
 class InputTests(TestCase):
     def test_pointer_request_is_bound_to_journaled_target(self) -> None:

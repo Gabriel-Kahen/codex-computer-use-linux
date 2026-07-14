@@ -171,6 +171,7 @@ def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
         "phase": "prepared",
         "target": prepared.get("target") or selected,
         "original": prepared.get("original"),
+        "shell_instance": prepared.get("shell_instance"),
     }
     try:
         save_lease(state)
@@ -206,6 +207,17 @@ def restore_lease(state: dict[str, Any], *, recovery: bool = False) -> dict[str,
         result = dbus_call("RecoverLease" if recovery else "RestoreLease", str(state["token"]))
     except Exception as exc:
         result = {"restored": False, "errors": [str(exc)]}
+        if recovery and state.get("phase") == "prepared" and state.get("shell_instance"):
+            try:
+                shell = dbus_call("Status")
+            except Exception:
+                shell = None
+            if (
+                isinstance(shell, dict)
+                and shell.get("shell_instance") == state["shell_instance"]
+                and shell.get("lease_phase") is None
+            ):
+                result = {"restored": True, "errors": [], "state": shell, "expired_pending_lease": True}
     if not isinstance(result, dict):
         result = {"restored": False, "errors": ["GNOME integration returned an invalid restoration result"]}
     restored = result.get("restored") is True and not result.get("errors")
@@ -215,6 +227,7 @@ def restore_lease(state: dict[str, Any], *, recovery: bool = False) -> dict[str,
         "restored": restored,
         "errors": result.get("errors") or [],
         "post_restore_state": result.get("state"),
+        "expired_pending_lease": result.get("expired_pending_lease") is True,
         "target": (state.get("target") or {}).get("id"),
         "journal_retained": not restored,
     }

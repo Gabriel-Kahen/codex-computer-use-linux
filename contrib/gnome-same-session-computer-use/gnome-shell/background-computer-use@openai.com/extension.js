@@ -43,6 +43,7 @@ export default class BackgroundComputerUseExtension extends Extension {
         this._pointer = this._seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
         this._keyboard = this._seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
         this._protocol = new LeaseProtocol();
+        this._shellInstance = GLib.uuid_string_random();
         this._leaseExpiryId = null;
         this._object = Gio.DBusExportedObject.wrapJSObject(XML, this);
         this._object.export(Gio.DBus.session, OBJECT_PATH);
@@ -69,6 +70,7 @@ export default class BackgroundComputerUseExtension extends Extension {
         this._tracker = null;
         this._protocol?.clear();
         this._protocol = null;
+        this._shellInstance = null;
         this._leaseExpiryId = null;
     }
 
@@ -175,6 +177,7 @@ export default class BackgroundComputerUseExtension extends Extension {
             modal_count: Main.modalCount,
             grab_active: global.display.is_grabbed(),
             lease_phase: this._protocol.lease?.phase ?? null,
+            shell_instance: this._shellInstance,
         });
     }
 
@@ -202,7 +205,13 @@ export default class BackgroundComputerUseExtension extends Extension {
             this._protocol.expirePending();
             return GLib.SOURCE_REMOVE;
         });
-        return {capability, phase: 'pending', target: this._window(window), original: lease.original};
+        return {
+            capability,
+            phase: 'pending',
+            target: this._window(window),
+            original: lease.original,
+            shell_instance: this._shellInstance,
+        };
     }
 
     ActivateLeaseAsync([capability], invocation) {
