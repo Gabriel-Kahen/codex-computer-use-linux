@@ -236,6 +236,16 @@ class StatusTests(TestCase):
 
 
 class McpTests(TestCase):
+    def test_initialize_does_not_claim_unknown_protocol_version(self) -> None:
+        response = server.dispatch({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2099-01-01"},
+        })
+
+        self.assertEqual(response["result"]["protocolVersion"], server.PROTOCOL_VERSION)
+
     def test_manifest_launcher_and_protocol_smoke(self) -> None:
         root = Path(__file__).resolve().parents[1]
         manifest = json.loads((root / ".codex-plugin/plugin.json").read_text())

@@ -1,3 +1,4 @@
+import json
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -57,8 +58,11 @@ class CaptureBoundaryTests(TestCase):
 
         self.assertTrue(commands[0][-5].endswith(".ScreenshotWindow"))
         self.assertEqual(commands[0][-4:-1], ["true", "false", "false"])
+        metadata = json.loads(result["content"][0]["text"])
+        self.assertNotIn("structuredContent", result)
+        self.assertEqual(result["content"][1]["type"], "image")
         self.assertEqual(
-            result["structuredContent"]["coordinate_space"],
+            metadata["coordinate_space"],
             {
                 "window_local": {"width": 400, "height": 300},
                 "screenshot_pixels": {"width": 800, "height": 600},

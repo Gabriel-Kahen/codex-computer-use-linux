@@ -295,7 +295,6 @@ def capture_window(arguments: dict[str, Any]) -> dict[str, Any]:
             {"type": "text", "text": json.dumps(metadata, indent=2)},
             {"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mimeType": "image/png"},
         ],
-        "structuredContent": metadata,
         "isError": False,
     }
 
@@ -442,9 +441,8 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
     try:
         method = message.get("method")
         if method == "initialize":
-            version = (message.get("params") or {}).get("protocolVersion", PROTOCOL_VERSION)
             result = {
-                "protocolVersion": version,
+                "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": SERVER_INFO,
                 "instructions": "Operate the real GNOME session. Prefer the separate Computer Use plugin's AT-SPI tools; global-seat actions require an acknowledged, journaled focus lease.",

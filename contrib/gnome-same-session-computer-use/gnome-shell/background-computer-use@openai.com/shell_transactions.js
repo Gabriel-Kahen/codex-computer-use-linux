@@ -16,6 +16,8 @@ export function activateLeaseTransaction(lease, adapter) {
     if (!target)
         throw new Error(`window ${lease.target} no longer exists`);
     const workspace = adapter.workspaceForWindow(target);
+    // Recovery must become authoritative before the first desktop mutation.
+    adapter.markLeaseActive();
     if (workspace)
         adapter.activateWorkspace(workspace);
     adapter.unminimizeWindow(target);

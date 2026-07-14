@@ -216,12 +216,12 @@ export default class BackgroundComputerUseExtension extends Extension {
         const state = activateLeaseTransaction(lease, {
             findWindow: id => this._windows().find(window => this._id(window) === id) ?? null,
             workspaceForWindow: window => window.get_workspace(),
+            markLeaseActive: () => this._protocol.activate(capability, sender),
             activateWorkspace: workspace => workspace.activate(time),
             unminimizeWindow: window => window.unminimize(),
             focusWindow: window => window.activate(time),
             state: () => this._state(),
         });
-        this._protocol.activate(capability, sender);
         this._cancelPendingExpiry();
         return {focused: lease.target, state};
     }

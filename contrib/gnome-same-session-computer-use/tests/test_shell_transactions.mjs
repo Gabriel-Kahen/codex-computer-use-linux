@@ -31,10 +31,21 @@ test('activation performs the focus transaction and verifies its result', () => 
     const calls = [];
     const target = {id: '11'};
     const workspace = {index: 2};
-    const lease = {target: '11'};
+    const protocol = new LeaseProtocol();
+    const lease = protocol.begin({
+        capability: CAPABILITY,
+        owner: OWNER,
+        target: '11',
+        targetMinimized: false,
+        original: {workspace: 1},
+    });
     const adapter = {
         findWindow: id => (calls.push(`find:${id}`), target),
         workspaceForWindow: window => (calls.push(`workspace:${window.id}`), workspace),
+        markLeaseActive: () => {
+            calls.push('mark-active');
+            protocol.activate(CAPABILITY, OWNER);
+        },
         activateWorkspace: value => calls.push(`activate-workspace:${value.index}`),
         unminimizeWindow: window => calls.push(`unminimize:${window.id}`),
         focusWindow: window => calls.push(`focus:${window.id}`),
@@ -42,9 +53,11 @@ test('activation performs the focus transaction and verifies its result', () => 
     };
 
     assert.throws(() => activateLeaseTransaction(lease, adapter), /did not focus/);
+    assert.equal(protocol.lease.phase, 'active');
     assert.deepEqual(calls, [
         'find:11',
         'workspace:11',
+        'mark-active',
         'activate-workspace:2',
         'unminimize:11',
         'focus:11',
