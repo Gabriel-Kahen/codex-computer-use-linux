@@ -9,6 +9,12 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ---
 
+## Codex Computer Use on Linux
+
+This fork is a home for work that improves the Codex computer-use experience on Linux. The long-term vision is broader than any one desktop environment or interaction backend: make Codex more capable, reliable, safe, and native-feeling when it works with Linux applications.
+
+The current focus is **same-session background computer use**. That means letting Codex inspect and operate applications that are already running in the user's real desktop session—preserving their processes, profiles, signed-in state, files, and open windows—without unnecessarily taking over the user's focus, cursor, or workspace. Background app control is the first major workstream, not the limit of the project.
+
 ## Quickstart
 
 ### Installing and running Codex CLI
@@ -39,9 +45,9 @@ brew install --cask codex
 
 Then simply run `codex` to get started.
 
-### Experimental Linux Computer Use fork
+### Current implementation: Hyprland background computer use
 
-This fork includes an experimental Hyprland integration that lets Codex inspect and operate windows in your existing desktop session. The integration is packaged as a Codex plugin under `contrib/hyprland-background-computer-use/`; it is not a general Linux backend and has been tested against Hyprland 0.55.4.
+The implementation currently available on `main` is an experimental Hyprland integration. It is packaged as a Codex plugin under `contrib/hyprland-background-computer-use/`; it is not yet a general Linux backend and has been tested against Hyprland 0.55.4.
 
 Install the bundled Computer Use plugin first. It supplies the accessibility and global-input tools. Then add this repository as a marketplace and install the Hyprland companion:
 
