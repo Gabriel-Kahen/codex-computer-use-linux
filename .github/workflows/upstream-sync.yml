@@ -182,11 +182,11 @@ jobs:
           Upstream and this fork both changed the paths below. Git merged them without textual conflicts and fork CI was dispatched, but automatic merging is disabled because the combined behavior needs manual review:
 
           ${paths}"
-          comment_id="$(gh api \
+          comment_ids="$(gh api \
             --paginate \
             "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
-            --jq ".[] | select(.body | contains(\"$marker\")) | .id" \
-            | head -n 1)"
+            --jq ".[] | select(.body | contains(\"$marker\")) | .id")"
+          comment_id="${comment_ids%%$'\n'*}"
           if [[ -n "$comment_id" ]]; then
             gh api \
               --method PATCH \
