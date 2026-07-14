@@ -4,7 +4,7 @@ The MCP broker attaches only to the inherited local Unix `DISPLAY` and Xauthorit
 
 `wmctrl -lpGx` supplies the EWMH client list. XIDs are exact identifiers but live only as long as the X client window. The broker reports both the advisory EWMH PID and the authenticated XRes PID. PID, title, and WM_CLASS are returned as hints for the separate AT-SPI Computer Use plugin.
 
-Exact capture uses `XCompositeNameWindowPixmap`, `XGetImage`, and libpng in a small source-built helper. It works for mapped windows while a compositing manager owns `_NET_WM_CM_Sn`, including obscured windows. Capture on another desktop depends on whether that window manager keeps the client mapped and whether its compositor retains the pixmap. The helper rejects minimized/unmapped windows and non-composited desktops instead of returning a misleading root-screen crop. Builds are same-user, cached by source hash, file-locked, and require no root daemon.
+Exact capture uses `XCompositeNameWindowPixmap`, `XGetImage`, and libpng in a small source-built helper. It works for mapped direct-color windows while a compositing manager owns `_NET_WM_CM_Sn`, including obscured windows. Capture on another desktop depends on whether that window manager keeps the client mapped and whether its compositor retains the pixmap. The helper rejects minimized/unmapped windows, indexed-color visuals, and non-composited desktops instead of returning misleading pixels. Builds are same-user, cached by source hash, file-locked, and require no root daemon.
 
 `send_window_shortcut` uses window-targeted XSendEvent through xdotool. This preserves focus but modern GTK, Qt, Chromium, Electron, and applications that inspect the synthetic bit may ignore it. The broker therefore reports delivery as unconfirmed.
 

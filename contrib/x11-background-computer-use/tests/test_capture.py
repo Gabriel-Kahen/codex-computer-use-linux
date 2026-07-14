@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import sys
 import tempfile
@@ -17,7 +18,7 @@ from x11_session_computer_use import server
 
 
 def png(width: int, height: int) -> bytes:
-    return b"\x89PNG\r\n\x1a\n" + b"\0" * 8 + width.to_bytes(4, "big") + height.to_bytes(4, "big")
+    return b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + width.to_bytes(4, "big") + height.to_bytes(4, "big")
 
 
 class CaptureBuildTests(TestCase):
@@ -76,11 +77,13 @@ class BrokerCaptureTests(TestCase):
             result = server.capture({"window": self.window["xid"]})
 
         self.assertEqual(base64.b64decode(result["content"][1]["data"]), raw)
-        self.assertEqual(result["structuredContent"]["coordinate_space"], {
+        self.assertNotIn("structuredContent", result)
+        metadata = json.loads(result["content"][0]["text"])
+        self.assertEqual(metadata["coordinate_space"], {
             "window_local": {"width": 640, "height": 480},
             "screenshot_pixels": {"width": 1280, "height": 960},
         })
-        self.assertEqual(result["structuredContent"]["capture_backend"], "XComposite named window pixmap")
+        self.assertEqual(metadata["capture_backend"], "XComposite named window pixmap")
 
     def test_save_path_replaces_destination_only_after_capture_succeeds(self) -> None:
         raw = png(640, 480)
@@ -99,7 +102,7 @@ class BrokerCaptureTests(TestCase):
                 result = server.capture({"window": self.window["xid"], "save_path": str(destination)})
 
             self.assertEqual(destination.read_bytes(), raw)
-            self.assertEqual(result["structuredContent"]["saved_to"], str(destination))
+            self.assertEqual(json.loads(result["content"][0]["text"])["saved_to"], str(destination))
             self.assertEqual(list(Path(temporary).iterdir()), [destination])
 
     def test_failed_capture_preserves_existing_destination(self) -> None:
@@ -114,3 +117,18 @@ class BrokerCaptureTests(TestCase):
 
             self.assertEqual(destination.read_bytes(), b"old")
             self.assertEqual(list(Path(temporary).iterdir()), [destination])
+
+    def test_invalid_capture_preserves_existing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "capture.png"
+            destination.write_bytes(b"old")
+
+            def fake_run(args, **_kwargs):
+                Path(args[2]).write_bytes(b"not a PNG")
+                return CompletedProcess(args, 0, "", "")
+
+            with patch.object(server, "resolve_window", return_value=self.window), patch.object(server, "ensure_capture_helper", return_value=Path("/helper")), patch.object(server, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "invalid PNG"):
+                    server.capture({"window": self.window["xid"], "save_path": str(destination)})
+
+            self.assertEqual(destination.read_bytes(), b"old")

@@ -16,7 +16,7 @@ Generic X11 cannot provide both reliable input and zero interference. Many appli
 
 - A local Xorg session with an EWMH-compatible window manager.
 - `python3`, `xprop`, `wmctrl`, `xdotool`, `xinput`, logind, and XRes 1.2.
-- For the capture and XRes ownership helper: a C compiler, `pkg-config`, and development packages for X11, XComposite, XRes, and libpng. Exact capture additionally requires an enabled X11 compositing manager.
+- For the capture and XRes ownership helper: a C compiler, `pkg-config`, and development packages for X11, XComposite, XRes, and libpng. Exact capture additionally requires an enabled X11 compositing manager and a direct-color visual, as used by normal modern Xorg desktops.
 - The bundled Computer Use plugin for preferred AT-SPI semantic actions.
 
 On Debian/Ubuntu:

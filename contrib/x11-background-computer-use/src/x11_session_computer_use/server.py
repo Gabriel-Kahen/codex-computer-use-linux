@@ -67,7 +67,9 @@ def run(args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProces
 
 def _process_start_time(pid: int) -> str | None:
     try:
-        return Path(f"/proc/{pid}/stat").read_text().split()[21]
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        fields = stat[stat.rfind(")") + 2 :].split()
+        return fields[19]
     except (FileNotFoundError, PermissionError, ProcessLookupError, IndexError):
         return None
 
@@ -95,12 +97,14 @@ def ensure_session() -> dict[str, Any]:
     session_id = os.environ.get("XDG_SESSION_ID")
     if not session_id or not shutil.which("loginctl"):
         raise RuntimeError("a logind XDG_SESSION_ID and loginctl are required to verify the local X11 login")
-    info = run(["loginctl", "show-session", session_id, "-p", "Active", "-p", "Remote", "-p", "Type", "-p", "Leader"])
+    info = run(["loginctl", "show-session", session_id, "-p", "Active", "-p", "Remote", "-p", "Type", "-p", "Display", "-p", "Leader"])
     if info.returncode:
         raise RuntimeError(info.stderr.strip() or "loginctl could not verify the graphical session")
     values = dict(line.split("=", 1) for line in info.stdout.splitlines() if "=" in line)
     if values.get("Active") != "yes" or values.get("Remote") != "no" or values.get("Type") != "x11":
         raise RuntimeError("DISPLAY is not positively verified as the active local X11 login")
+    if _normalized_display(values.get("Display", "")) != _normalized_display(display):
+        raise RuntimeError("DISPLAY does not match the X server registered for the logind session")
     probe = run(["xprop", "-root", "_NET_SUPPORTING_WM_CHECK"], timeout=5)
     if probe.returncode:
         raise RuntimeError(probe.stderr.strip() or f"cannot authenticate to X11 display {display}")
@@ -193,6 +197,8 @@ def list_windows() -> list[dict[str, Any]]:
             numeric_pid = None
             xid = raw_xid.lower()
         state = _window_state(xid)
+        if not same_uid:
+            continue
         windows.append({
             "xid": xid,
             "capture_id": xid,
@@ -249,10 +255,14 @@ def _identity_matches(expected: dict[str, Any] | None) -> bool:
     return bool(expected and _window_identity(str(expected.get("xid") or "")) == expected)
 
 
-def _validate_lease_binding(state: dict[str, Any]) -> None:
+def _validate_session_binding(state: dict[str, Any]) -> None:
     expected = state.get("session_fingerprint")
     if not isinstance(expected, dict) or ensure_session() != expected:
         raise RuntimeError("refusing lease recovery because the verified X11 login or X server/WM fingerprint changed")
+
+
+def _validate_lease_binding(state: dict[str, Any]) -> None:
+    _validate_session_binding(state)
     target_identity = state.get("target_identity")
     if target_identity and not _identity_matches(target_identity):
         raise RuntimeError("refusing lease recovery because the target X11 window identity changed")
@@ -262,7 +272,8 @@ def _active_window() -> str | None:
     proc = run(["xdotool", "getactivewindow"])
     if proc.returncode or not proc.stdout.strip().isdigit():
         return None
-    return f"0x{int(proc.stdout.strip()):08x}"
+    xid = int(proc.stdout.strip())
+    return f"0x{xid:08x}" if xid else None
 
 
 def _desktop() -> int | None:
@@ -408,6 +419,13 @@ def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
     pointer = _pointer()
     if pointer is None:
         raise RuntimeError("cannot snapshot the pointer, so an input lease cannot be restored safely")
+    active_xid = _active_window()
+    active_identity = _window_identity(active_xid)
+    if active_xid and not active_identity:
+        raise RuntimeError("cannot authenticate the active window, so focus cannot be restored safely")
+    desktop = _desktop()
+    if desktop is None:
+        raise RuntimeError("cannot snapshot the current desktop, so an input lease cannot be restored safely")
     token = secrets.token_urlsafe(18)
     state = {
         "version": 2,
@@ -416,10 +434,9 @@ def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
         "session_fingerprint": session_fingerprint,
         "target": target,
         "target_identity": target_identity,
-        "original": {"active_xid": _active_window(), "desktop": _desktop(), "pointer": pointer, "target_minimized": target["minimized"]},
+        "original": {"active_xid": active_xid, "active_identity": active_identity, "desktop": desktop, "pointer": pointer, "target_minimized": target["minimized"]},
         "pressed_button": None,
     }
-    state["original"]["active_identity"] = _window_identity(state["original"]["active_xid"])
     save_lease(state)
     try:
         _validate_lease_binding(state)
@@ -545,7 +562,7 @@ def lease_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
 
 
 def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
-    _validate_lease_binding(state)
+    _validate_session_binding(state)
     _ensure_input_safe()
     errors: list[str] = []
     pressed = state.get("pressed_button")
@@ -578,9 +595,11 @@ def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def png_size(raw: bytes) -> dict[str, int] | None:
-    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n":
+    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
         return None
-    return {"width": int.from_bytes(raw[16:20], "big"), "height": int.from_bytes(raw[20:24], "big")}
+    width = int.from_bytes(raw[16:20], "big")
+    height = int.from_bytes(raw[20:24], "big")
+    return {"width": width, "height": height} if width and height else None
 
 
 def capture(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -604,6 +623,9 @@ def capture(arguments: dict[str, Any]) -> dict[str, Any]:
         if proc.returncode:
             raise RuntimeError(proc.stderr.strip() or "exact XComposite window capture failed")
         raw = temporary.read_bytes()
+        image_size = png_size(raw)
+        if image_size is None:
+            raise RuntimeError("exact XComposite window capture returned an invalid PNG")
         if destination:
             temporary.replace(destination)
     finally:
@@ -611,13 +633,13 @@ def capture(arguments: dict[str, Any]) -> dict[str, Any]:
     metadata = {
         "window": window,
         "saved_to": str(destination) if destination else None,
-        "coordinate_space": {"window_local": {"width": window["width"], "height": window["height"]}, "screenshot_pixels": png_size(raw)},
+        "coordinate_space": {"window_local": {"width": window["width"], "height": window["height"]}, "screenshot_pixels": image_size},
         "capture_backend": "XComposite named window pixmap",
         "focus_changed": False,
         "pointer_moved": False,
         "desktop_changed": False,
     }
-    return {"content": [{"type": "text", "text": json.dumps(metadata, indent=2)}, {"type": "image", "data": base64.b64encode(raw).decode(), "mimeType": "image/png"}], "structuredContent": metadata, "isError": False}
+    return {"content": [{"type": "text", "text": json.dumps(metadata, indent=2)}, {"type": "image", "data": base64.b64encode(raw).decode(), "mimeType": "image/png"}], "isError": False}
 
 
 def status() -> dict[str, Any]:

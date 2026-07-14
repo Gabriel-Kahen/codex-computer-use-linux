@@ -22,6 +22,11 @@ class WindowTests(TestCase):
     def test_display_screen_zero_is_same_x_server(self) -> None:
         self.assertEqual(server._normalized_display(":0.0"), server._normalized_display(":0"))
 
+    def test_process_start_time_handles_spaces_in_process_name(self) -> None:
+        stat = "42 (process with spaces) S " + " ".join([*(str(index) for index in range(4, 22)), "start-time"])
+        with patch.object(Path, "read_text", return_value=stat):
+            self.assertEqual(server._process_start_time(42), "start-time")
+
     def test_parses_ewmh_windows_and_marks_same_uid(self) -> None:
         pid = os.getpid()
         advertised_pid = pid + 1000
@@ -71,9 +76,21 @@ class WindowTests(TestCase):
             with self.assertRaisesRegex(RuntimeError, "not proven"):
                 server.resolve_window("0x1")
 
+    def test_list_omits_windows_without_same_uid_proof(self) -> None:
+        wmctrl = "0x01200007  2 123 10 20 800 600 app.App host Private title\n"
+
+        with patch.object(server, "ensure_session"), patch.object(server, "run", return_value=completed([], wmctrl)), patch.object(server, "_active_window", return_value=None), patch.object(server, "_authenticated_pid", return_value=None), patch.object(server, "_window_state", return_value={"mapped": True, "minimized": False, "window_type": None}):
+            self.assertEqual(server.list_windows(), [])
+
     def test_session_requires_positive_local_logind_proof(self) -> None:
         with patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_ID": "7"}, clear=False), patch.object(server, "_local_display_socket", return_value=Path("/tmp")), patch.object(server.shutil, "which", return_value="/usr/bin/loginctl"), patch.object(server, "run", return_value=completed([], "Active=no\nRemote=no\nType=x11\nLeader=2\n")):
             with self.assertRaisesRegex(RuntimeError, "not positively verified"):
+                server.ensure_session()
+
+    def test_session_rejects_display_not_registered_with_logind(self) -> None:
+        info = "Active=yes\nRemote=no\nType=x11\nDisplay=:0\nLeader=2\n"
+        with patch.dict(os.environ, {"DISPLAY": ":99", "XDG_SESSION_ID": "7"}, clear=False), patch.object(server, "_local_display_socket", return_value=Path("/tmp")), patch.object(server.shutil, "which", return_value="/usr/bin/loginctl"), patch.object(server, "run", return_value=completed([], info)):
+            with self.assertRaisesRegex(RuntimeError, "registered for the logind session"):
                 server.ensure_session()
 
     def test_xinput_checks_each_non_xtest_slave_and_fails_closed(self) -> None:
@@ -130,7 +147,8 @@ class LeaseTests(TestCase):
             if args[0] == "windowactivate":
                 self.assertTrue(server.LEASE_FILE.exists())
 
-        with patch.object(server, "ensure_session", return_value={"session": "same"}), patch.object(server, "_ensure_input_safe"), patch.object(server, "resolve_window", return_value=target), patch.object(server, "_window_identity", side_effect=[target_identity, None]), patch.object(server, "_identity_matches", return_value=True), patch.object(server, "_active_window", return_value="0x00000010"), patch.object(server, "_desktop", return_value=3), patch.object(server, "_pointer", return_value={"x": 4, "y": 5}), patch.object(server, "_checked_xdotool", side_effect=checked), patch.object(server, "_validate_lease_binding"), patch.object(server, "run", return_value=completed([])) as run:
+        active_identity = {"xid": "0x00000010", "pid": 10, "process_start_time": "1", "wm_class": "other"}
+        with patch.object(server, "ensure_session", return_value={"session": "same"}), patch.object(server, "_ensure_input_safe"), patch.object(server, "resolve_window", return_value=target), patch.object(server, "_window_identity", side_effect=[target_identity, active_identity]), patch.object(server, "_identity_matches", return_value=True), patch.object(server, "_active_window", return_value="0x00000010"), patch.object(server, "_desktop", return_value=3), patch.object(server, "_pointer", return_value={"x": 4, "y": 5}), patch.object(server, "_checked_xdotool", side_effect=checked), patch.object(server, "_validate_lease_binding"), patch.object(server, "_validate_session_binding"), patch.object(server, "run", return_value=completed([])) as run:
             result = server.begin_lease({"window": "0x20", "acknowledge_interference": True})
             state = json.loads(server.LEASE_FILE.read_text())
             state["pressed_button"] = "1"
@@ -209,13 +227,23 @@ class LeaseTests(TestCase):
                 server.restore_lease(state)
         run.assert_not_called()
 
-    def test_changed_target_identity_blocks_recovery_before_mouseup(self) -> None:
+    def test_changed_target_identity_does_not_block_button_release(self) -> None:
         fingerprint = {"socket_inode": 1}
-        state = {"session_fingerprint": fingerprint, "target_identity": {"xid": "0x20"}, "pressed_button": "1"}
-        with patch.object(server, "ensure_session", return_value=fingerprint), patch.object(server, "_identity_matches", return_value=False), patch.object(server, "run") as run:
-            with self.assertRaisesRegex(RuntimeError, "window identity changed"):
-                server.restore_lease(state)
-        run.assert_not_called()
+        state = {"session_fingerprint": fingerprint, "target_identity": {"xid": "0x20"}, "target": {"xid": "0x20"}, "original": {}, "pressed_button": "1"}
+        with patch.object(server, "ensure_session", return_value=fingerprint), patch.object(server, "_ensure_input_safe"), patch.object(server, "_identity_matches", return_value=False), patch.object(server, "run", return_value=completed([])) as run:
+            restored = server.restore_lease(state)
+
+        self.assertTrue(restored["restored"])
+        self.assertEqual(run.call_args.args[0], ["xdotool", "mouseup", "1"])
+
+    def test_begin_refuses_unrestorable_active_window(self) -> None:
+        target = {"xid": "0x20", "pid": 20, "minimized": False, "width": 100, "height": 80}
+        target_identity = {"xid": "0x20", "pid": 20, "process_start_time": "1", "wm_class": "app"}
+        with patch.object(server, "ensure_session", return_value={"session": "same"}), patch.object(server, "_ensure_input_safe"), patch.object(server, "resolve_window", return_value=target), patch.object(server, "_window_identity", side_effect=[target_identity, None]), patch.object(server, "_active_window", return_value="0x10"), patch.object(server, "_pointer", return_value={"x": 1, "y": 2}), patch.object(server, "_checked_xdotool") as xdotool:
+            with self.assertRaisesRegex(RuntimeError, "active window"):
+                server.begin_lease({"window": "0x20", "acknowledge_interference": True})
+
+        xdotool.assert_not_called()
 
 
 class StatusTests(TestCase):

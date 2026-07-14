@@ -95,6 +95,12 @@ int main(int argc, char **argv) {
         XCloseDisplay(display);
         return 1;
     }
+    if (!attributes.visual->red_mask || !attributes.visual->green_mask ||
+        !attributes.visual->blue_mask) {
+        fprintf(stderr, "window does not use a supported direct-color visual\n");
+        XCloseDisplay(display);
+        return 1;
+    }
     XSetErrorHandler(record_x_error);
     Pixmap pixmap = XCompositeNameWindowPixmap(display, xid);
     XSync(display, False);
@@ -147,9 +153,9 @@ int main(int argc, char **argv) {
     for (unsigned py = 0; py < height; py++) {
         for (unsigned px = 0; px < width; px++) {
             unsigned long pixel = XGetPixel(image, px, py);
-            row[px * 3] = component(pixel, image->red_mask);
-            row[px * 3 + 1] = component(pixel, image->green_mask);
-            row[px * 3 + 2] = component(pixel, image->blue_mask);
+            row[px * 3] = component(pixel, attributes.visual->red_mask);
+            row[px * 3 + 1] = component(pixel, attributes.visual->green_mask);
+            row[px * 3 + 2] = component(pixel, attributes.visual->blue_mask);
         }
         png_write_row(png, row);
     }

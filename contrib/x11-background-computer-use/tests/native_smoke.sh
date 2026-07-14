@@ -21,6 +21,10 @@ trap 'exit 130' INT TERM
 export DISPLAY=$display
 export HOME=$temporary/home
 mkdir -p "$HOME"
+cc -O2 -Wall -Wextra -Werror \
+  -o "$temporary/x11-test-window" \
+  "$(dirname "$0")/x11-test-window.c" \
+  $(pkg-config --cflags --libs x11)
 
 Xvfb "$display" -screen 0 1024x768x24 -nolisten tcp >"$temporary/xvfb.log" 2>&1 &
 pids+=("$!")
@@ -42,9 +46,9 @@ openbox --sm-disable >"$temporary/openbox.log" 2>&1 &
 pids+=("$!")
 xcompmgr -a >"$temporary/xcompmgr.log" 2>&1 &
 pids+=("$!")
-xterm -fa monospace -title Codex-X11-Native-Smoke -e sh -c 'exec sleep 30' >"$temporary/xterm.log" 2>&1 &
-xterm_pid=$!
-pids+=("$xterm_pid")
+"$temporary/x11-test-window" >"$temporary/test-window.log" 2>&1 &
+window_pid=$!
+pids+=("$window_pid")
 
 window_id=
 for _ in $(seq 1 100); do
@@ -56,14 +60,14 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 if [[ -z $window_id ]]; then
-  cat "$temporary/openbox.log" "$temporary/xterm.log"
-  echo "EWMH window manager or xterm client did not become ready" >&2
+  cat "$temporary/openbox.log" "$temporary/test-window.log"
+  echo "EWMH window manager or test client did not become ready" >&2
   exit 1
 fi
 
 authenticated_pid=$($helper --pid "$window_id")
-if [[ $authenticated_pid != "$xterm_pid" ]]; then
-  echo "XRes authenticated PID $authenticated_pid, expected $xterm_pid" >&2
+if [[ $authenticated_pid != "$window_pid" ]]; then
+  echo "XRes authenticated PID $authenticated_pid, expected $window_pid" >&2
   exit 1
 fi
 
@@ -84,6 +88,7 @@ fi
 python3 - "$temporary/window.png" <<'PY'
 from pathlib import Path
 import sys
+import zlib
 
 raw = Path(sys.argv[1]).read_bytes()
 if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n":
@@ -92,5 +97,45 @@ width = int.from_bytes(raw[16:20], "big")
 height = int.from_bytes(raw[20:24], "big")
 if width <= 0 or height <= 0:
     raise SystemExit(f"invalid PNG dimensions: {width}x{height}")
+chunks = []
+offset = 8
+while offset < len(raw):
+    size = int.from_bytes(raw[offset:offset + 4], "big")
+    kind = raw[offset + 4:offset + 8]
+    data = raw[offset + 8:offset + 8 + size]
+    offset += size + 12
+    if kind == b"IDAT":
+        chunks.append(data)
+pixels = zlib.decompress(b"".join(chunks))
+stride = width * 3
+previous = bytearray(stride)
+rows = []
+offset = 0
+for _ in range(height):
+    filter_type = pixels[offset]
+    row = bytearray(pixels[offset + 1:offset + 1 + stride])
+    offset += stride + 1
+    for index in range(stride):
+        left = row[index - 3] if index >= 3 else 0
+        above = previous[index]
+        upper_left = previous[index - 3] if index >= 3 else 0
+        if filter_type == 1:
+            row[index] = (row[index] + left) & 0xff
+        elif filter_type == 2:
+            row[index] = (row[index] + above) & 0xff
+        elif filter_type == 3:
+            row[index] = (row[index] + ((left + above) // 2)) & 0xff
+        elif filter_type == 4:
+            estimate = left + above - upper_left
+            nearest = min((left, above, upper_left), key=lambda value: abs(estimate - value))
+            row[index] = (row[index] + nearest) & 0xff
+        elif filter_type != 0:
+            raise SystemExit(f"unsupported PNG filter: {filter_type}")
+    rows.append(row)
+    previous = row
+sample_offset = (width // 2) * 3
+sample = bytes(rows[height * 3 // 4][sample_offset:sample_offset + 3])
+if sample != bytes.fromhex("123456"):
+    raise SystemExit(f"captured background pixel is {sample.hex()}, expected 123456")
 print(f"XComposite PNG {width}x{height}")
 PY
