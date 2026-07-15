@@ -934,10 +934,7 @@ async fn new_turn_refreshes_managed_network_proxy_for_sandbox_change() -> anyhow
     let (session, _turn_context) = make_session_and_context().await;
     let initial_permission_profile = PermissionProfile::workspace_write();
 
-    let mut network_config = NetworkProxyConfig {
-        enabled: true,
-        ..Default::default()
-    };
+    let mut network_config = NetworkProxyConfig::default();
     network_config.set_allowed_domains(vec!["evil.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(NetworkDomainPermissionsToml {
@@ -1192,34 +1189,6 @@ async fn workspace_write_turns_continue_to_expose_managed_network_proxy() -> any
 
     let turn_context = session.new_default_turn().await;
     assert!(turn_context.network.is_some());
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-#[tokio::test]
-async fn workspace_write_turns_do_not_expose_disabled_managed_network_proxy() -> anyhow::Result<()>
-{
-    let permission_profile = PermissionProfile::workspace_write();
-    let network_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig::default(),
-        Some(NetworkConstraints {
-            enabled: Some(false),
-            ..Default::default()
-        }),
-        &permission_profile,
-    )?;
-
-    let session = make_session_with_config(move |config| {
-        config
-            .permissions
-            .set_permission_profile(permission_profile)
-            .expect("test setup should allow permission profile");
-        config.permissions.network = Some(network_spec);
-    })
-    .await?;
-
-    let turn_context = session.new_default_turn().await;
-    assert!(turn_context.network.is_none());
     Ok(())
 }
 
@@ -4746,17 +4715,9 @@ async fn active_profile_update_rebuilds_network_proxy_config() -> std::io::Resul
         codex_home.path().join(codex_config::CONFIG_TOML_FILE),
         toml::to_string(&base_config).expect("serialize config"),
     )?;
-    let elevated_only_windows_sandbox_requirement = || {
-        codex_config::test_support::CloudConfigBundleFixture::loader_with_enterprise_requirement(
-            r#"[windows]
-allowed_sandbox_implementations = ["elevated"]
-"#,
-        )
-    };
     let locked_config = Arc::new(
         ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
-            .cloud_config_bundle(elevated_only_windows_sandbox_requirement())
             .harness_overrides(ConfigOverrides {
                 cwd: Some(cwd.path().to_path_buf()),
                 ..Default::default()
@@ -4775,7 +4736,6 @@ allowed_sandbox_implementations = ["elevated"]
     );
     let selected_config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
-        .cloud_config_bundle(elevated_only_windows_sandbox_requirement())
         .harness_overrides(ConfigOverrides {
             cwd: Some(cwd.path().to_path_buf()),
             default_permissions: Some("web-enabled".to_string()),
@@ -7688,26 +7648,23 @@ async fn refresh_mcp_servers_keeps_the_previous_runtime_alive() {
     );
 }
 
+struct PendingNoiseConnectProvider;
+
+impl codex_exec_server::NoiseRendezvousConnectProvider for PendingNoiseConnectProvider {
+    fn connect_bundle(
+        &self,
+        _: codex_exec_server::NoiseChannelPublicKey,
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<codex_exec_server::NoiseRendezvousConnectBundle, codex_exec_server::ExecServerError>,
+    > {
+        Box::pin(futures::future::pending())
+    }
+}
+
 #[tokio::test]
 async fn deferred_environment_roots_refresh_plugin_availability() {
     struct ReadyPluginContributor;
-
-    struct PendingNoiseConnectProvider;
-
-    impl codex_exec_server::NoiseRendezvousConnectProvider for PendingNoiseConnectProvider {
-        fn connect_bundle(
-            &self,
-            _: codex_exec_server::NoiseChannelPublicKey,
-        ) -> futures::future::BoxFuture<
-            '_,
-            Result<
-                codex_exec_server::NoiseRendezvousConnectBundle,
-                codex_exec_server::ExecServerError,
-            >,
-        > {
-            Box::pin(futures::future::pending())
-        }
-    }
 
     impl codex_extension_api::McpServerContributor<Config> for ReadyPluginContributor {
         fn id(&self) -> &'static str {
@@ -7822,6 +7779,83 @@ async fn deferred_environment_roots_refresh_plugin_availability() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
+async fn conflicting_ready_environment_root_ids_keep_first_location() {
+    let (session, turn_context) = make_session_and_context().await;
+    let environment_manager = session.services.turn_environments.environment_manager();
+    let selected_root =
+        |environment_id: &str, path: &str| codex_protocol::capabilities::SelectedCapabilityRoot {
+            id: "shared-root".to_string(),
+            location: codex_protocol::capabilities::CapabilityRootLocation::Environment {
+                environment_id: environment_id.to_string(),
+                path: PathUri::parse(path).expect("root URI"),
+            },
+        };
+    let selected_roots = [
+        selected_root("executor-a", "file:///plugins/a"),
+        selected_root("executor-b", "file:///plugins/b"),
+    ];
+    let local_environment = turn_context
+        .environments
+        .primary()
+        .expect("ready local environment");
+    let mut turn_environments = Vec::new();
+    for selected_root in &selected_roots {
+        let codex_protocol::capabilities::CapabilityRootLocation::Environment {
+            environment_id,
+            ..
+        } = &selected_root.location;
+        let registration = environment_manager
+            .register_deferred_noise_environment(
+                environment_id.clone(),
+                Arc::new(PendingNoiseConnectProvider),
+            )
+            .expect("register deferred environment");
+        let environment = environment_manager
+            .get_environment(environment_id)
+            .expect("deferred environment");
+        registration
+            .complete(Ok(codex_exec_server::EnvironmentReadyInfo {
+                selected_capability_roots: vec![selected_root.clone()],
+            }))
+            .expect("complete deferred environment");
+        turn_environments.push(TurnEnvironment::new(
+            environment_id.clone(),
+            environment,
+            local_environment.cwd().clone(),
+            local_environment.workspace_roots().to_vec(),
+            local_environment.shell.clone(),
+        ));
+    }
+    let environments = TurnEnvironmentSnapshot {
+        turn_environments,
+        starting: Vec::new(),
+    };
+
+    let resolved_roots = session
+        .resolve_selected_capability_roots_for_step(&environments)
+        .await;
+
+    assert_eq!(
+        resolved_roots
+            .iter()
+            .map(|root| root.selected_root().clone())
+            .collect::<Vec<_>>(),
+        vec![selected_roots[0].clone()]
+    );
+    logs_assert(|lines: &[&str]| {
+        lines
+            .iter()
+            .find(|line| {
+                line.contains("ignoring selected capability root with conflicting location")
+                    && line.contains("root_id=\"shared-root\"")
+            })
+            .map(|_| Ok(()))
+            .unwrap_or_else(|| Err("expected conflicting root location warning".to_string()))
+    });
+}
+
+#[tokio::test]
 async fn built_tools_uses_the_step_mcp_runtime() -> anyhow::Result<()> {
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
@@ -7907,32 +7941,17 @@ async fn spawn_task_does_not_update_previous_turn_settings_for_non_run_turn_task
 }
 
 #[tokio::test]
-async fn record_context_updates_emits_disabled_network_transition() {
-    let (session, mut previous_context) = make_session_and_context().await;
-    let permission_profile = PermissionProfile::workspace_write();
-    let network_config = NetworkProxyConfig {
-        enabled: true,
-        ..Default::default()
-    };
-    let network_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        network_config,
-        /*requirements*/ None,
-        &permission_profile,
-    )
-    .expect("build network proxy spec");
-    let started_proxy = network_spec
-        .start_proxy(
-            &permission_profile,
-            /*policy_decider*/ None,
-            /*blocked_request_observer*/ None,
-            /*enable_network_approval_flow*/ false,
-            crate::config::NetworkProxyAuditMetadata::default(),
+async fn record_context_updates_emits_environment_item_for_network_changes() {
+    let (session, previous_context) = make_session_and_context().await;
+    let previous_context = Arc::new(previous_context);
+    let mut current_context = previous_context
+        .with_model(
+            previous_context.model_info.slug.clone(),
+            &session.services.models_manager,
         )
-        .await
-        .expect("start network proxy");
-    previous_context.network = Some(started_proxy.proxy());
+        .await;
 
-    let mut config = (*previous_context.config).clone();
+    let mut config = (*current_context.config).clone();
     let mut requirements = config.config_layer_stack.requirements().clone();
     requirements.network = Some(Sourced::new(
         NetworkConstraints {
@@ -7967,15 +7986,7 @@ async fn record_context_updates_emits_disabled_network_transition() {
         config.config_layer_stack.requirements_toml().clone(),
     )
     .expect("rebuild config layer stack with network requirements");
-    previous_context.config = Arc::new(config);
-    let previous_context = Arc::new(previous_context);
-    let mut current_context = previous_context
-        .with_model(
-            previous_context.model_info.slug.clone(),
-            &session.services.models_manager,
-        )
-        .await;
-    current_context.network = None;
+    current_context.config = Arc::new(config);
 
     let update_items =
         record_context_update_items(&session, previous_context, current_context).await;
@@ -7984,7 +7995,9 @@ async fn record_context_updates_emits_disabled_network_transition() {
         .into_iter()
         .find(|text| text.contains("<environment_context>"))
         .expect("environment update item should be emitted");
-    assert!(environment_update.contains("<network enabled=\"false\"></network>"));
+    assert!(environment_update.contains(
+        "<network enabled=\"true\"><allowed>api.example.com</allowed><denied>blocked.example.com</denied></network>"
+    ));
 }
 
 #[tokio::test]
