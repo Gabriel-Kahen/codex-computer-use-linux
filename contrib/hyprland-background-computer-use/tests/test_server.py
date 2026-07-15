@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -105,16 +106,63 @@ class WindowListingTests(TestCase):
 
         self.assertEqual(xid, "20")
 
+    def test_size_budget_paginates_without_skipping_windows(self) -> None:
+        text = "x" * server.MAX_WINDOW_TEXT_CHARS
+        raw_windows = [
+            {
+                "address": f"0x{index}",
+                "title": text,
+                "class": text,
+                "workspace": {"id": index, "name": text},
+                "stableId": index,
+            }
+            for index in range(30)
+        ]
+        seen: list[str] = []
+        cursor = None
+        page_lengths: list[int] = []
+        with patch.object(server, "hypr_windows", return_value=raw_windows):
+            while True:
+                arguments = {"cursor": cursor} if cursor is not None else {}
+                page = server.call_tool("list_session_windows", arguments)["structuredContent"]
+                encoded = json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode()
+                self.assertLessEqual(len(encoded), server.MAX_WINDOW_RESULT_BYTES)
+                page_lengths.append(len(page["windows"]))
+                seen.extend(window["address"] for window in page["windows"])
+                cursor = page["next_cursor"]
+                if cursor is None:
+                    break
+
+        self.assertLess(page_lengths[0], server.MAX_WINDOWS_PER_PAGE)
+        self.assertEqual(seen, [f"0x{index}" for index in range(30)])
+
 
 class ProtocolTests(TestCase):
-    def test_initialize_echoes_a_supported_older_protocol_version(self) -> None:
-        response = server.dispatch(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {"protocolVersion": "2025-06-18"},
-            }
-        )
+    def test_initialize_echoes_supported_protocol_versions(self) -> None:
+        for version in ("2024-11-05", "2025-03-26", "2025-06-18", server.PROTOCOL_VERSION):
+            with self.subTest(version=version):
+                response = server.dispatch(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {"protocolVersion": version},
+                    }
+                )
 
-        self.assertEqual(response["result"]["protocolVersion"], "2025-06-18")
+                self.assertEqual(response["result"]["protocolVersion"], version)
+
+    def test_dispatch_bounds_tool_and_method_errors(self) -> None:
+        with patch.object(server, "call_tool", side_effect=RuntimeError("x" * 100_000)):
+            tool_error = server.dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "session_status", "arguments": {}},
+                }
+            )
+        method_error = server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "x" * 100_000})
+
+        self.assertEqual(len(tool_error["error"]["message"]), server.MAX_ERROR_TEXT_CHARS)
+        self.assertEqual(len(method_error["error"]["message"]), server.MAX_ERROR_TEXT_CHARS)

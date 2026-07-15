@@ -22,10 +22,12 @@ from .native_plugin import plugin_build_requirements
 
 SERVER_INFO = {"name": "same-session-computer-use", "version": "0.1.1"}
 PROTOCOL_VERSION = "2025-11-25"
-SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2025-06-18", PROTOCOL_VERSION})
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", PROTOCOL_VERSION})
 # Base64 expansion must stay below the rmcp client's 8 MiB stdio line cap.
 MAX_CAPTURE_PNG_BYTES = 5 * 1024 * 1024
 MAX_CAPTURE_PIXELS = 7680 * 4320
+MAX_ERROR_TEXT_CHARS = 2048
+MAX_ERROR_ITEMS = 8
 MAX_WINDOW_RESULT_BYTES = 32 * 1024
 MAX_WINDOWS_PER_PAGE = 20
 MAX_WINDOW_TEXT_CHARS = 512
@@ -261,6 +263,13 @@ def bounded_window(window: dict[str, Any]) -> dict[str, Any]:
     return bounded
 
 
+def bounded_error(value: object) -> str:
+    message = str(value)
+    if len(message) <= MAX_ERROR_TEXT_CHARS:
+        return message
+    return f"{message[:MAX_ERROR_TEXT_CHARS - 1]}…"
+
+
 def resolve_window(query: str) -> dict[str, Any]:
     if not query or len(query) > MAX_WINDOW_TEXT_CHARS:
         raise ValueError(f"window must contain between 1 and {MAX_WINDOW_TEXT_CHARS} characters")
@@ -453,7 +462,7 @@ def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
     if not errors: LEASE_FILE.unlink(missing_ok=True)
     return {
         "restored": not errors,
-        "errors": errors,
+        "errors": [bounded_error(error) for error in errors[:MAX_ERROR_ITEMS]],
         "window_address": address,
         "focus_address": active_address,
         "pointer": cursor,
@@ -901,10 +910,10 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
             if not isinstance(args, dict): raise ValueError("tool arguments must be an object")
             result = call_tool(str(params.get("name") or ""), args)
         elif method == "ping": result = {}
-        else: return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"method not found: {method}"}}
+        else: return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": bounded_error(f"method not found: {method}")}}
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except Exception as exc:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": str(exc)}}
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": bounded_error(exc)}}
 
 
 def main() -> int:
@@ -918,7 +927,7 @@ def main() -> int:
     for line in sys.stdin:
         try: message = json.loads(line)
         except Exception as exc:
-            with lock: print(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}), flush=True)
+            with lock: print(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": bounded_error(exc)}}), flush=True)
             continue
         worker = threading.Thread(target=process, args=(message,), daemon=True)
         workers.append(worker); worker.start()

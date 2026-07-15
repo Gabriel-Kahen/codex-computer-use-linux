@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import struct
 import zlib
@@ -79,6 +80,46 @@ class CaptureSaveTests(TestCase):
 
         self.assertNotIn("structuredContent", result)
         self.assertEqual(result["content"][1]["mimeType"], "image/png")
+
+    def test_coordinate_capture_rejects_invalid_png_and_removes_temporary_file(self) -> None:
+        state = {"token": "secret", "output": "HEADLESS-1", "target": WINDOW}
+        with TemporaryDirectory() as directory:
+            capture_path = Path(directory) / "capture.png"
+            descriptor = os.open(capture_path, os.O_CREAT | os.O_RDWR, 0o600)
+
+            def capture(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                Path(args[-1]).write_bytes(b"not a PNG")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with (
+                patch.object(server, "require_lease", return_value=state),
+                patch.object(server.tempfile, "mkstemp", return_value=(descriptor, str(capture_path))),
+                patch.object(server, "run", side_effect=capture),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invalid PNG"):
+                    server.capture_lease("secret")
+
+            self.assertFalse(capture_path.exists())
+
+    def test_coordinate_capture_rejects_oversized_png_and_removes_temporary_file(self) -> None:
+        state = {"token": "secret", "output": "HEADLESS-1", "target": WINDOW}
+        with TemporaryDirectory() as directory:
+            capture_path = Path(directory) / "capture.png"
+            descriptor = os.open(capture_path, os.O_CREAT | os.O_RDWR, 0o600)
+
+            def capture(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                Path(args[-1]).write_bytes(PNG + b"x" * server.MAX_CAPTURE_PNG_BYTES)
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with (
+                patch.object(server, "require_lease", return_value=state),
+                patch.object(server.tempfile, "mkstemp", return_value=(descriptor, str(capture_path))),
+                patch.object(server, "run", side_effect=capture),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "MCP transport limit"):
+                    server.capture_lease("secret")
+
+            self.assertFalse(capture_path.exists())
 
     def test_invalid_capture_preserves_existing_destination(self) -> None:
         with TemporaryDirectory() as directory:

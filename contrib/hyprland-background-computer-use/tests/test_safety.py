@@ -189,6 +189,22 @@ class RestoreTests(TestCase):
             ],
         )
 
+    def test_bounds_restoration_error_collection(self) -> None:
+        state = {
+            "target": {"address": "0xtarget"},
+            "original": {"target_workspace": 7},
+        }
+        with (
+            patch.object(server, "hypr_windows", return_value=[{"address": "0xtarget"}]),
+            patch.object(server, "hypr_json", return_value=[]),
+            patch.object(server, "hypr_dispatch", side_effect=RuntimeError("x" * 100_000)),
+        ):
+            result = server.restore_lease(state)
+
+        self.assertFalse(result["restored"])
+        self.assertEqual(len(result["errors"]), 2)
+        self.assertTrue(all(len(error) == server.MAX_ERROR_TEXT_CHARS for error in result["errors"]))
+
 
 class StatusTests(TestCase):
     def test_reports_buildable_native_capabilities_without_claiming_at_spi(self) -> None:
