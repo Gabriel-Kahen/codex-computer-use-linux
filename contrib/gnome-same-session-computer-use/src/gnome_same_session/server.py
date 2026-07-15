@@ -28,9 +28,6 @@ SERVER_INFO = {"name": "gnome-same-session-computer-use", "version": "0.1.0"}
 PROTOCOL_VERSION = "2025-11-25"
 MAX_MCP_STDOUT_LINE_BYTES = 8 * 1024 * 1024
 MAX_CAPTURE_PNG_BYTES = 5 * 1024 * 1024
-MAX_CAPTURE_PIXELS = 7680 * 4320
-MAX_WINDOW_RESULT_BYTES = 32 * 1024
-MAX_WINDOWS_PER_PAGE = 20
 MAX_WINDOW_TEXT_CHARS = 512
 MAX_ERROR_TEXT_CHARS = 2048
 MAX_RESPONSE_COLLECTION_ITEMS = 8
@@ -142,31 +139,6 @@ def bounded_json_value(value: Any, depth: int = 0) -> Any:
             for key, item in list(value.items())[:MAX_RESPONSE_COLLECTION_ITEMS]
         }
     return bounded_text(value)
-
-
-def window_summary(window: Any) -> dict[str, Any]:
-    if not isinstance(window, dict):
-        window = {}
-    frame = window.get("frame")
-    if not isinstance(frame, dict):
-        frame = {}
-    return {
-        "id": bounded_text(window.get("id")),
-        "title": bounded_text(window.get("title")),
-        "wm_class": bounded_text(window.get("wm_class")),
-        "app_id": bounded_text(window.get("app_id")),
-        "pid": bounded_number(window.get("pid")),
-        "workspace": bounded_number(window.get("workspace")),
-        "monitor": bounded_number(window.get("monitor")),
-        "focused": window.get("focused") is True,
-        "minimized": window.get("minimized") is True,
-        "fullscreen": window.get("fullscreen") is True,
-        "client_type": bounded_text(window.get("client_type")),
-        "frame": {
-            key: bounded_number(frame.get(key))
-            for key in ("x", "y", "width", "height")
-        },
-    }
 
 
 def windows() -> list[dict[str, Any]]:
