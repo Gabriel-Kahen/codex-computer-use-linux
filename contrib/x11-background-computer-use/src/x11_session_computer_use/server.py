@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import threading
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +22,19 @@ from .capture import ensure_capture_helper
 
 SERVER_INFO = {"name": "x11-same-session-computer-use", "version": "0.1.0"}
 PROTOCOL_VERSION = "2025-11-25"
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2025-06-18", PROTOCOL_VERSION})
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "x11-same-session-computer-use"
 LEASE_FILE = STATE_DIR / "input-lease.json"
 LOCK_FILE = STATE_DIR / "input-lease.lock"
 MAX_WINDOW_RESULT_BYTES = 32 * 1024
 MAX_WINDOWS_PER_PAGE = 20
 MAX_WINDOW_TEXT_CHARS = 512
+
+
+class IdentityMatch(Enum):
+    MATCH = "match"
+    CHANGED = "changed"
+    INDETERMINATE = "indeterminate"
 
 
 def tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None, *, read_only: bool = False, idempotent: bool = False) -> dict[str, Any]:
@@ -253,12 +261,31 @@ def _window_identity(xid: str | None) -> dict[str, Any] | None:
     start_time = _process_start_time(pid) if pid else None
     if not pid or not start_time or not _pid_belongs_to_session(pid):
         return None
-    wm_class = _xprop(xid, "WM_CLASS")[:MAX_WINDOW_TEXT_CHARS]
-    return {"xid": xid, "pid": pid, "process_start_time": start_time, "wm_class": wm_class.strip()}
+    wm_class = run(["xprop", "-id", xid, "WM_CLASS"])
+    if wm_class.returncode:
+        return None
+    return {"xid": xid, "pid": pid, "process_start_time": start_time, "wm_class": wm_class.stdout[:MAX_WINDOW_TEXT_CHARS].strip()}
 
 
-def _identity_matches(expected: dict[str, Any] | None) -> bool:
-    return bool(expected and _window_identity(str(expected.get("xid") or "")) == expected)
+def _identity_matches(expected: dict[str, Any] | None) -> IdentityMatch:
+    if expected is None:
+        return IdentityMatch.CHANGED
+    xid = str(expected.get("xid") or "")
+    if not xid:
+        return IdentityMatch.INDETERMINATE
+    try:
+        current = _window_identity(xid)
+        if current is not None:
+            return IdentityMatch.MATCH if current == expected else IdentityMatch.CHANGED
+        existence = run(["xprop", "-id", xid, "WM_CLASS"])
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return IdentityMatch.INDETERMINATE
+    if existence.returncode == 0:
+        return IdentityMatch.INDETERMINATE
+    error = f"{existence.stdout}\n{existence.stderr}".casefold()
+    if "badwindow" in error or "no such window" in error:
+        return IdentityMatch.CHANGED
+    return IdentityMatch.INDETERMINATE
 
 
 def _validate_session_binding(state: dict[str, Any]) -> None:
@@ -270,8 +297,12 @@ def _validate_session_binding(state: dict[str, Any]) -> None:
 def _validate_lease_binding(state: dict[str, Any]) -> None:
     _validate_session_binding(state)
     target_identity = state.get("target_identity")
-    if target_identity and not _identity_matches(target_identity):
-        raise RuntimeError("refusing lease recovery because the target X11 window identity changed")
+    if target_identity:
+        identity = _identity_matches(target_identity)
+        if identity is IdentityMatch.CHANGED:
+            raise RuntimeError("refusing input because the target X11 window identity changed")
+        if identity is IdentityMatch.INDETERMINATE:
+            raise RuntimeError("refusing input because the target X11 window identity could not be verified")
 
 
 def _active_window() -> str | None:
@@ -395,12 +426,17 @@ def save_lease(state: dict[str, Any]) -> None:
     temporary.replace(LEASE_FILE)
 
 
-def require_lease(token: str) -> dict[str, Any]:
+def require_lease_token(token: str) -> dict[str, Any]:
     state = load_lease()
     if not state:
         raise RuntimeError("no input lease is active")
     if not secrets.compare_digest(str(state.get("token") or ""), token):
         raise ValueError("lease token does not match the active input lease")
+    return state
+
+
+def require_lease(token: str) -> dict[str, Any]:
+    state = require_lease_token(token)
     _validate_lease_binding(state)
     return state
 
@@ -479,8 +515,11 @@ def _validate_point(state: dict[str, Any], x: int, y: int) -> None:
 def _ensure_target_active(state: dict[str, Any]) -> None:
     _ensure_input_safe()
     xid = state["target"]["xid"]
-    if not _identity_matches(state.get("target_identity")):
+    identity = _identity_matches(state.get("target_identity"))
+    if identity is IdentityMatch.CHANGED:
         raise RuntimeError("the leased target window identity changed")
+    if identity is IdentityMatch.INDETERMINATE:
+        raise RuntimeError("the leased target window identity could not be verified")
     if _active_window() != xid:
         _checked_xdotool("windowactivate", "--sync", xid)
 
@@ -579,17 +618,26 @@ def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
     original = state.get("original") or {}
     target = (state.get("target") or {}).get("xid")
     active = original.get("active_xid")
+    active_identity = original.get("active_identity")
+    active_match = _identity_matches(active_identity) if active_identity else IdentityMatch.CHANGED
     try:
-        if _identity_matches(original.get("active_identity")):
+        if active_match is IdentityMatch.MATCH:
             _checked_xdotool("windowactivate", "--sync", str(active))
-        elif original.get("desktop") is not None:
-            _checked_xdotool("set_desktop", str(original["desktop"]))
+        else:
+            if active_match is IdentityMatch.INDETERMINATE:
+                errors.append("original active X11 window identity could not be verified")
+            if original.get("desktop") is not None:
+                _checked_xdotool("set_desktop", str(original["desktop"]))
     except Exception as exc:
         errors.append(f"focus/desktop restore: {exc}")
-    if original.get("target_minimized") and _identity_matches(state.get("target_identity")):
-        proc = run(["xdotool", "windowminimize", str(target)])
-        if proc.returncode:
-            errors.append(proc.stderr.strip() or "failed to restore target minimized state")
+    if original.get("target_minimized"):
+        target_match = _identity_matches(state.get("target_identity"))
+        if target_match is IdentityMatch.MATCH:
+            proc = run(["xdotool", "windowminimize", str(target)])
+            if proc.returncode:
+                errors.append(proc.stderr.strip() or "failed to restore target minimized state")
+        elif target_match is IdentityMatch.INDETERMINATE:
+            errors.append("target X11 window identity could not be verified; minimized state was not restored")
     pointer = original.get("pointer")
     if pointer:
         proc = run(["xdotool", "mousemove", "--sync", str(pointer["x"]), str(pointer["y"])])
@@ -703,7 +751,7 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             return text_result(lease_pointer(arguments, name.removeprefix("lease_pointer_")))
     if name == "end_input_lease":
         with lease_guard():
-            return text_result(restore_lease(require_lease(str(arguments["lease_token"]))))
+            return text_result(restore_lease(require_lease_token(str(arguments["lease_token"]))))
     if name == "recover_input_lease":
         with lease_guard():
             state = load_lease()
@@ -718,8 +766,9 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
     try:
         method = message.get("method")
         if method == "initialize":
-            requested = (message.get("params") or {}).get("protocolVersion", PROTOCOL_VERSION)
-            result = {"protocolVersion": requested, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate only same-UID windows in the current local EWMH Xorg login. Prefer AT-SPI through the separate Computer Use plugin; use exact XComposite capture here, and acknowledge a journaled input lease for reliable coordinate or keyboard input."}
+            requested = (message.get("params") or {}).get("protocolVersion")
+            negotiated = requested if isinstance(requested, str) and requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
+            result = {"protocolVersion": negotiated, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate only same-UID windows in the current local EWMH Xorg login. Prefer AT-SPI through the separate Computer Use plugin; use exact XComposite capture here, and acknowledge a journaled input lease for reliable coordinate or keyboard input."}
         elif method == "tools/list":
             result = {"tools": TOOLS}
         elif method == "tools/call":
