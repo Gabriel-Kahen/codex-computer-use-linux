@@ -44,7 +44,7 @@ fi
 
 openbox --sm-disable >"$temporary/openbox.log" 2>&1 &
 pids+=("$!")
-xcompmgr -a >"$temporary/xcompmgr.log" 2>&1 &
+xcompmgr -n >"$temporary/xcompmgr.log" 2>&1 &
 pids+=("$!")
 "$temporary/x11-test-window" >"$temporary/test-window.log" 2>&1 &
 window_pid=$!
