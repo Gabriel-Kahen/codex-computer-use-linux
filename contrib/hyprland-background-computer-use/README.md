@@ -32,6 +32,8 @@ The native extension sends a complete event transaction directly to the selected
 
 The fallback reuses the same application process. It does not create another profile or login. The target may be fullscreened on the temporary output, and all recorded compositor state is restored afterward.
 
+Window discovery is paginated and bounds compositor-provided text only when returning it over MCP, preserving full internal titles for reliable matching. PNG captures must pass bounded structural and pixel-stream validation before base64 encoding, and captures larger than 5 MiB are rejected so responses remain below Codex's stdio transport limit. Image results omit `structuredContent` so Codex receives the actual screenshot content blocks.
+
 ## Repository layout
 
 - `hyprland/` — ABI-checked native Wayland target-pointer extension.
