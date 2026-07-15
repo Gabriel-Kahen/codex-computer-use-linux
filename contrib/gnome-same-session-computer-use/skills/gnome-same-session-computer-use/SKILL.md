@@ -9,7 +9,7 @@ Operate the real logged-in GNOME session. Never replace it with a VM, nested des
 
 ## Workflow
 
-1. Call `session_status`, then `list_session_windows`.
+1. Call `session_status`, then `list_session_windows`; follow `next_cursor` when more windows remain.
 2. Reuse the existing matching window.
 3. Prefer semantic AT-SPI actions from `computer-use@openai-bundled`: actions first, then editable text/value operations.
 4. Exact capture of an already focused window is safe. An inactive window requires a focus lease.
