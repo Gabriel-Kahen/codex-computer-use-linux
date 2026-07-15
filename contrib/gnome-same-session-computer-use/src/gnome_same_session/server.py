@@ -65,7 +65,7 @@ TOKEN = {"type": "string", "description": "Token returned by begin_focus_lease."
 POINT = {"type": "number", "minimum": 0}
 TOOLS = [
     tool("session_status", "Report GNOME/Mutter integration health and exact capability boundaries.", {}, [], read_only=True, idempotent=True),
-    tool("list_session_windows", "List existing windows in the user's real GNOME Shell session.", {}, [], read_only=True, idempotent=True),
+    tool("list_session_windows", "List one bounded page of windows in the user's real GNOME Shell session.", {"cursor": {"type": ["string", "null"]}, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_WINDOWS_PER_PAGE}}, [], read_only=True, idempotent=True),
     tool("capture_session_window", "Capture an exact focused window. An unfocused window must first be placed under an acknowledged focus lease.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}}, ["window"], idempotent=True),
     tool("begin_focus_lease", "Journal desktop state, switch to and focus an existing window, and authorize brief global-seat contention until restored.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}}, ["window", "acknowledge_interference"]),
     tool("lease_pointer_click", "Click a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "x": POINT, "y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
@@ -145,7 +145,7 @@ def bounded_json_value(value: Any, depth: int = 0) -> Any:
 
 def windows() -> list[dict[str, Any]]:
     value = dbus_call("ListWindows")
-    if not isinstance(value, list):
+    if not isinstance(value, list) or any(not isinstance(window, dict) for window in value):
         raise RuntimeError("GNOME integration returned an invalid window list")
     return value
 
@@ -164,8 +164,13 @@ def resolve_window(query: str) -> dict[str, Any]:
     if not matches:
         raise RuntimeError(f"no real GNOME window matches {query!r}")
     if len(matches) > 1:
-        choices = ", ".join(f"{window.get('app_id')} {window.get('title')} ({window.get('id')})" for window in matches[:8])
-        raise RuntimeError(f"window query is ambiguous; use a stable id: {choices}")
+        summaries = [window_summary(window) for window in matches[:MAX_RESPONSE_COLLECTION_ITEMS]]
+        choices = ", ".join(
+            f"{window['app_id']} {window['title']} ({window['id']})"
+            for window in summaries
+        )
+        message = f"window query is ambiguous; use a stable id: {choices}"
+        raise RuntimeError(message[:MAX_ERROR_TEXT_CHARS])
     return matches[0]
 
 
@@ -201,8 +206,10 @@ def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("a focus lease is already active; end or recover it first")
     selected = resolve_window(str(arguments["window"]))
     prepared = dbus_call("BeginLease", str(selected["id"]))
+    if not isinstance(prepared, dict):
+        raise RuntimeError("GNOME integration returned an invalid lease preparation result")
     capability = prepared.get("capability")
-    if not isinstance(capability, str) or len(capability) < 64:
+    if not isinstance(capability, str) or not 64 <= len(capability) <= 256:
         raise RuntimeError("GNOME integration returned an invalid lease capability")
     state = {
         "version": 2,
@@ -224,7 +231,7 @@ def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
         raise
     return {
         "lease_token": state["token"],
-        "window": selected,
+        "window": window_summary(selected),
         "interference_boundary": "workspace and keyboard focus remain leased; pointer is briefly moved and restored per pointer action",
         "capture": "capture_session_window is exact while this lease remains active",
     }
@@ -468,9 +475,10 @@ def capture_window(arguments: dict[str, Any]) -> dict[str, Any]:
             temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
-    frame = selected.get("frame") or {}
+    summary = window_summary(selected)
+    frame = summary["frame"]
     metadata = {
-        "window": selected,
+        "window": summary,
         "saved_to": str(destination) if destination else None,
         "coordinate_space": coordinate_space(frame, raw),
         "capture_requires_focus": True,
@@ -521,7 +529,12 @@ def pointer_action(arguments: dict[str, Any], action: str) -> dict[str, Any]:
         state = require_lease(arguments.get("lease_token"))
         with INPUT_LOCK, file_guard(INPUT_FILE):
             result = dbus_call("InjectPointer", state["token"], json.dumps(request, separators=(",", ":")))
-    return {"lease_token": state["token"], "window": state["target"], "transaction": result, "global_seat_used": True}
+    return {
+        "lease_token": bounded_text(state["token"], 256),
+        "window": window_summary(state["target"]),
+        "transaction": bounded_json_value(result),
+        "global_seat_used": True,
+    }
 
 
 def send_shortcut(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -537,7 +550,11 @@ def send_shortcut(arguments: dict[str, Any]) -> dict[str, Any]:
         state = require_lease(arguments.get("lease_token"))
         with INPUT_LOCK, file_guard(INPUT_FILE):
             result = dbus_call("InjectKeys", state["token"], json.dumps(request, separators=(",", ":")))
-    return {"window": state["target"], "transaction": result, "global_seat_used": True}
+    return {
+        "window": window_summary(state["target"]),
+        "transaction": bounded_json_value(result),
+        "global_seat_used": True,
+    }
 
 
 def status() -> dict[str, Any]:
@@ -551,9 +568,10 @@ def status() -> dict[str, Any]:
     error: str | None = None
     if checks["pygobject"]:
         try:
-            integration = dbus_call("Status")
+            raw_integration = dbus_call("Status")
+            integration = bounded_json_value(raw_integration) if isinstance(raw_integration, dict) else None
         except Exception as exc:
-            error = str(exc)
+            error = bounded_text(exc, MAX_ERROR_TEXT_CHARS)
     screenshot_service = False
     if checks["gdbus"]:
         ensure_session_environment()
@@ -590,14 +608,48 @@ def status() -> dict[str, Any]:
 
 
 def text_result(value: Any) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps(value, indent=2)}], "structuredContent": value, "isError": False}
+    return {"content": [{"type": "text", "text": json.dumps(value, indent=2, ensure_ascii=False)}], "structuredContent": value, "isError": False}
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "session_status":
         return text_result(status())
     if name == "list_session_windows":
-        return text_result({"windows": windows(), "stable_id_lifetime": "until GNOME Shell or the window restarts"})
+        limit = arguments.get("limit")
+        if limit is None:
+            limit = MAX_WINDOWS_PER_PAGE
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_WINDOWS_PER_PAGE:
+            raise ValueError(f"limit must be an integer between 1 and {MAX_WINDOWS_PER_PAGE}")
+        cursor = arguments.get("cursor")
+        if cursor is None:
+            offset = 0
+        elif isinstance(cursor, str) and len(cursor) <= 20 and cursor.isascii() and cursor.isdigit():
+            offset = int(cursor)
+        else:
+            raise ValueError("cursor must be the next_cursor string from a previous result")
+        listed = [window_summary(window) for window in windows()]
+        page: list[dict[str, Any]] = []
+        end = offset
+        while end < len(listed) and len(page) < limit:
+            candidate = [*page, listed[end]]
+            candidate_end = end + 1
+            candidate_result = {
+                "windows": candidate,
+                "next_cursor": str(candidate_end) if candidate_end < len(listed) else None,
+                "stable_id_lifetime": "until GNOME Shell or the window restarts",
+            }
+            encoded = json.dumps(candidate_result, ensure_ascii=False, separators=(",", ":")).encode()
+            if len(encoded) > MAX_WINDOW_RESULT_BYTES:
+                break
+            page = candidate
+            end = candidate_end
+        if not page and offset < len(listed):
+            raise RuntimeError("a window entry exceeds the bounded listing result size")
+        return text_result({
+            "windows": page,
+            "next_cursor": str(end) if end < len(listed) else None,
+            "stable_id_lifetime": "until GNOME Shell or the window restarts",
+        })
     if name == "capture_session_window":
         return capture_window(arguments)
     if name == "begin_focus_lease":
@@ -644,10 +696,12 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
         elif method == "ping":
             result = {}
         else:
-            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"method not found: {method}"}}
+            message = bounded_text(f"method not found: {method}", MAX_ERROR_TEXT_CHARS)
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": message}}
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except Exception as exc:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": str(exc)}}
+        message = bounded_text(exc, MAX_ERROR_TEXT_CHARS)
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": message}}
 
 
 def main() -> int:

@@ -29,6 +29,42 @@ class ResolutionTests(TestCase):
             with self.assertRaisesRegex(RuntimeError, "ambiguous"):
                 server.resolve_window("Editor")
 
+    def test_preserves_raw_window_text_for_matching_and_bounds_summaries(self) -> None:
+        oversized = {
+            **WINDOWS[0],
+            "title": "t" * (server.MAX_WINDOW_TEXT_CHARS + 1),
+            "wm_class": "w" * (server.MAX_WINDOW_TEXT_CHARS + 1),
+            "app_id": "a" * (server.MAX_WINDOW_TEXT_CHARS + 1),
+        }
+        with patch.object(server, "dbus_call", return_value=[oversized]):
+            raw = server.windows()[0]
+            bounded = server.window_summary(raw)
+
+        self.assertEqual(raw, oversized)
+        self.assertEqual(len(bounded["title"]), server.MAX_WINDOW_TEXT_CHARS)
+        self.assertEqual(len(bounded["wm_class"]), server.MAX_WINDOW_TEXT_CHARS)
+        self.assertEqual(len(bounded["app_id"]), server.MAX_WINDOW_TEXT_CHARS)
+
+    def test_matches_title_substring_beyond_summary_boundary(self) -> None:
+        oversized = {**WINDOWS[0], "title": "x" * server.MAX_WINDOW_TEXT_CHARS + " deep marker"}
+        with patch.object(server, "windows", return_value=[oversized]):
+            selected = server.resolve_window("deep marker")
+
+        self.assertEqual(selected, oversized)
+
+    def test_bounds_ambiguous_window_error(self) -> None:
+        oversized = {
+            **WINDOWS[0],
+            "title": "t" * server.MAX_MCP_STDOUT_LINE_BYTES,
+            "app_id": "a" * server.MAX_MCP_STDOUT_LINE_BYTES,
+        }
+        duplicates = [oversized, {**oversized, "id": "13"}]
+        with patch.object(server, "windows", return_value=duplicates):
+            with self.assertRaises(RuntimeError) as raised:
+                server.resolve_window("t")
+
+        self.assertLessEqual(len(str(raised.exception)), server.MAX_ERROR_TEXT_CHARS)
+
 
 class DbusTests(TestCase):
     def test_reuses_one_connection_for_caller_bound_lease_calls(self) -> None:
@@ -80,6 +116,7 @@ class LeaseTests(TestCase):
 
     def test_journals_original_state_before_focus(self) -> None:
         events: list[str] = []
+        selected = {**WINDOWS[0], "title": "x" * server.MAX_MCP_STDOUT_LINE_BYTES}
 
         def call(method: str, *args: str):
             events.append(method)
@@ -99,7 +136,7 @@ class LeaseTests(TestCase):
             with (
                 patch.object(server, "LEASE_FILE", Path(directory) / "lease.json"),
                 patch.object(server, "STATE_DIR", Path(directory)),
-                patch.object(server, "resolve_window", return_value=WINDOWS[0]),
+                patch.object(server, "resolve_window", return_value=selected),
                 patch.object(server, "dbus_call", side_effect=call),
             ):
                 result = server.begin_lease({"window": "11", "acknowledge_interference": True})
@@ -108,7 +145,8 @@ class LeaseTests(TestCase):
         self.assertEqual(events, ["BeginLease", "ActivateLease"])
         self.assertEqual(journal["phase"], "active")
         self.assertEqual(journal["token"], CAPABILITY)
-        self.assertEqual(result["window"], WINDOWS[0])
+        self.assertEqual(result["window"], server.window_summary(selected))
+        self.assertEqual(len(result["window"]["title"]), server.MAX_WINDOW_TEXT_CHARS)
 
     def test_restore_keeps_journal_when_shell_restore_fails(self) -> None:
         state = {"token": CAPABILITY, "target": {"id": "11"}, "original": {"workspace": 0}}
@@ -309,11 +347,18 @@ class LeaseTests(TestCase):
 
 class InputTests(TestCase):
     def test_pointer_request_is_bound_to_journaled_target(self) -> None:
-        state = {"token": CAPABILITY, "target": WINDOWS[0]}
+        state = {
+            "token": CAPABILITY,
+            "target": {**WINDOWS[0], "title": "x" * server.MAX_MCP_STDOUT_LINE_BYTES},
+        }
         with (
             patch.object(server, "require_lease", return_value=state),
             patch.object(server, "file_guard"),
-            patch.object(server, "dbus_call", return_value={"pointer_restored": True}) as call,
+            patch.object(
+                server,
+                "dbus_call",
+                return_value={"pointer_restored": True, "detail": "x" * server.MAX_MCP_STDOUT_LINE_BYTES},
+            ) as call,
         ):
             result = server.pointer_action({"lease_token": CAPABILITY, "x": 10, "y": 20}, "click")
 
@@ -321,6 +366,8 @@ class InputTests(TestCase):
         self.assertEqual(call.call_args.args[1], CAPABILITY)
         self.assertEqual(request["point"], {"x": 10.0, "y": 20.0})
         self.assertTrue(result["global_seat_used"])
+        self.assertEqual(len(result["window"]["title"]), server.MAX_WINDOW_TEXT_CHARS)
+        self.assertEqual(len(result["transaction"]["detail"]), server.MAX_WINDOW_TEXT_CHARS)
 
     def test_lease_lock_covers_token_validation_and_input(self) -> None:
         events: list[str] = []
@@ -398,6 +445,74 @@ class McpTests(TestCase):
         })
 
         self.assertEqual(response["result"]["protocolVersion"], server.PROTOCOL_VERSION)
+
+    def test_window_listing_is_paginated_below_transport_limit(self) -> None:
+        listed = [{**WINDOWS[0], "id": str(index)} for index in range(server.MAX_WINDOWS_PER_PAGE + 1)]
+        with patch.object(server, "windows", return_value=listed):
+            first = server.call_tool("list_session_windows", {"limit": 2})
+            second = server.call_tool("list_session_windows", {"limit": 2, "cursor": "2"})
+
+        self.assertEqual([window["id"] for window in first["structuredContent"]["windows"]], ["0", "1"])
+        self.assertEqual(first["structuredContent"]["next_cursor"], "2")
+        self.assertEqual([window["id"] for window in second["structuredContent"]["windows"]], ["2", "3"])
+        encoded = json.dumps({"jsonrpc": "2.0", "id": 1, "result": first}, separators=(",", ":")).encode()
+        self.assertLess(len(encoded), server.MAX_MCP_STDOUT_LINE_BYTES)
+
+    def test_window_listing_truncates_by_size_without_skips(self) -> None:
+        bounded = {
+            "title": "t" * server.MAX_WINDOW_TEXT_CHARS,
+            "app_id": "a" * server.MAX_WINDOW_TEXT_CHARS,
+            "wm_class": "w" * server.MAX_WINDOW_TEXT_CHARS,
+        }
+        listed = [{**WINDOWS[0], **bounded, "id": str(index)} for index in range(30)]
+        pages = []
+        cursor = None
+        with patch.object(server, "windows", return_value=listed):
+            while True:
+                arguments = {"limit": server.MAX_WINDOWS_PER_PAGE}
+                if cursor is not None:
+                    arguments["cursor"] = cursor
+                page = server.call_tool("list_session_windows", arguments)
+                pages.append(page)
+                cursor = page["structuredContent"]["next_cursor"]
+                if cursor is None:
+                    break
+
+        first = pages[0]
+        first_windows = first["structuredContent"]["windows"]
+        self.assertEqual(len(first_windows), 18)
+        self.assertEqual(first["structuredContent"]["next_cursor"], "18")
+        self.assertEqual(pages[1]["structuredContent"]["windows"][0]["id"], "18")
+        self.assertEqual(
+            [window["id"] for page in pages for window in page["structuredContent"]["windows"]],
+            [str(index) for index in range(30)],
+        )
+        for page in pages:
+            structured = json.dumps(page["structuredContent"], ensure_ascii=False, separators=(",", ":")).encode()
+            response = json.dumps({"jsonrpc": "2.0", "id": 1, "result": page}, ensure_ascii=False, separators=(",", ":")).encode()
+            self.assertLessEqual(len(structured), server.MAX_WINDOW_RESULT_BYTES)
+            self.assertLess(len(response), server.MAX_MCP_STDOUT_LINE_BYTES)
+
+    def test_oversized_title_is_bounded_before_mcp_serialization(self) -> None:
+        oversized = {**WINDOWS[0], "title": "x" * server.MAX_MCP_STDOUT_LINE_BYTES}
+        with patch.object(server, "dbus_call", return_value=[oversized]):
+            result = server.dispatch({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "list_session_windows", "arguments": {}},
+            })
+
+        title = result["result"]["structuredContent"]["windows"][0]["title"]
+        encoded = json.dumps(result, separators=(",", ":")).encode()
+        self.assertEqual(len(title), server.MAX_WINDOW_TEXT_CHARS)
+        self.assertLess(len(encoded), server.MAX_MCP_STDOUT_LINE_BYTES)
+
+    def test_window_listing_rejects_invalid_page_arguments(self) -> None:
+        for arguments in ({"limit": True}, {"limit": server.MAX_WINDOWS_PER_PAGE + 1}, {"cursor": "-1"}):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(ValueError):
+                    server.call_tool("list_session_windows", arguments)
 
     def test_manifest_launcher_and_protocol_smoke(self) -> None:
         root = Path(__file__).resolve().parents[1]

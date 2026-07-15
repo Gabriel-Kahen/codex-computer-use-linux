@@ -50,7 +50,12 @@ class CaptureBoundaryTests(TestCase):
             self.assertEqual(list(destination.parent.glob(".capture.png.*.png")), [])
 
     def test_screenshot_signature_and_scaled_coordinate_transform(self) -> None:
-        window = {"id": "11", "focused": True, "frame": {"width": 400, "height": 300}}
+        window = {
+            "id": "11",
+            "title": "x" * server.MAX_MCP_STDOUT_LINE_BYTES,
+            "focused": True,
+            "frame": {"width": 400, "height": 300},
+        }
         commands: list[list[str]] = []
 
         def capture(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -70,6 +75,7 @@ class CaptureBoundaryTests(TestCase):
         metadata = json.loads(result["content"][0]["text"])
         self.assertNotIn("structuredContent", result)
         self.assertEqual(result["content"][1]["type"], "image")
+        self.assertEqual(len(metadata["window"]["title"]), server.MAX_WINDOW_TEXT_CHARS)
         self.assertEqual(
             metadata["coordinate_space"],
             {

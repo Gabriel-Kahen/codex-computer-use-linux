@@ -49,7 +49,7 @@ Start a new Codex task after installation. Call `session_status` before doing wo
 
 ## Workflow
 
-1. Discover the target with `list_session_windows`.
+1. Discover the target with `list_session_windows`, following `next_cursor` for additional bounded pages.
 2. Prefer the companion plugin's AT-SPI actions.
 3. For exact visual or coordinate work, ask the user to acknowledge interference and call `begin_focus_lease`.
 4. Capture or operate the leased window.
