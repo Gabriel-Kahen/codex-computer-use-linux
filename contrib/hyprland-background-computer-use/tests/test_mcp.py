@@ -20,7 +20,7 @@ class RepositorySmokeTests(TestCase):
 
     def test_mcp_initialize_tools_and_ping(self) -> None:
         requests = [
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}},
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "unsupported-version"}},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
             {"jsonrpc": "2.0", "id": 3, "method": "ping"},
         ]
