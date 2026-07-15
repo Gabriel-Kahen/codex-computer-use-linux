@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,13 @@ from .native_plugin import plugin_build_requirements
 
 SERVER_INFO = {"name": "same-session-computer-use", "version": "0.1.1"}
 PROTOCOL_VERSION = "2025-11-25"
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2025-06-18", PROTOCOL_VERSION})
+# Base64 expansion must stay below the rmcp client's 8 MiB stdio line cap.
+MAX_CAPTURE_PNG_BYTES = 5 * 1024 * 1024
+MAX_CAPTURE_PIXELS = 7680 * 4320
+MAX_WINDOW_RESULT_BYTES = 32 * 1024
+MAX_WINDOWS_PER_PAGE = 20
+MAX_WINDOW_TEXT_CHARS = 512
 LEASE_FILE = STATE_DIR / "coordinate-lease.json"
 LOCK_FILE = STATE_DIR / "coordinate-lease.lock"
 POINTER_LOCK_FILE = STATE_DIR / "pointer-transaction.lock"
@@ -36,8 +44,14 @@ TOOLS = [
     },
     {
         "name": "list_session_windows",
-        "description": "List real windows from the user's current Hyprland login, including workspace, process, accessibility hints, and exact-capture identifiers.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": "List a bounded page of real windows from the user's current Hyprland login, including workspace, process, accessibility hints, and exact-capture identifiers.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cursor": {"type": ["string", "null"], "maxLength": 20},
+                "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_WINDOWS_PER_PAGE},
+            },
+        },
         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     {
@@ -217,16 +231,14 @@ def hypr_windows() -> list[dict[str, Any]]:
 def combine_windows() -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for win in hypr_windows():
-        title = str(win.get("title") or "")
-        klass = str(win.get("class") or "")
         workspace = win.get("workspace") or {}
         result.append({
             "address": win.get("address"),
-            "class": klass,
-            "title": title,
+            "class": str(win.get("class") or ""),
+            "title": str(win.get("title") or ""),
             "pid": win.get("pid"),
             "workspace": workspace.get("id"),
-            "workspace_name": workspace.get("name"),
+            "workspace_name": str(workspace.get("name") or ""),
             "monitor": win.get("monitor"),
             "focused": win.get("focusHistoryID") == 0,
             "mapped": win.get("mapped", True),
@@ -241,7 +253,17 @@ def combine_windows() -> list[dict[str, Any]]:
     return result
 
 
+def bounded_window(window: dict[str, Any]) -> dict[str, Any]:
+    bounded = dict(window)
+    for field in ("address", "capture_id", "class", "title", "workspace_name"):
+        if bounded.get(field) is not None:
+            bounded[field] = str(bounded[field])[:MAX_WINDOW_TEXT_CHARS]
+    return bounded
+
+
 def resolve_window(query: str) -> dict[str, Any]:
+    if not query or len(query) > MAX_WINDOW_TEXT_CHARS:
+        raise ValueError(f"window must contain between 1 and {MAX_WINDOW_TEXT_CHARS} characters")
     windows = combine_windows()
     q = query.lower()
     exact = [w for w in windows if q in {str(w.get("address") or "").lower(), str(w.get("capture_id") or "").lower(), str(w.get("class") or "").lower()}]
@@ -249,7 +271,12 @@ def resolve_window(query: str) -> dict[str, Any]:
     if not matches:
         raise RuntimeError(f"no real session window matches {query!r}")
     if len(matches) > 1:
-        choices = ", ".join(f"{w.get('class')} {w.get('title')} ({w.get('address')})" for w in matches[:8])
+        choices = ", ".join(
+            f"{str(w.get('class') or '')[:MAX_WINDOW_TEXT_CHARS]} "
+            f"{str(w.get('title') or '')[:MAX_WINDOW_TEXT_CHARS]} "
+            f"({str(w.get('address') or '')[:MAX_WINDOW_TEXT_CHARS]})"
+            for w in matches[:8]
+        )
         raise RuntimeError(f"window query is ambiguous; use an address or identifier: {choices}")
     if not matches[0].get("capture_id"):
         raise RuntimeError("the selected window has no exact-capture identifier")
@@ -369,7 +396,7 @@ def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
             "lease_token": token,
             "output": output,
             "workspace": workspace,
-            "window": current,
+            "window": bounded_window(current) if current else None,
             "fullscreened_on_fallback_screen": bool(state["fallback"]["fullscreen_applied"]),
             "original_fullscreen": int(selected.get("fullscreen") or 0),
             "interference_boundary": "global keyboard focus and raw pointer are shared until end_coordinate_lease",
@@ -439,12 +466,14 @@ def capture_lease(token: str) -> dict[str, Any]:
     state = require_lease(token)
     fd, name = tempfile.mkstemp(prefix="same-session-coordinate-", suffix=".png")
     os.close(fd); output = Path(name)
-    proc = run(["grim", "-o", str(state["output"]), str(output)], timeout=20)
-    if proc.returncode:
+    try:
+        proc = run(["grim", "-o", str(state["output"]), str(output)], timeout=20)
+        if proc.returncode:
+            raise RuntimeError(proc.stderr.strip() or "coordinate desktop capture failed")
+        raw = read_bounded_png(output, "coordinate desktop capture")
+    finally:
         output.unlink(missing_ok=True)
-        raise RuntimeError(proc.stderr.strip() or "coordinate desktop capture failed")
-    raw = output.read_bytes()
-    data = base64.b64encode(raw).decode("ascii"); output.unlink(missing_ok=True)
+    data = base64.b64encode(raw).decode("ascii")
     monitor = next((m for m in hypr_json(["monitors"]) if m.get("name") == state["output"]), None)
     if monitor is None:
         raise RuntimeError("coordinate lease output disappeared before capture metadata was collected")
@@ -457,7 +486,7 @@ def capture_lease(token: str) -> dict[str, Any]:
     metadata = {
         "lease_token": token,
         "output": state["output"],
-        "window": current,
+        "window": bounded_window(current),
         "fullscreened_on_fallback_screen": bool((state.get("fallback") or {}).get("fullscreen_applied")),
         "coordinate_space": {
             "desktop_origin": {"x": int(monitor.get("x") or 0), "y": int(monitor.get("y") or 0)},
@@ -468,7 +497,7 @@ def capture_lease(token: str) -> dict[str, Any]:
             "note": "For global fallback input: desktop_x = origin.x + screenshot_x * width / screenshot_pixels.width, and likewise for y.",
         },
     }
-    return {"content": [{"type": "text", "text": json.dumps(metadata, indent=2)}, {"type": "image", "data": data, "mimeType": "image/png"}], "structuredContent": metadata, "isError": False}
+    return {"content": [{"type": "text", "text": json.dumps(metadata, indent=2)}, {"type": "image", "data": data, "mimeType": "image/png"}], "isError": False}
 
 
 def physical_snapshot() -> dict[str, Any]:
@@ -482,9 +511,114 @@ def validate_point(window: dict[str, Any], x: float, y: float) -> None:
 
 
 def png_pixel_size(raw: bytes) -> dict[str, int] | None:
-    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n":
+    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
         return None
-    return {"width": int.from_bytes(raw[16:20], "big"), "height": int.from_bytes(raw[20:24], "big")}
+    width = int.from_bytes(raw[16:20], "big")
+    height = int.from_bytes(raw[20:24], "big")
+    return {"width": width, "height": height} if width and height else None
+
+
+def valid_png(raw: bytes) -> bool:
+    if raw[:8] != b"\x89PNG\r\n\x1a\n":
+        return False
+    offset = 8
+    decoder = None
+    decoded = 0
+    expected_decoded = 0
+    row_bytes = 0
+    saw_idat = False
+    idat_ended = False
+    saw_iend = False
+    while offset + 12 <= len(raw):
+        length = int.from_bytes(raw[offset : offset + 4], "big")
+        chunk_type = raw[offset + 4 : offset + 8]
+        data_start = offset + 8
+        data_end = data_start + length
+        chunk_end = data_end + 4
+        if chunk_end > len(raw):
+            return False
+        chunk_data = memoryview(raw)[data_start:data_end]
+        expected_crc = int.from_bytes(raw[data_end:chunk_end], "big")
+        if zlib.crc32(chunk_data, zlib.crc32(chunk_type)) & 0xFFFFFFFF != expected_crc:
+            return False
+        if offset == 8:
+            if chunk_type != b"IHDR" or length != 13:
+                return False
+            width = int.from_bytes(chunk_data[:4], "big")
+            height = int.from_bytes(chunk_data[4:8], "big")
+            bit_depth = chunk_data[8]
+            color_type = chunk_data[9]
+            valid_depths = {
+                0: {1, 2, 4, 8, 16},
+                2: {8, 16},
+                3: {1, 2, 4, 8},
+                4: {8, 16},
+                6: {8, 16},
+            }
+            if (
+                not width
+                or not height
+                or width * height > MAX_CAPTURE_PIXELS
+                or bit_depth not in valid_depths.get(color_type, set())
+                or bytes(chunk_data[10:13]) != b"\x00\x00\x00"
+            ):
+                return False
+            channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
+            row_bytes = (width * channels * bit_depth + 7) // 8 + 1
+            expected_decoded = row_bytes * height
+            decoder = zlib.decompressobj()
+        elif chunk_type == b"IHDR":
+            return False
+        elif chunk_type == b"IDAT":
+            if decoder is None or idat_ended or saw_iend:
+                return False
+            saw_idat = True
+            compressed: bytes | memoryview = chunk_data
+            while True:
+                remaining = expected_decoded - decoded + 1
+                if remaining <= 0:
+                    return False
+                maximum = min(64 * 1024, remaining)
+                try:
+                    output = decoder.decompress(compressed, maximum)
+                except zlib.error:
+                    return False
+                first_filter = (-decoded) % row_bytes
+                if any(output[index] > 4 for index in range(first_filter, len(output), row_bytes)):
+                    return False
+                decoded += len(output)
+                compressed = decoder.unconsumed_tail
+                if compressed:
+                    continue
+                if len(output) == maximum and not decoder.eof:
+                    compressed = b""
+                    continue
+                break
+            if decoder.unused_data:
+                return False
+        else:
+            if saw_idat:
+                idat_ended = True
+            if chunk_type == b"IEND":
+                if length or not saw_idat or decoder is None or not decoder.eof:
+                    return False
+                saw_iend = True
+                offset = chunk_end
+                break
+        offset = chunk_end
+    return saw_iend and offset == len(raw) and decoded == expected_decoded
+
+
+def read_bounded_png(path: Path, operation: str) -> bytes:
+    if path.stat().st_size > MAX_CAPTURE_PNG_BYTES:
+        raise RuntimeError(f"{operation} exceeds the {MAX_CAPTURE_PNG_BYTES}-byte MCP transport limit")
+    with path.open("rb") as image:
+        raw = image.read(MAX_CAPTURE_PNG_BYTES + 1)
+    if len(raw) > MAX_CAPTURE_PNG_BYTES:
+        raise RuntimeError(f"{operation} exceeds the {MAX_CAPTURE_PNG_BYTES}-byte MCP transport limit")
+    if not valid_png(raw):
+        raise RuntimeError(f"{operation} returned an invalid PNG")
+    return raw
 
 
 def window_coordinate_space(window: dict[str, Any], raw: bytes) -> dict[str, Any] | None:
@@ -585,7 +719,7 @@ def _targeted_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
     if isinstance(result, dict) and result.get("ok") is False: raise RuntimeError(str(result.get("error") or "targeted pointer action failed"))
     after = physical_snapshot()
     unchanged = after == before
-    return {"action": action, "window": window, "result": result, "observed_physical_state_unchanged": unchanged, "physical_state_before": before, "physical_state_after": after, "cursor_moved_by_backend": False, "keyboard_focus_changed_by_backend": False, "workspace_changed_by_backend": False}
+    return {"action": action, "window": bounded_window(window), "result": result, "observed_physical_state_unchanged": unchanged, "physical_state_before": before, "physical_state_after": after, "cursor_moved_by_backend": False, "keyboard_focus_changed_by_backend": False, "workspace_changed_by_backend": False}
 
 
 def targeted_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
@@ -618,14 +752,14 @@ def capture_result(arguments: dict[str, Any]) -> dict[str, Any]:
         proc = run(["grim", "-T", str(selected["capture_id"]), str(capture)], timeout=20)
         if proc.returncode:
             raise RuntimeError(proc.stderr.strip() or "exact window capture failed")
-        raw = capture.read_bytes()
+        raw = read_bounded_png(capture, "exact window capture")
         data = base64.b64encode(raw).decode("ascii")
         if requested_path:
             capture.replace(output)
     finally:
         capture.unlink(missing_ok=True)
     metadata = {
-        "window": selected,
+        "window": bounded_window(selected),
         "coordinate_space": window_coordinate_space(selected, raw),
         "saved_to": str(output) if requested_path else None,
         "focus_changed": False,
@@ -637,7 +771,6 @@ def capture_result(arguments: dict[str, Any]) -> dict[str, Any]:
             {"type": "text", "text": json.dumps(metadata, indent=2, ensure_ascii=False)},
             {"type": "image", "data": data, "mimeType": "image/png"},
         ],
-        "structuredContent": metadata,
         "isError": False,
     }
 
@@ -689,7 +822,37 @@ def status() -> dict[str, Any]:
 
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "session_status": return text_result(status())
-    if name == "list_session_windows": return text_result({"windows": combine_windows()})
+    if name == "list_session_windows":
+        limit = arguments.get("limit")
+        if limit is None:
+            limit = MAX_WINDOWS_PER_PAGE
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_WINDOWS_PER_PAGE:
+            raise ValueError(f"limit must be an integer between 1 and {MAX_WINDOWS_PER_PAGE}")
+        cursor = arguments.get("cursor")
+        if cursor is None:
+            offset = 0
+        elif isinstance(cursor, str) and len(cursor) <= 20 and cursor.isascii() and cursor.isdigit():
+            offset = int(cursor)
+        else:
+            raise ValueError("cursor must be the next_cursor string from a previous result")
+        windows = [bounded_window(window) for window in combine_windows()]
+        page: list[dict[str, Any]] = []
+        end = offset
+        while end < len(windows) and len(page) < limit:
+            candidate = [*page, windows[end]]
+            candidate_end = end + 1
+            candidate_result = {
+                "windows": candidate,
+                "next_cursor": str(candidate_end) if candidate_end < len(windows) else None,
+            }
+            encoded = json.dumps(candidate_result, ensure_ascii=False, separators=(",", ":")).encode()
+            if len(encoded) > MAX_WINDOW_RESULT_BYTES:
+                break
+            page = candidate
+            end = candidate_end
+        if not page and offset < len(windows):
+            raise RuntimeError("a window entry exceeds the bounded listing result size")
+        return text_result({"windows": page, "next_cursor": str(end) if end < len(windows) else None})
     if name == "capture_session_window": return capture_result(arguments)
     if name == "send_window_shortcut":
         address = str(arguments["address"])
@@ -728,8 +891,9 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
     method = message.get("method")
     try:
         if method == "initialize":
-            requested = (message.get("params") or {}).get("protocolVersion", PROTOCOL_VERSION)
-            result = {"protocolVersion": requested, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate the user's real logged-in Hyprland session. Capture exact windows here; semantic AT-SPI actions require the separate Computer Use plugin."}
+            requested = (message.get("params") or {}).get("protocolVersion")
+            negotiated = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
+            result = {"protocolVersion": negotiated, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate the user's real logged-in Hyprland session. Capture exact windows here; semantic AT-SPI actions require the separate Computer Use plugin."}
         elif method == "tools/list": result = {"tools": TOOLS}
         elif method == "tools/call":
             params = message.get("params") or {}
