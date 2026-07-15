@@ -49,6 +49,48 @@ class CaptureBoundaryTests(TestCase):
             self.assertEqual(destination.read_bytes(), b"old")
             self.assertEqual(list(destination.parent.glob(".capture.png.*.png")), [])
 
+    def test_shell_restart_prevents_or_discards_capture(self) -> None:
+        cases = (
+            ("before screenshot", ["shell-b"], False, False),
+            ("after screenshot", ["shell-a", "shell-b"], True, False),
+            ("before accepting focus check", ["shell-a", "shell-a", "shell-b"], True, True),
+        )
+        window = {
+            "id": "11",
+            "focused": True,
+            "frame": {"width": 1, "height": 1},
+        }
+        for label, instances, screenshot_started, focus_checked in cases:
+            with self.subTest(label=label), TemporaryDirectory() as directory:
+                destination = Path(directory) / "capture.png"
+                destination.write_bytes(b"old")
+
+                def capture(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                    Path(args[-1]).write_bytes(png(1, 1))
+                    return subprocess.CompletedProcess(args, 0, "", "")
+
+                statuses = [
+                    {"shell_instance": shell_instance}
+                    for shell_instance in instances
+                ]
+                with (
+                    patch.object(server, "load_lease", return_value=None),
+                    patch.object(server, "shell_status", side_effect=statuses),
+                    patch.object(server, "resolve_window", return_value=window) as resolve,
+                    patch.object(server, "run", side_effect=capture) as run,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "GNOME Shell restarted"):
+                        server.capture_window(
+                            {"window": "11", "save_path": str(destination)},
+                            selected=window,
+                            expected_shell_instance="shell-a",
+                        )
+
+                self.assertEqual(run.call_count, int(screenshot_started))
+                self.assertEqual(resolve.call_count, int(focus_checked))
+                self.assertEqual(destination.read_bytes(), b"old")
+                self.assertEqual(list(destination.parent.glob(".capture.png.*.png")), [])
+
     def test_screenshot_signature_and_scaled_coordinate_transform(self) -> None:
         window = {
             "id": "11",

@@ -1,5 +1,4 @@
 import base64
-import fcntl
 import json
 import math
 import os
@@ -9,10 +8,22 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from .claims import DEFAULT_LEASE_SECONDS
+from .claims import MAX_LEASE_SECONDS
+from .claims import MAX_OWNER_CHARS
+from .claims import MIN_LEASE_SECONDS
+from .claims import ClaimRegistry
+from .claims import atomic_write_json
+from .claims import broker_is_alive
+from .claims import current_broker_identity
+from .claims import current_session_identity
+from .claims import file_guard
 
 try:
     import gi
@@ -25,7 +36,7 @@ except (ImportError, ValueError):
     GLib = None
 
 
-SERVER_INFO = {"name": "gnome-same-session-computer-use", "version": "0.1.0"}
+SERVER_INFO = {"name": "gnome-same-session-computer-use", "version": "0.2.0"}
 PROTOCOL_VERSION = "2025-11-25"
 MAX_MCP_STDOUT_LINE_BYTES = 8 * 1024 * 1024
 MAX_CAPTURE_PNG_BYTES = 5 * 1024 * 1024
@@ -34,6 +45,8 @@ MAX_CAPTURE_PIXELS = 7680 * 4320
 # small enough that the combined result and wrapper remain below Codex's 12 KiB cap.
 MAX_WINDOW_RESULT_BYTES = 4 * 1024
 MAX_WINDOWS_PER_PAGE = 20
+MAX_CLAIM_RESULT_BYTES = 2 * 1024
+MAX_CLAIMS_PER_PAGE = 20
 MAX_WINDOW_TEXT_CHARS = 512
 MAX_ERROR_TEXT_CHARS = 2048
 MAX_RESPONSE_COLLECTION_ITEMS = 8
@@ -41,10 +54,17 @@ MAX_RESPONSE_DEPTH = 4
 BUS_NAME = "org.gnome.Shell.Extensions.BackgroundComputerUse"
 OBJECT_PATH = "/org/gnome/Shell/Extensions/BackgroundComputerUse"
 INTERFACE = BUS_NAME
-STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / SERVER_INFO["name"]
+STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / SERVER_INFO["name"]
+SESSION_IDENTITY = current_session_identity()
+STATE_DIR = STATE_ROOT / "sessions" / SESSION_IDENTITY
 LEASE_FILE = STATE_DIR / "focus-lease.json"
 LOCK_FILE = STATE_DIR / "focus-lease.lock"
 INPUT_FILE = STATE_DIR / "input.lock"
+LEGACY_LEASE_FILE = STATE_ROOT / "focus-lease.json"
+LEGACY_LOCK_FILE = STATE_ROOT / "focus-lease.lock"
+MIGRATION_LOCK_FILE = STATE_ROOT / "session-migration.lock"
+BROKER_IDENTITY = current_broker_identity()
+CLAIMS = ClaimRegistry(STATE_DIR, SESSION_IDENTITY, broker=BROKER_IDENTITY)
 INPUT_LOCK = threading.Lock()
 DBUS_LOCK = threading.Lock()
 _DBUS_CONNECTION = None
@@ -64,18 +84,23 @@ def tool(name: str, description: str, properties: dict[str, Any], required: list
     }
 
 
-WINDOW = {"type": "string", "description": "Stable GNOME window id, exact app id/class, or title substring."}
-TOKEN = {"type": "string", "description": "Token returned by begin_focus_lease."}
+WINDOW = {"type": "string", "minLength": 1, "maxLength": 512, "description": "Stable GNOME window id, exact app id/class, or title substring."}
+TOKEN = {"type": "string", "minLength": 64, "maxLength": 256, "description": "Token returned by begin_focus_lease."}
+CLAIM_TOKEN = {"type": "string", "minLength": 64, "maxLength": 256, "description": "Opaque token returned by claim_session_window."}
+CURSOR = {"type": ["string", "null"], "maxLength": 20}
 POINT = {"type": "number", "minimum": 0}
 TOOLS = [
     tool("session_status", "Report GNOME/Mutter integration health and exact capability boundaries.", {}, [], read_only=True, idempotent=True),
-    tool("list_session_windows", "List one bounded page of windows in the user's real GNOME Shell session.", {"cursor": {"type": ["string", "null"]}, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_WINDOWS_PER_PAGE}}, [], read_only=True, idempotent=True),
-    tool("capture_session_window", "Capture an exact focused window. An unfocused window must first be placed under an acknowledged focus lease.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}}, ["window"], idempotent=True),
-    tool("begin_focus_lease", "Journal desktop state, switch to and focus an existing window, and authorize brief global-seat contention until restored.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}}, ["window", "acknowledge_interference"]),
-    tool("lease_pointer_click", "Click a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "x": POINT, "y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
-    tool("lease_pointer_scroll", "Scroll in a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "x": POINT, "y": POINT, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
-    tool("lease_pointer_drag", "Drag in a leased window using Mutter's global virtual seat, restoring the pointer after release.", {"lease_token": TOKEN, "start_x": POINT, "start_y": POINT, "end_x": POINT, "end_y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "motion_steps": {"type": "integer", "minimum": 2, "maximum": 32, "default": 8}}, ["lease_token", "start_x", "start_y", "end_x", "end_y"]),
-    tool("send_lease_shortcut", "Send one key or shortcut to the currently focused leased window through Mutter's global virtual keyboard.", {"lease_token": TOKEN, "key": {"type": "string"}, "modifiers": {"type": "array", "items": {"type": "string", "enum": ["CTRL", "SHIFT", "ALT", "SUPER"]}, "default": []}}, ["lease_token", "key"]),
+    tool("list_session_windows", "List one bounded page of windows in the user's real GNOME Shell session.", {"cursor": CURSOR, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_WINDOWS_PER_PAGE}}, [], read_only=True, idempotent=True),
+    tool("claim_session_window", "Exclusively claim one window for this Codex thread while allowing other threads to claim different windows concurrently.", {"window": WINDOW, "lease_seconds": {"type": "integer", "minimum": MIN_LEASE_SECONDS, "maximum": MAX_LEASE_SECONDS, "default": DEFAULT_LEASE_SECONDS}}, ["window"]),
+    tool("release_session_window", "Release a window claim owned by this Codex thread.", {"claim_token": CLAIM_TOKEN}, ["claim_token"], idempotent=True),
+    tool("list_window_claims", "List one bounded page of live window claims without exposing their capability tokens.", {"cursor": CURSOR, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_CLAIMS_PER_PAGE}}, [], read_only=True, idempotent=True),
+    tool("capture_session_window", "Capture an exact focused window. An unfocused window must first be placed under an acknowledged focus lease.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}, "claim_token": CLAIM_TOKEN}, ["window"], idempotent=True),
+    tool("begin_focus_lease", "Journal desktop state, switch to and focus an existing window, and authorize brief global-seat contention until restored.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}, "claim_token": CLAIM_TOKEN}, ["window", "acknowledge_interference"]),
+    tool("lease_pointer_click", "Click a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
+    tool("lease_pointer_scroll", "Scroll in a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
+    tool("lease_pointer_drag", "Drag in a leased window using Mutter's global virtual seat, restoring the pointer after release.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "start_x": POINT, "start_y": POINT, "end_x": POINT, "end_y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "motion_steps": {"type": "integer", "minimum": 2, "maximum": 32, "default": 8}}, ["lease_token", "start_x", "start_y", "end_x", "end_y"]),
+    tool("send_lease_shortcut", "Send one key or shortcut to the currently focused leased window through Mutter's global virtual keyboard.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "key": {"type": "string", "minLength": 1, "maxLength": 64}, "modifiers": {"type": "array", "maxItems": 4, "items": {"type": "string", "enum": ["CTRL", "SHIFT", "ALT", "SUPER"]}, "default": []}}, ["lease_token", "key"]),
     tool("end_focus_lease", "Restore the pre-lease workspace, focused window, and pointer from the journal.", {"lease_token": TOKEN}, ["lease_token"]),
     tool("recover_focus_lease", "Restore any unfinished focus lease after a broker interruption or crash.", {}, [], idempotent=True),
 ]
@@ -172,6 +197,11 @@ def window_summary(window: Any) -> dict[str, Any]:
     }
 
 
+def lease_window_id(state: dict[str, Any] | None) -> str:
+    target = (state or {}).get("target")
+    return str(target.get("id") if isinstance(target, dict) else target or "")
+
+
 def windows() -> list[dict[str, Any]]:
     value = dbus_call("ListWindows")
     if not isinstance(value, list) or any(not isinstance(window, dict) for window in value):
@@ -179,8 +209,8 @@ def windows() -> list[dict[str, Any]]:
     return value
 
 
-def resolve_window(query: str) -> dict[str, Any]:
-    if not query or len(query) > 512:
+def resolve_window(query: Any) -> dict[str, Any]:
+    if not isinstance(query, str) or not query or len(query) > 512:
         raise ValueError("window must contain between 1 and 512 characters")
     candidates = windows()
     lowered = query.casefold()
@@ -203,53 +233,176 @@ def resolve_window(query: str) -> dict[str, Any]:
     return matches[0]
 
 
-@contextmanager
-def file_guard(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+def migrate_legacy_lease() -> None:
+    if LEASE_FILE.exists() or not LEGACY_LEASE_FILE.exists():
+        return
+    with file_guard(MIGRATION_LOCK_FILE):
+        if LEASE_FILE.exists() or not LEGACY_LEASE_FILE.exists():
+            return
+        with file_guard(LEGACY_LOCK_FILE):
+            try:
+                state = json.loads(LEGACY_LEASE_FILE.read_text())
+            except (OSError, json.JSONDecodeError):
+                return
+            if not isinstance(state, dict):
+                return
+            journal_identity = state.get("session_identity")
+            if journal_identity is not None:
+                matches = journal_identity == SESSION_IDENTITY
+            elif state.get("version") == 2 and isinstance(state.get("shell_instance"), str):
+                try:
+                    current = dbus_call("Status")
+                except Exception:
+                    return
+                matches = (
+                    isinstance(current, dict)
+                    and current.get("shell_instance") == state["shell_instance"]
+                )
+            else:
+                matches = False
+            if not matches:
+                return
+            state["session_identity"] = SESSION_IDENTITY
+            atomic_write_json(LEASE_FILE, state)
+            LEGACY_LEASE_FILE.unlink(missing_ok=True)
 
 
 def load_lease() -> dict[str, Any] | None:
+    migrate_legacy_lease()
     if not LEASE_FILE.exists():
         return None
-    return json.loads(LEASE_FILE.read_text())
+    try:
+        state = json.loads(LEASE_FILE.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read the private focus-lease journal: {exc}") from exc
+    if not isinstance(state, dict):
+        raise RuntimeError("private focus-lease journal has an unsupported format")
+    journal_identity = state.get("session_identity")
+    if journal_identity is not None and journal_identity != SESSION_IDENTITY:
+        raise RuntimeError("focus-lease journal belongs to another GNOME session")
+    return state
 
 
 def save_lease(state: dict[str, Any]) -> None:
-    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = LEASE_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state, indent=2))
-    temporary.chmod(0o600)
-    temporary.replace(LEASE_FILE)
+    state["session_identity"] = SESSION_IDENTITY
+    atomic_write_json(LEASE_FILE, state)
 
 
-def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
+def shell_status() -> dict[str, Any]:
+    value = dbus_call("Status")
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("shell_instance"), str)
+        or not 1 <= len(value["shell_instance"]) <= 256
+    ):
+        raise RuntimeError("GNOME integration returned an invalid Shell session identity")
+    return value
+
+
+def require_shell_instance(expected_shell_instance: str) -> None:
+    if shell_status()["shell_instance"] != expected_shell_instance:
+        raise RuntimeError(
+            "GNOME Shell restarted while resolving or acting on the window; resolve it again"
+        )
+
+
+def resolve_window_for_shell(
+    query: Any,
+    expected_shell_instance: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    current_shell_instance = shell_status()["shell_instance"]
+    if expected_shell_instance is None:
+        expected_shell_instance = current_shell_instance
+    elif current_shell_instance != expected_shell_instance:
+        raise RuntimeError(
+            "GNOME Shell restarted while resolving or acting on the window; resolve it again"
+        )
+    selected = resolve_window(query)
+    require_shell_instance(expected_shell_instance)
+    return selected, expected_shell_instance
+
+
+def owner_from_params(params: dict[str, Any]) -> str | None:
+    metadata = params.get("_meta")
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        raise ValueError("tools/call params._meta must be an object")
+    owner = metadata.get("threadId")
+    if owner is None:
+        return None
+    if not isinstance(owner, str) or not owner or len(owner) > MAX_OWNER_CHARS or "\0" in owner:
+        raise ValueError(
+            f"params._meta.threadId must contain between 1 and {MAX_OWNER_CHARS} characters"
+        )
+    return owner
+
+
+def shell_recovery_seconds(expires_at: float) -> str:
+    remaining = max(0.001, min(float(MAX_LEASE_SECONDS), expires_at - time.time()))
+    return f"{remaining:.6f}"
+
+
+def claim_recovery_seconds(claim: dict[str, Any]) -> str:
+    deadline = max(
+        float(claim.get("expires_at") or 0),
+        float(claim.get("inflight_until") or 0),
+    )
+    return shell_recovery_seconds(deadline)
+
+
+def begin_lease(
+    arguments: dict[str, Any],
+    owner: str | None = None,
+    selected: dict[str, Any] | None = None,
+    claim: dict[str, Any] | None = None,
+    *,
+    expected_shell_instance: str | None = None,
+) -> dict[str, Any]:
     if arguments.get("acknowledge_interference") is not True:
         raise ValueError("acknowledge_interference must be true because GNOME uses one global input seat")
     if load_lease():
         raise RuntimeError("a focus lease is already active; end or recover it first")
-    selected = resolve_window(str(arguments["window"]))
-    prepared = dbus_call("BeginLease", str(selected["id"]))
+    selected = selected or resolve_window(arguments.get("window"))
+    if expected_shell_instance is not None:
+        require_shell_instance(expected_shell_instance)
+    if claim:
+        prepared = dbus_call(
+            "BeginClaimedLease", str(selected["id"]), claim_recovery_seconds(claim)
+        )
+    else:
+        prepared = dbus_call("BeginLease", str(selected["id"]))
     if not isinstance(prepared, dict):
         raise RuntimeError("GNOME integration returned an invalid lease preparation result")
     capability = prepared.get("capability")
     if not isinstance(capability, str) or not 64 <= len(capability) <= 256:
         raise RuntimeError("GNOME integration returned an invalid lease capability")
     state = {
-        "version": 2,
+        "version": 3,
         "token": capability,
         "phase": "prepared",
         "target": prepared.get("target") or selected,
         "original": prepared.get("original"),
         "shell_instance": prepared.get("shell_instance"),
+        "owner_thread_id": owner,
+        "broker": BROKER_IDENTITY,
+        "claim_token": claim.get("claim_token") if claim else None,
     }
     try:
         save_lease(state)
+        if (
+            expected_shell_instance is not None
+            and state["shell_instance"] != expected_shell_instance
+        ):
+            raise RuntimeError(
+                "GNOME Shell restarted while preparing the focus lease; resolve the window again"
+            )
+        if str((prepared.get("target") or {}).get("id")) != str(selected["id"]):
+            raise RuntimeError(
+                "GNOME Shell prepared a different focus-lease target; resolve the window again"
+            )
+        if expected_shell_instance is not None:
+            require_shell_instance(expected_shell_instance)
         focused = dbus_call("ActivateLease", capability)
         if str((focused.get("state") or {}).get("focused_window")) != str(selected["id"]):
             raise RuntimeError("GNOME did not grant focus to the requested lease window")
@@ -266,7 +419,7 @@ def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def require_lease(token: str) -> dict[str, Any]:
+def require_lease(token: str, owner: str | None = None) -> dict[str, Any]:
     if not isinstance(token, str) or not 64 <= len(token) <= 256:
         raise ValueError("lease_token has an invalid length")
     state = load_lease()
@@ -274,7 +427,18 @@ def require_lease(token: str) -> dict[str, Any]:
         raise RuntimeError("no focus lease is active")
     if not secrets.compare_digest(str(state.get("token") or ""), token):
         raise ValueError("lease token does not match the active focus lease")
+    lease_owner = state.get("owner_thread_id")
+    if lease_owner is not None and owner != lease_owner:
+        raise RuntimeError("focus lease belongs to another computer-use agent")
     return state
+
+
+def require_bound_claim(state: dict[str, Any], claim: dict[str, Any] | None) -> None:
+    bound_token = state.get("claim_token")
+    if bound_token is None:
+        return
+    if claim is None or not secrets.compare_digest(str(claim.get("claim_token") or ""), bound_token):
+        raise RuntimeError("the focus lease's window claim expired or was replaced; recover the focus lease")
 
 
 def restore_lease(state: dict[str, Any], *, recovery: bool = False) -> dict[str, Any]:
@@ -463,12 +627,23 @@ def coordinate_space(frame: dict[str, Any], raw: bytes) -> dict[str, Any]:
     }
 
 
-def capture_window(arguments: dict[str, Any]) -> dict[str, Any]:
-    selected = resolve_window(str(arguments["window"]))
+def capture_window(
+    arguments: dict[str, Any],
+    owner: str | None = None,
+    selected: dict[str, Any] | None = None,
+    claim: dict[str, Any] | None = None,
+    *,
+    expected_shell_instance: str | None = None,
+) -> dict[str, Any]:
+    selected = selected or resolve_window(arguments.get("window"))
     active_lease = load_lease()
+    if active_lease and active_lease.get("owner_thread_id") is not None:
+        if active_lease["owner_thread_id"] != owner:
+            raise RuntimeError("capture cannot use another computer-use agent's focus lease")
+        require_bound_claim(active_lease, claim)
     permitted = selected.get("focused") or (
         active_lease and active_lease.get("phase") == "active" and
-        str((active_lease.get("target") or {}).get("id")) == str(selected.get("id"))
+        lease_window_id(active_lease) == str(selected.get("id"))
     )
     if not permitted:
         raise RuntimeError("stock Mutter can only capture the focused window exactly; begin_focus_lease first")
@@ -484,6 +659,8 @@ def capture_window(arguments: dict[str, Any]) -> dict[str, Any]:
     temporary = Path(name)
     temporary.unlink(missing_ok=True)
     try:
+        if expected_shell_instance is not None:
+            require_shell_instance(expected_shell_instance)
         proc = run([
             "gdbus", "call", "--session", "--dest", "org.gnome.Shell.Screenshot",
             "--object-path", "/org/gnome/Shell/Screenshot", "--method",
@@ -495,7 +672,12 @@ def capture_window(arguments: dict[str, Any]) -> dict[str, Any]:
             fallback = run(["gnome-screenshot", "-w", "-f", str(temporary)], timeout=20)
             if fallback.returncode or not temporary.is_file():
                 raise RuntimeError(fallback.stderr.strip() or "focused-window capture failed")
-        current = resolve_window(str(selected["id"]))
+        if expected_shell_instance is None:
+            current = resolve_window(str(selected["id"]))
+        else:
+            current, _ = resolve_window_for_shell(
+                str(selected["id"]), expected_shell_instance
+            )
         if not current.get("focused"):
             raise RuntimeError("the leased window lost focus during capture; screenshot discarded")
         raw = read_bounded_png(temporary)
@@ -535,7 +717,13 @@ def bounded_integer(value: Any, name: str, minimum: int, maximum: int, *, exclud
     return value
 
 
-def pointer_action(arguments: dict[str, Any], action: str) -> dict[str, Any]:
+def pointer_action(
+    arguments: dict[str, Any],
+    action: str,
+    owner: str | None = None,
+    claim: dict[str, Any] | None = None,
+    expected_target: str | None = None,
+) -> dict[str, Any]:
     if action not in {"click", "scroll", "drag"}:
         raise ValueError(f"unknown pointer action {action}")
     button = arguments.get("button", "left")
@@ -555,7 +743,10 @@ def pointer_action(arguments: dict[str, Any], action: str) -> dict[str, Any]:
         else:
             request["steps"] = bounded_integer(arguments["steps"], "steps", -20, 20, exclude_zero=True)
     with file_guard(LOCK_FILE):
-        state = require_lease(arguments.get("lease_token"))
+        state = require_lease(arguments.get("lease_token"), owner)
+        if expected_target is not None and lease_window_id(state) != expected_target:
+            raise RuntimeError("focus lease changed while the pointer action was waiting")
+        require_bound_claim(state, claim)
         with INPUT_LOCK, file_guard(INPUT_FILE):
             result = dbus_call("InjectPointer", state["token"], json.dumps(request, separators=(",", ":")))
     return {
@@ -566,7 +757,12 @@ def pointer_action(arguments: dict[str, Any], action: str) -> dict[str, Any]:
     }
 
 
-def send_shortcut(arguments: dict[str, Any]) -> dict[str, Any]:
+def send_shortcut(
+    arguments: dict[str, Any],
+    owner: str | None = None,
+    claim: dict[str, Any] | None = None,
+    expected_target: str | None = None,
+) -> dict[str, Any]:
     modifiers = arguments.get("modifiers", [])
     allowed = {"CTRL", "SHIFT", "ALT", "SUPER"}
     if not isinstance(modifiers, list) or len(modifiers) > 4 or any(type(value) is not str or value not in allowed for value in modifiers) or len(set(modifiers)) != len(modifiers):
@@ -576,7 +772,10 @@ def send_shortcut(arguments: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("key must contain between 1 and 64 characters")
     request = {"key": key, "modifiers": modifiers}
     with file_guard(LOCK_FILE):
-        state = require_lease(arguments.get("lease_token"))
+        state = require_lease(arguments.get("lease_token"), owner)
+        if expected_target is not None and lease_window_id(state) != expected_target:
+            raise RuntimeError("focus lease changed while the shortcut was waiting")
+        require_bound_claim(state, claim)
         with INPUT_LOCK, file_guard(INPUT_FILE):
             result = dbus_call("InjectKeys", state["token"], json.dumps(request, separators=(",", ":")))
     return {
@@ -584,6 +783,113 @@ def send_shortcut(arguments: dict[str, Any]) -> dict[str, Any]:
         "transaction": bounded_json_value(result),
         "global_seat_used": True,
     }
+
+
+def renew_focus_lease_for_claim(claim: dict[str, Any]) -> None:
+    with file_guard(LOCK_FILE):
+        lease = load_lease()
+        if not lease:
+            return
+        target_id = lease_window_id(lease)
+        claim_window_id = str((claim.get("window") or {}).get("id") or "")
+        if target_id != claim_window_id:
+            return
+        bound_token = str(lease.get("claim_token") or "")
+        claim_token = str(claim.get("claim_token") or "")
+        if not bound_token:
+            raise RuntimeError(
+                "the focus-lease target is reserved by an unclaimed lease; end or recover it first"
+            )
+        if (
+            not secrets.compare_digest(bound_token, claim_token)
+            or lease.get("owner_thread_id") != claim.get("owner_thread_id")
+        ):
+            raise RuntimeError(
+                "the focus-lease target remains reserved by an older claim; end or recover it first"
+            )
+        dbus_call("RenewLease", lease["token"], f"{float(claim['lease_seconds']):.6f}")
+        lease["broker"] = BROKER_IDENTITY
+        save_lease(lease)
+
+
+def claim_window(arguments: dict[str, Any], owner: str | None) -> dict[str, Any]:
+    selected, shell_instance = resolve_window_for_shell(arguments.get("window"))
+
+    def renew_lease_and_validate_shell(claim: dict[str, Any]) -> None:
+        renew_focus_lease_for_claim(claim)
+        require_shell_instance(shell_instance)
+
+    return CLAIMS.claim(
+        selected,
+        owner,
+        arguments.get("lease_seconds", DEFAULT_LEASE_SECONDS),
+        shell_instance,
+        before_save=renew_lease_and_validate_shell,
+    )
+
+
+def release_window(arguments: dict[str, Any], owner: str | None) -> dict[str, Any]:
+    shell = shell_status()
+
+    def ensure_not_leased(claim: dict[str, Any]) -> None:
+        with file_guard(LOCK_FILE):
+            lease = load_lease()
+            if (
+                lease
+                and lease_window_id(lease)
+                == str((claim.get("window") or {}).get("id") or "")
+            ):
+                raise RuntimeError("end or recover the bound focus lease before releasing its window claim")
+
+    return CLAIMS.release(
+        arguments.get("claim_token"),
+        owner,
+        shell["shell_instance"],
+        before_release=ensure_not_leased,
+    )
+
+
+def lease_target_id() -> str:
+    state = load_lease()
+    target = lease_window_id(state)
+    if not target:
+        raise RuntimeError("no focus lease with a valid target is active")
+    return target
+
+
+def end_lease(arguments: dict[str, Any], owner: str | None) -> dict[str, Any]:
+    with file_guard(LOCK_FILE):
+        with INPUT_LOCK, file_guard(INPUT_FILE):
+            state = require_lease(str(arguments["lease_token"]), owner)
+            recovery = state.get("broker") not in (None, BROKER_IDENTITY)
+            return restore_lease(state, recovery=recovery)
+
+
+def recover_lease(
+    owner: str | None,
+    claim: dict[str, Any] | None,
+    expected_token: str | None = None,
+) -> dict[str, Any]:
+    with file_guard(LOCK_FILE):
+        with INPUT_LOCK, file_guard(INPUT_FILE):
+            state = load_lease()
+            if not state:
+                return {"restored": True, "message": "no unfinished focus lease"}
+            if expected_token is not None and state.get("token") != expected_token:
+                raise RuntimeError("focus lease changed while recovery was waiting")
+            lease_owner = state.get("owner_thread_id")
+            if lease_owner is not None and lease_owner != owner:
+                if claim is not None:
+                    raise RuntimeError("another computer-use agent still owns the focus lease's live window claim")
+                if state.get("claim_token") is None and broker_is_alive(state.get("broker")):
+                    raise RuntimeError("the original unclaimed focus-lease broker is still running")
+            if (
+                lease_owner is None
+                and state.get("broker") not in (None, BROKER_IDENTITY)
+                and broker_is_alive(state.get("broker"))
+            ):
+                raise RuntimeError("the original unclaimed focus-lease broker is still running")
+            return restore_lease(state, recovery=True)
 
 
 def status() -> dict[str, Any]:
@@ -611,8 +917,15 @@ def status() -> dict[str, Any]:
         screenshot_service = screenshot.returncode == 0 and "ScreenshotWindow" in screenshot.stdout
     checks["focused_window_screenshot"] = screenshot_service or shutil.which("gnome-screenshot") is not None
     ready = integration is not None
+    claim_count: int | None = None
+    claim_error: str | None = None
+    if integration:
+        try:
+            claim_count = len(CLAIMS.list(integration["shell_instance"]))
+        except Exception as exc:
+            claim_error = bounded_text(exc, MAX_ERROR_TEXT_CHARS)
     return {
-        "desktop": desktop,
+        "desktop": bounded_text(desktop),
         "integration": integration,
         "integration_error": error,
         "capabilities": {
@@ -625,13 +938,18 @@ def status() -> dict[str, Any]:
             "targeted_background_keyboard": False,
             "recoverable_focus_lease": ready,
             "lease_pointer_restoration": ready,
+            "parallel_window_claims": ready,
+            "serialized_global_seat": ready,
         },
         "requirements": {
             **checks,
             "gnome_shell_extension": ready,
-            "background_semantic_actions": "provided by the separate computer-use@openai-bundled AT-SPI plugin",
+            "background_semantic_actions": "provided by a separate AT-SPI process; broker claims are policy coordination there, not a mechanical fence",
         },
         "active_lease": load_lease() is not None,
+        "active_window_claims": claim_count,
+        "claim_journal_error": claim_error,
+        "session_identity": SESSION_IDENTITY,
         "safety_note": "Mutter exposes one global seat; lease input can visibly contend with physical input and cannot detect every held hardware button.",
     }
 
@@ -640,26 +958,30 @@ def text_result(value: Any) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(value, indent=2, ensure_ascii=False)}], "structuredContent": value, "isError": False}
 
 
-def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def page_arguments(arguments: dict[str, Any], maximum: int) -> tuple[int, int | None, bool]:
+    requested_limit = arguments.get("limit")
+    if requested_limit is not None and (
+        isinstance(requested_limit, bool)
+        or not isinstance(requested_limit, int)
+        or not 1 <= requested_limit <= maximum
+    ):
+        raise ValueError(f"limit must be an integer between 1 and {maximum}")
+    cursor = arguments.get("cursor")
+    if cursor is None:
+        offset = 0
+    elif isinstance(cursor, str) and len(cursor) <= 20 and cursor.isascii() and cursor.isdigit():
+        offset = int(cursor)
+    else:
+        raise ValueError("cursor must be the next_cursor string from a previous result")
+    return offset, requested_limit, requested_limit is not None or cursor is not None
+
+
+def call_tool(name: str, arguments: dict[str, Any], owner: str | None = None) -> dict[str, Any]:
     if name == "session_status":
         return text_result(status())
     if name == "list_session_windows":
-        requested_limit = arguments.get("limit")
-        if requested_limit is not None and (
-            isinstance(requested_limit, bool)
-            or not isinstance(requested_limit, int)
-            or not 1 <= requested_limit <= MAX_WINDOWS_PER_PAGE
-        ):
-            raise ValueError(f"limit must be an integer between 1 and {MAX_WINDOWS_PER_PAGE}")
-        cursor = arguments.get("cursor")
-        if cursor is None:
-            offset = 0
-        elif isinstance(cursor, str) and len(cursor) <= 20 and cursor.isascii() and cursor.isdigit():
-            offset = int(cursor)
-        else:
-            raise ValueError("cursor must be the next_cursor string from a previous result")
+        offset, requested_limit, paginated = page_arguments(arguments, MAX_WINDOWS_PER_PAGE)
         listed = [window_summary(window) for window in windows()]
-        paginated = requested_limit is not None or cursor is not None
         limit = requested_limit if requested_limit is not None else (MAX_WINDOWS_PER_PAGE if paginated else len(listed))
         page: list[dict[str, Any]] = []
         end = offset
@@ -685,25 +1007,119 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             "next_cursor": str(end) if end < len(listed) else None,
             "stable_id_lifetime": "until GNOME Shell or the window restarts",
         })
+    if name == "claim_session_window":
+        result = claim_window(arguments, owner)
+        if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) > MAX_CLAIM_RESULT_BYTES:
+            raise RuntimeError("window claim result exceeds the bounded model-visible result size")
+        return text_result(result)
+    if name == "release_session_window":
+        return text_result(release_window(arguments, owner))
+    if name == "list_window_claims":
+        shell = shell_status()
+        offset, requested_limit, paginated = page_arguments(arguments, MAX_CLAIMS_PER_PAGE)
+        listed = sorted(
+            CLAIMS.list(shell["shell_instance"]),
+            key=lambda claim: str((claim.get("window") or {}).get("id") or ""),
+        )
+        limit = requested_limit if requested_limit is not None else (MAX_CLAIMS_PER_PAGE if paginated else len(listed))
+        page: list[dict[str, Any]] = []
+        end = offset
+        while end < len(listed) and len(page) < limit:
+            candidate = [*page, listed[end]]
+            candidate_end = end + 1
+            candidate_result = {
+                "claims": candidate,
+                "next_cursor": str(candidate_end) if candidate_end < len(listed) else None,
+                "truncated": candidate_end < len(listed),
+            }
+            encoded = json.dumps(candidate_result, ensure_ascii=False, separators=(",", ":")).encode()
+            if len(encoded) > MAX_CLAIM_RESULT_BYTES:
+                break
+            page = candidate
+            end = candidate_end
+        if not paginated and end < len(listed):
+            raise RuntimeError("window claim list exceeds the model-visible result size; retry with limit to paginate")
+        if not page and offset < len(listed):
+            raise RuntimeError("a window claim entry exceeds the bounded listing result size")
+        return text_result({
+            "claims": page,
+            "next_cursor": str(end) if end < len(listed) else None,
+            "truncated": end < len(listed),
+        })
     if name == "capture_session_window":
-        return capture_window(arguments)
+        selected, shell_instance = resolve_window_for_shell(arguments.get("window"))
+        with CLAIMS.authorize(
+            str(selected["id"]),
+            owner,
+            arguments.get("claim_token"),
+            shell_instance,
+            on_complete=renew_focus_lease_for_claim,
+        ) as claim:
+            with file_guard(LOCK_FILE):
+                with INPUT_LOCK, file_guard(INPUT_FILE):
+                    return capture_window(
+                        arguments,
+                        owner,
+                        selected,
+                        claim,
+                        expected_shell_instance=shell_instance,
+                    )
     if name == "begin_focus_lease":
-        with file_guard(LOCK_FILE):
-            return text_result(begin_lease(arguments))
+        selected, shell_instance = resolve_window_for_shell(arguments.get("window"))
+        with CLAIMS.authorize(
+            str(selected["id"]),
+            owner,
+            arguments.get("claim_token"),
+            shell_instance,
+            on_complete=renew_focus_lease_for_claim,
+        ) as claim:
+            with file_guard(LOCK_FILE):
+                with INPUT_LOCK, file_guard(INPUT_FILE):
+                    return text_result(
+                        begin_lease(
+                            arguments,
+                            owner,
+                            selected,
+                            claim,
+                            expected_shell_instance=shell_instance,
+                        )
+                    )
     if name in {"lease_pointer_click", "lease_pointer_scroll", "lease_pointer_drag"}:
         action = name.removeprefix("lease_pointer_")
-        return text_result(pointer_action(arguments, action))
+        target = lease_target_id()
+        shell = shell_status()
+        with CLAIMS.authorize(
+            target,
+            owner,
+            arguments.get("claim_token"),
+            shell["shell_instance"],
+            on_complete=renew_focus_lease_for_claim,
+        ) as claim:
+            return text_result(pointer_action(arguments, action, owner, claim, target))
     if name == "send_lease_shortcut":
-        return text_result(send_shortcut(arguments))
+        target = lease_target_id()
+        shell = shell_status()
+        with CLAIMS.authorize(
+            target,
+            owner,
+            arguments.get("claim_token"),
+            shell["shell_instance"],
+            on_complete=renew_focus_lease_for_claim,
+        ) as claim:
+            return text_result(send_shortcut(arguments, owner, claim, target))
     if name == "end_focus_lease":
-        with file_guard(LOCK_FILE):
-            with INPUT_LOCK, file_guard(INPUT_FILE):
-                return text_result(restore_lease(require_lease(str(arguments["lease_token"]))))
+        return text_result(end_lease(arguments, owner))
     if name == "recover_focus_lease":
         with file_guard(LOCK_FILE):
-            with INPUT_LOCK, file_guard(INPUT_FILE):
-                state = load_lease()
-                return text_result({"restored": True, "recovery_complete": True, "message": "no unfinished focus lease"} if not state else restore_lease(state, recovery=True))
+            snapshot = load_lease()
+        if not snapshot:
+            return text_result({"restored": True, "recovery_complete": True, "message": "no unfinished focus lease"})
+        target = lease_window_id(snapshot)
+        if not target:
+            raise RuntimeError("focus lease journal has no valid target")
+        shell = shell_status()
+        with CLAIMS.inspect(target, shell["shell_instance"]) as claim:
+            return text_result(recover_lease(owner, claim, str(snapshot.get("token") or "")))
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -718,16 +1134,20 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": SERVER_INFO,
-                "instructions": "Operate the real GNOME session. Prefer the separate Computer Use plugin's AT-SPI tools; global-seat actions require an acknowledged, journaled focus lease.",
+                "instructions": "Operate the real GNOME session. Claim one window per parallel agent, treat claims as cooperative policy for the separate AT-SPI process, and use this broker's serialized acknowledged focus-lease lane for capture or global-seat input.",
             }
         elif method == "tools/list":
             result = {"tools": TOOLS}
         elif method == "tools/call":
             params = message.get("params") or {}
+            if not isinstance(params, dict):
+                raise ValueError("tools/call params must be an object")
             arguments = params.get("arguments") or {}
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must be an object")
-            result = call_tool(str(params.get("name") or ""), arguments)
+            result = call_tool(
+                str(params.get("name") or ""), arguments, owner_from_params(params)
+            )
         elif method == "ping":
             result = {}
         else:
@@ -754,7 +1174,8 @@ def main() -> int:
             message = json.loads(line)
         except Exception as exc:
             with write_lock:
-                print(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}), flush=True)
+                message = bounded_text(exc, MAX_ERROR_TEXT_CHARS)
+                print(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": message}}), flush=True)
             continue
         worker = threading.Thread(target=process, args=(message,), daemon=True)
         workers.append(worker)

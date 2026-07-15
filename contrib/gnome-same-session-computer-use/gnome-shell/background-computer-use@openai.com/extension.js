@@ -24,7 +24,9 @@ const XML = `<node>
     <method name="Status"><arg type="s" direction="out"/></method>
     <method name="ListWindows"><arg type="s" direction="out"/></method>
     <method name="BeginLease"><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="BeginClaimedLease"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="ActivateLease"><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="RenewLease"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="RestoreLease"><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="RecoverLease"><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="InjectPointer"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
@@ -177,6 +179,7 @@ export default class BackgroundComputerUseExtension extends Extension {
             modal_count: Main.modalCount,
             grab_active: global.display.is_grabbed(),
             lease_phase: this._protocol.lease?.phase ?? null,
+            claimed_lease_recoverable: this._protocol.lease?.recoveryDeadlineUsec != null,
             shell_instance: this._shellInstance,
         });
     }
@@ -190,15 +193,32 @@ export default class BackgroundComputerUseExtension extends Extension {
     }
 
     _beginLease(id, owner) {
+        return this._beginLeaseWithRecovery(id, owner, null);
+    }
+
+    BeginClaimedLeaseAsync([id, recoverySeconds], invocation) {
+        this._reply(invocation, () =>
+            this._beginLeaseWithRecovery(id, invocation.get_sender(), recoverySeconds));
+    }
+
+    _beginLeaseWithRecovery(id, owner, recoverySeconds) {
         this._assertInputSafe();
         const window = this._find(id);
         const capability = `${GLib.uuid_string_random()}${GLib.uuid_string_random()}`;
+        let recoveryDeadlineUsec = null;
+        if (recoverySeconds !== null) {
+            const seconds = Number(recoverySeconds);
+            if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 300)
+                throw new Error('claimed lease recovery seconds must be a number greater than 0 and at most 300');
+            recoveryDeadlineUsec = GLib.get_monotonic_time() + Math.ceil(seconds * 1_000_000);
+        }
         const lease = this._protocol.begin({
             capability,
             owner,
             target: id,
             targetMinimized: Boolean(window.minimized),
             original: this._state(),
+            recoveryDeadlineUsec,
         });
         this._leaseExpiryId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 30, () => {
             this._leaseExpiryId = null;
@@ -216,6 +236,17 @@ export default class BackgroundComputerUseExtension extends Extension {
 
     ActivateLeaseAsync([capability], invocation) {
         this._reply(invocation, () => this._activateLease(capability, invocation.get_sender()));
+    }
+
+    RenewLeaseAsync([capability, recoverySeconds], invocation) {
+        this._reply(invocation, () => {
+            const seconds = Number(recoverySeconds);
+            if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 300)
+                throw new Error('claimed lease recovery seconds must be a number greater than 0 and at most 300');
+            const deadline = GLib.get_monotonic_time() + Math.ceil(seconds * 1_000_000);
+            const lease = this._protocol.renew(capability, invocation.get_sender(), deadline);
+            return {renewed: true, recovery_deadline_usec: lease.recoveryDeadlineUsec};
+        });
     }
 
     _activateLease(capability, sender) {
@@ -249,7 +280,8 @@ export default class BackgroundComputerUseExtension extends Extension {
             const ownerPresent = currentOwner && sender !== currentOwner
                 ? this._nameHasOwner(currentOwner)
                 : false;
-            return this._restoreLease(this._protocol.recover(capability, sender, ownerPresent));
+            return this._restoreLease(this._protocol.recover(
+                capability, sender, ownerPresent, GLib.get_monotonic_time()));
         });
     }
 

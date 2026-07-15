@@ -48,6 +48,34 @@ test('recovery cannot steal a live caller but can bind after it vanishes', () =>
     assert.throws(() => protocol.require(CAPABILITY, OWNER), /another D-Bus caller/);
 });
 
+test('claimed lease recovery waits for expiry even when capability is known', () => {
+    const protocol = new LeaseProtocol();
+    protocol.begin({
+        capability: CAPABILITY,
+        owner: OWNER,
+        target: '11',
+        targetMinimized: false,
+        original: {workspace: 2},
+        recoveryDeadlineUsec: 2_000_000,
+    });
+    protocol.activate(CAPABILITY, OWNER);
+
+    assert.throws(
+        () => protocol.recover(CAPABILITY, OTHER_OWNER, true, 1_999_999),
+        /still connected/,
+    );
+    assert.equal(protocol.recover(CAPABILITY, OTHER_OWNER, true, 2_000_000).owner, OTHER_OWNER);
+});
+
+test('only the current D-Bus owner can renew claimed recovery fencing', () => {
+    const protocol = pendingProtocol();
+    assert.throws(
+        () => protocol.renew(CAPABILITY, OTHER_OWNER, 3_000_000),
+        /another D-Bus caller/,
+    );
+    assert.equal(protocol.renew(CAPABILITY, OWNER, 3_000_000).recoveryDeadlineUsec, 3_000_000);
+});
+
 test('failed restore retains state while successful restore clears it', () => {
     const protocol = pendingProtocol();
     protocol.activate(CAPABILITY, OWNER);

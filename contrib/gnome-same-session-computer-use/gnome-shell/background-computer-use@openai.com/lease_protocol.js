@@ -47,7 +47,7 @@ export class LeaseProtocol {
         this.lease = null;
     }
 
-    begin({capability, owner, target, targetMinimized, original}) {
+    begin({capability, owner, target, targetMinimized, original, recoveryDeadlineUsec = null}) {
         if (this.lease)
             throw new Error('a Shell lease is already pending or active');
         if (typeof capability !== 'string' || capability.length < 64)
@@ -56,7 +56,18 @@ export class LeaseProtocol {
             throw new Error('invalid D-Bus lease owner');
         if (typeof target !== 'string' || !target)
             throw new Error('invalid lease target');
-        this.lease = {capability, owner, target, targetMinimized: Boolean(targetMinimized), original, phase: 'pending'};
+        if (recoveryDeadlineUsec !== null &&
+            (!Number.isSafeInteger(recoveryDeadlineUsec) || recoveryDeadlineUsec <= 0))
+            throw new Error('invalid lease recovery deadline');
+        this.lease = {
+            capability,
+            owner,
+            target,
+            targetMinimized: Boolean(targetMinimized),
+            original,
+            recoveryDeadlineUsec,
+            phase: 'pending',
+        };
         return this.lease;
     }
 
@@ -77,12 +88,22 @@ export class LeaseProtocol {
         return lease;
     }
 
-    recover(capability, owner, originalOwnerPresent) {
+    renew(capability, owner, recoveryDeadlineUsec) {
+        const lease = this.require(capability, owner);
+        if (!Number.isSafeInteger(recoveryDeadlineUsec) || recoveryDeadlineUsec <= 0)
+            throw new Error('invalid lease recovery deadline');
+        lease.recoveryDeadlineUsec = recoveryDeadlineUsec;
+        return lease;
+    }
+
+    recover(capability, owner, originalOwnerPresent, nowUsec = null) {
         if (typeof capability !== 'string' || capability.length < 64 ||
             !this.lease || capability !== this.lease.capability)
             throw new Error('invalid Shell lease capability');
         if (owner !== this.lease.owner) {
-            if (originalOwnerPresent)
+            const claimLive = this.lease.recoveryDeadlineUsec === null ||
+                nowUsec === null || nowUsec < this.lease.recoveryDeadlineUsec;
+            if (originalOwnerPresent && claimLive)
                 throw new Error('the original D-Bus lease owner is still connected');
             this.lease.owner = owner;
         }
