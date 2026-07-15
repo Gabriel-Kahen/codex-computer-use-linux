@@ -30,6 +30,10 @@ PROTOCOL_VERSION = "2025-11-25"
 MAX_MCP_STDOUT_LINE_BYTES = 8 * 1024 * 1024
 MAX_CAPTURE_PNG_BYTES = 5 * 1024 * 1024
 MAX_CAPTURE_PIXELS = 7680 * 4320
+# MCP tool results repeat structured content in a text block. Keep the source page
+# small enough that the combined result and wrapper remain below Codex's 12 KiB cap.
+MAX_WINDOW_RESULT_BYTES = 4 * 1024
+MAX_WINDOWS_PER_PAGE = 20
 MAX_WINDOW_TEXT_CHARS = 512
 MAX_ERROR_TEXT_CHARS = 2048
 MAX_RESPONSE_COLLECTION_ITEMS = 8
@@ -141,6 +145,31 @@ def bounded_json_value(value: Any, depth: int = 0) -> Any:
             for key, item in list(value.items())[:MAX_RESPONSE_COLLECTION_ITEMS]
         }
     return bounded_text(value)
+
+
+def window_summary(window: Any) -> dict[str, Any]:
+    if not isinstance(window, dict):
+        window = {}
+    frame = window.get("frame")
+    if not isinstance(frame, dict):
+        frame = {}
+    return {
+        "id": bounded_text(window.get("id")),
+        "title": bounded_text(window.get("title")),
+        "wm_class": bounded_text(window.get("wm_class")),
+        "app_id": bounded_text(window.get("app_id")),
+        "pid": bounded_number(window.get("pid")),
+        "workspace": bounded_number(window.get("workspace")),
+        "monitor": bounded_number(window.get("monitor")),
+        "focused": window.get("focused") is True,
+        "minimized": window.get("minimized") is True,
+        "fullscreen": window.get("fullscreen") is True,
+        "client_type": bounded_text(window.get("client_type")),
+        "frame": {
+            key: bounded_number(frame.get(key))
+            for key in ("x", "y", "width", "height")
+        },
+    }
 
 
 def windows() -> list[dict[str, Any]]:
@@ -615,10 +644,12 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "session_status":
         return text_result(status())
     if name == "list_session_windows":
-        limit = arguments.get("limit")
-        if limit is None:
-            limit = MAX_WINDOWS_PER_PAGE
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_WINDOWS_PER_PAGE:
+        requested_limit = arguments.get("limit")
+        if requested_limit is not None and (
+            isinstance(requested_limit, bool)
+            or not isinstance(requested_limit, int)
+            or not 1 <= requested_limit <= MAX_WINDOWS_PER_PAGE
+        ):
             raise ValueError(f"limit must be an integer between 1 and {MAX_WINDOWS_PER_PAGE}")
         cursor = arguments.get("cursor")
         if cursor is None:
@@ -628,6 +659,8 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         else:
             raise ValueError("cursor must be the next_cursor string from a previous result")
         listed = [window_summary(window) for window in windows()]
+        paginated = requested_limit is not None or cursor is not None
+        limit = requested_limit if requested_limit is not None else (MAX_WINDOWS_PER_PAGE if paginated else len(listed))
         page: list[dict[str, Any]] = []
         end = offset
         while end < len(listed) and len(page) < limit:
@@ -643,6 +676,8 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 break
             page = candidate
             end = candidate_end
+        if not paginated and end < len(listed):
+            raise RuntimeError("window list exceeds the model-visible result size; retry with limit to paginate")
         if not page and offset < len(listed):
             raise RuntimeError("a window entry exceeds the bounded listing result size")
         return text_result({
