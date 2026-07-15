@@ -57,7 +57,7 @@ Start a new Codex task after installation. Call `session_status` before doing wo
 
 Capture metadata reports screenshot pixel dimensions, logical window-local dimensions, and `pixel_to_window_scale`. Convert a screenshot point before pointer input: `window_x = screenshot_x * pixel_to_window_scale.x`, and likewise for y.
 
-The journal lives at `${XDG_STATE_HOME:-$HOME/.local/state}/gnome-same-session-computer-use/focus-lease.json`. Only one lease and one input transaction may be active at a time across broker processes. Recovery retains this journal if any postcondition fails; inspect the returned mismatch and retry after resolving it.
+The journal lives at `${XDG_STATE_HOME:-$HOME/.local/state}/gnome-same-session-computer-use/focus-lease.json`. Only one lease and one input transaction may be active at a time across broker processes. Recovery retains this journal if an actionable postcondition fails; inspect the returned mismatch and retry after resolving it. If a journaled window has closed, recovery reports `restored: false`, identifies it in `missing_windows`, and clears the now-unactionable journal when `recovery_complete` is true. `recovery_outcome_unknown: true` means the same Shell instance no longer holds an active lease after a lost recovery reply, so there is no remaining cleanup to retry but full restoration cannot be proven.
 
 ## Remove
 

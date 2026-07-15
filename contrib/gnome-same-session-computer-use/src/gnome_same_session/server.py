@@ -28,6 +28,13 @@ SERVER_INFO = {"name": "gnome-same-session-computer-use", "version": "0.1.0"}
 PROTOCOL_VERSION = "2025-11-25"
 MAX_MCP_STDOUT_LINE_BYTES = 8 * 1024 * 1024
 MAX_CAPTURE_PNG_BYTES = 5 * 1024 * 1024
+MAX_CAPTURE_PIXELS = 7680 * 4320
+MAX_WINDOW_RESULT_BYTES = 32 * 1024
+MAX_WINDOWS_PER_PAGE = 20
+MAX_WINDOW_TEXT_CHARS = 512
+MAX_ERROR_TEXT_CHARS = 2048
+MAX_RESPONSE_COLLECTION_ITEMS = 8
+MAX_RESPONSE_DEPTH = 4
 BUS_NAME = "org.gnome.Shell.Extensions.BackgroundComputerUse"
 OBJECT_PATH = "/org/gnome/Shell/Extensions/BackgroundComputerUse"
 INTERFACE = BUS_NAME
@@ -104,6 +111,62 @@ def dbus_call(method: str, *arguments: str) -> Any:
         return json.loads(response.unpack()[0])
     except Exception as exc:
         raise RuntimeError(f"GNOME integration method {method} failed: {exc}") from exc
+
+
+def bounded_text(value: Any, limit: int = MAX_WINDOW_TEXT_CHARS) -> str:
+    return str("" if value is None else value)[:limit]
+
+
+def bounded_number(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value if abs(value) <= 2**53 - 1 else None
+
+
+def bounded_json_value(value: Any, depth: int = 0) -> Any:
+    if isinstance(value, str):
+        return bounded_text(value)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bounded_number(value)
+    if depth >= MAX_RESPONSE_DEPTH:
+        return None
+    if isinstance(value, list):
+        return [bounded_json_value(item, depth + 1) for item in value[:MAX_RESPONSE_COLLECTION_ITEMS]]
+    if isinstance(value, dict):
+        return {
+            bounded_text(key, 128): bounded_json_value(item, depth + 1)
+            for key, item in list(value.items())[:MAX_RESPONSE_COLLECTION_ITEMS]
+        }
+    return bounded_text(value)
+
+
+def window_summary(window: Any) -> dict[str, Any]:
+    if not isinstance(window, dict):
+        window = {}
+    frame = window.get("frame")
+    if not isinstance(frame, dict):
+        frame = {}
+    return {
+        "id": bounded_text(window.get("id")),
+        "title": bounded_text(window.get("title")),
+        "wm_class": bounded_text(window.get("wm_class")),
+        "app_id": bounded_text(window.get("app_id")),
+        "pid": bounded_number(window.get("pid")),
+        "workspace": bounded_number(window.get("workspace")),
+        "monitor": bounded_number(window.get("monitor")),
+        "focused": window.get("focused") is True,
+        "minimized": window.get("minimized") is True,
+        "fullscreen": window.get("fullscreen") is True,
+        "client_type": bounded_text(window.get("client_type")),
+        "frame": {
+            key: bounded_number(frame.get(key))
+            for key in ("x", "y", "width", "height")
+        },
+    }
 
 
 def windows() -> list[dict[str, Any]]:
@@ -209,7 +272,7 @@ def restore_lease(state: dict[str, Any], *, recovery: bool = False) -> dict[str,
         result = dbus_call("RecoverLease" if recovery else "RestoreLease", str(state["token"]))
     except Exception as exc:
         result = {"restored": False, "errors": [str(exc)]}
-        if recovery and state.get("phase") == "prepared" and state.get("shell_instance"):
+        if recovery and state.get("phase") in {"prepared", "active"} and state.get("shell_instance"):
             try:
                 shell = dbus_call("Status")
             except Exception:
@@ -219,19 +282,48 @@ def restore_lease(state: dict[str, Any], *, recovery: bool = False) -> dict[str,
                 and shell.get("shell_instance") == state["shell_instance"]
                 and shell.get("lease_phase") is None
             ):
-                result = {"restored": True, "errors": [], "state": shell, "expired_pending_lease": True}
+                prepared = state["phase"] == "prepared"
+                result = {
+                    "restored": prepared,
+                    "recovery_complete": True,
+                    "errors": [],
+                    "state": shell,
+                    "expired_pending_lease": prepared,
+                    "recovery_outcome_unknown": not prepared,
+                }
     if not isinstance(result, dict):
         result = {"restored": False, "errors": ["GNOME integration returned an invalid restoration result"]}
-    restored = result.get("restored") is True and not result.get("errors")
-    if restored:
+    raw_errors = result.get("errors")
+    errors = (
+        [bounded_text(error, MAX_ERROR_TEXT_CHARS) for error in raw_errors[:MAX_RESPONSE_COLLECTION_ITEMS]]
+        if isinstance(raw_errors, list)
+        else ["GNOME integration returned an invalid restoration errors field"]
+    )
+    raw_missing_windows = result.get("missing_windows", [])
+    if isinstance(raw_missing_windows, list):
+        missing_windows = [
+            bounded_text(window)
+            for window in raw_missing_windows[:MAX_RESPONSE_COLLECTION_ITEMS]
+        ]
+    else:
+        missing_windows = []
+        errors.append("GNOME integration returned an invalid missing_windows field")
+    recovery_complete = result.get("recovery_complete", result.get("restored")) is True and not errors
+    restored = result.get("restored") is True and recovery_complete and not missing_windows
+    if recovery_complete:
         LEASE_FILE.unlink(missing_ok=True)
+    target = state.get("target")
+    target_id = target.get("id") if isinstance(target, dict) else target
     return {
         "restored": restored,
-        "errors": result.get("errors") or [],
-        "post_restore_state": result.get("state"),
+        "recovery_complete": recovery_complete,
+        "errors": errors,
+        "missing_windows": missing_windows,
+        "post_restore_state": bounded_json_value(result.get("state")),
         "expired_pending_lease": result.get("expired_pending_lease") is True,
-        "target": (state.get("target") or {}).get("id"),
-        "journal_retained": not restored,
+        "recovery_outcome_unknown": result.get("recovery_outcome_unknown") is True,
+        "target": bounded_text(target_id),
+        "journal_retained": not recovery_complete,
     }
 
 
@@ -450,7 +542,7 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         with file_guard(LOCK_FILE):
             with INPUT_LOCK, file_guard(INPUT_FILE):
                 state = load_lease()
-                return text_result({"restored": True, "message": "no unfinished focus lease"} if not state else restore_lease(state, recovery=True))
+                return text_result({"restored": True, "recovery_complete": True, "message": "no unfinished focus lease"} if not state else restore_lease(state, recovery=True))
     raise ValueError(f"unknown tool: {name}")
 
 

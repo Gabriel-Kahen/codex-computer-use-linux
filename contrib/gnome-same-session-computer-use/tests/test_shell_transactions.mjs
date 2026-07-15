@@ -97,9 +97,10 @@ test('restore runs every step and a postcondition mismatch retains the lease', (
         movePointer: point => calls.push(`pointer:${point.x},${point.y}`),
         state: () => ({focused_window: 'wrong', workspace: 3, pointer: {x: 10, y: 20}}),
     });
-    protocol.finishRestore(result.restored);
+    protocol.finishRestore(result.recovery_complete);
 
     assert.equal(result.restored, false);
+    assert.equal(result.recovery_complete, false);
     assert.match(result.errors.join('\n'), /focused window mismatch/);
     assert.equal(protocol.lease.phase, 'active');
     assert.deepEqual(calls, [
@@ -112,6 +113,90 @@ test('restore runs every step and a postcondition mismatch retains the lease', (
         'pointer:10,20',
         'is-minimized:11',
     ]);
+});
+
+test('restore clears a non-actionable lease when the original window closed', () => {
+    const target = {id: '11', minimized: false};
+    const workspace = {index: 3};
+    const state = {focused_window: null, workspace: 3, pointer: {x: 10, y: 20}};
+    const protocol = new LeaseProtocol();
+    const lease = protocol.begin({
+        capability: CAPABILITY,
+        owner: OWNER,
+        target: '11',
+        targetMinimized: true,
+        original: {focused_window: '22', workspace: 3, pointer: {x: 10, y: 20}},
+    });
+    protocol.activate(CAPABILITY, OWNER);
+
+    const result = restoreLeaseTransaction(lease, {
+        findWindow: id => id === '11' ? target : null,
+        workspaceForWindow: () => assert.fail('closed original has no workspace'),
+        workspaceByIndex: () => workspace,
+        activateWorkspace: () => {},
+        focusWindow: () => assert.fail('closed original cannot be focused'),
+        minimizeWindow: window => { window.minimized = true; },
+        isMinimized: window => window.minimized,
+        movePointer: () => {},
+        state: () => state,
+    });
+    protocol.finishRestore(result.recovery_complete);
+
+    assert.deepEqual(result, {
+        restored: true,
+        recovery_complete: true,
+        errors: [],
+        missing_windows: ['original-focused:22'],
+        state,
+    });
+    assert.equal(protocol.lease, null);
+});
+
+test('restore clears a non-actionable lease when the leased target closed', () => {
+    const calls = [];
+    const focused = {id: '22'};
+    const workspace = {index: 3};
+    const state = {focused_window: '22', workspace: 3, pointer: {x: 10, y: 20}};
+    const protocol = new LeaseProtocol();
+    const lease = protocol.begin({
+        capability: CAPABILITY,
+        owner: OWNER,
+        target: '11',
+        targetMinimized: true,
+        original: {focused_window: '22', workspace: 3, pointer: {x: 10, y: 20}},
+    });
+    protocol.activate(CAPABILITY, OWNER);
+
+    const result = restoreLeaseTransaction(lease, {
+        findWindow: id => (calls.push(`find:${id}`), id === '11' ? null : focused),
+        workspaceForWindow: window => (calls.push(`workspace:${window.id}`), workspace),
+        workspaceByIndex: () => assert.fail('focused original supplies its workspace'),
+        activateWorkspace: value => calls.push(`activate-workspace:${value.index}`),
+        focusWindow: window => calls.push(`focus:${window.id}`),
+        minimizeWindow: () => assert.fail('closed target cannot be minimized'),
+        isMinimized: () => assert.fail('closed target has no minimized postcondition'),
+        movePointer: point => calls.push(`pointer:${point.x},${point.y}`),
+        state: () => (calls.push('state'), state),
+    });
+    protocol.finishRestore(result.recovery_complete);
+
+    assert.deepEqual(result, {
+        restored: true,
+        recovery_complete: true,
+        errors: [],
+        missing_windows: ['target:11'],
+        state,
+    });
+    assert.deepEqual(calls, [
+        'find:11',
+        'find:22',
+        'workspace:22',
+        'activate-workspace:3',
+        'focus:22',
+        'pointer:10,20',
+        'state',
+    ]);
+    assert.equal(protocol.lease, null);
 });
 
 for (const action of ['click', 'drag']) {

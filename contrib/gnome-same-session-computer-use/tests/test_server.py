@@ -140,6 +140,61 @@ class LeaseTests(TestCase):
         self.assertTrue(remains)
         self.assertEqual(result["errors"], ["pointer restoration mismatch"])
 
+    def test_restore_discards_journal_after_non_actionable_closed_window(self) -> None:
+        state = {"token": CAPABILITY, "target": {"id": "11"}, "original": {"focused_window": "12"}}
+        shell_result = {
+            "restored": False,
+            "recovery_complete": True,
+            "errors": [],
+            "missing_windows": ["original-focused:12"],
+            "state": {"focused_window": None, "workspace": 0, "pointer": {"x": 3, "y": 4}},
+        }
+        with TemporaryDirectory() as directory:
+            with (
+                patch.object(server, "LEASE_FILE", Path(directory) / "lease.json"),
+                patch.object(server, "dbus_call", return_value=shell_result),
+            ):
+                server.LEASE_FILE.write_text("{}")
+                result = server.restore_lease(state)
+                remains = server.LEASE_FILE.exists()
+
+        self.assertFalse(result["restored"])
+        self.assertTrue(result["recovery_complete"])
+        self.assertEqual(result["missing_windows"], ["original-focused:12"])
+        self.assertFalse(result["journal_retained"])
+        self.assertFalse(remains)
+
+    def test_restore_discards_journal_when_lease_target_closed(self) -> None:
+        state = {"token": CAPABILITY, "target": {"id": "11"}, "original": {"focused_window": "12"}}
+        shell_result = {
+            "restored": True,
+            "recovery_complete": True,
+            "errors": [],
+            "missing_windows": ["target:11"],
+            "state": {"focused_window": "12", "workspace": 0, "pointer": {"x": 3, "y": 4}},
+        }
+        with TemporaryDirectory() as directory:
+            with (
+                patch.object(server, "LEASE_FILE", Path(directory) / "lease.json"),
+                patch.object(server, "dbus_call", return_value=shell_result),
+            ):
+                server.LEASE_FILE.write_text("{}")
+                result = server.restore_lease(state)
+                remains = server.LEASE_FILE.exists()
+
+        self.assertEqual(result, {
+            "restored": False,
+            "recovery_complete": True,
+            "errors": [],
+            "missing_windows": ["target:11"],
+            "post_restore_state": shell_result["state"],
+            "expired_pending_lease": False,
+            "recovery_outcome_unknown": False,
+            "target": "11",
+            "journal_retained": False,
+        })
+        self.assertFalse(remains)
+
     def test_recovery_uses_explicit_rebind_method(self) -> None:
         state = {"token": CAPABILITY, "target": {"id": "11"}}
         with TemporaryDirectory() as directory:
@@ -153,16 +208,63 @@ class LeaseTests(TestCase):
         self.assertTrue(result["restored"])
         call.assert_called_once_with("RecoverLease", CAPABILITY)
 
-    def test_recovery_only_discards_expired_pending_journal_from_same_shell(self) -> None:
-        state = {
-            "token": CAPABILITY,
-            "phase": "prepared",
-            "shell_instance": "shell-1",
-            "target": {"id": "11"},
-        }
-        cases = (("shell-1", True), ("shell-2", False))
-        for current_shell, expected_restored in cases:
-            with self.subTest(current_shell=current_shell):
+    def test_recovery_reconciles_missing_shell_lease_by_phase_and_instance(self) -> None:
+        cases = (
+            (
+                "prepared",
+                "shell-1",
+                {
+                    "restored": True,
+                    "recovery_complete": True,
+                    "errors": [],
+                    "missing_windows": [],
+                    "post_restore_state": {"shell_instance": "shell-1", "lease_phase": None},
+                    "expired_pending_lease": True,
+                    "recovery_outcome_unknown": False,
+                    "target": "11",
+                    "journal_retained": False,
+                },
+            ),
+            (
+                "active",
+                "shell-1",
+                {
+                    "restored": False,
+                    "recovery_complete": True,
+                    "errors": [],
+                    "missing_windows": [],
+                    "post_restore_state": {"shell_instance": "shell-1", "lease_phase": None},
+                    "expired_pending_lease": False,
+                    "recovery_outcome_unknown": True,
+                    "target": "11",
+                    "journal_retained": False,
+                },
+            ),
+            (
+                "active",
+                "shell-2",
+                {
+                    "restored": False,
+                    "recovery_complete": False,
+                    "errors": ["invalid Shell lease capability"],
+                    "missing_windows": [],
+                    "post_restore_state": None,
+                    "expired_pending_lease": False,
+                    "recovery_outcome_unknown": False,
+                    "target": "11",
+                    "journal_retained": True,
+                },
+            ),
+        )
+        for phase, current_shell, expected in cases:
+            with self.subTest(phase=phase, current_shell=current_shell):
+                state = {
+                    "token": CAPABILITY,
+                    "phase": phase,
+                    "shell_instance": "shell-1",
+                    "target": {"id": "11"},
+                }
+
                 def call(method: str, *_args: str):
                     if method == "RecoverLease":
                         raise RuntimeError("invalid Shell lease capability")
@@ -179,23 +281,30 @@ class LeaseTests(TestCase):
                         result = server.restore_lease(state, recovery=True)
                         remains = server.LEASE_FILE.exists()
 
-                expected_errors = [] if expected_restored else ["invalid Shell lease capability"]
-                self.assertEqual(
-                    result,
-                    {
-                        "restored": expected_restored,
-                        "errors": expected_errors,
-                        "post_restore_state": (
-                            {"shell_instance": current_shell, "lease_phase": None}
-                            if expected_restored
-                            else None
-                        ),
-                        "expired_pending_lease": expected_restored,
-                        "target": "11",
-                        "journal_retained": not expected_restored,
-                    },
-                )
-                self.assertEqual(remains, not expected_restored)
+                self.assertEqual(result, expected)
+                self.assertEqual(remains, expected["journal_retained"])
+
+    def test_bounds_restoration_fields_from_shell_and_journal(self) -> None:
+        oversized = "x" * server.MAX_MCP_STDOUT_LINE_BYTES
+        state = {"token": CAPABILITY, "target": {"id": oversized}}
+        shell_result = {
+            "restored": False,
+            "recovery_complete": True,
+            "errors": [],
+            "missing_windows": [oversized],
+            "state": {"focused_window": oversized},
+        }
+        with TemporaryDirectory() as directory:
+            with (
+                patch.object(server, "LEASE_FILE", Path(directory) / "lease.json"),
+                patch.object(server, "dbus_call", return_value=shell_result),
+            ):
+                server.LEASE_FILE.write_text("{}")
+                result = server.restore_lease(state)
+
+        self.assertEqual(len(result["missing_windows"][0]), server.MAX_WINDOW_TEXT_CHARS)
+        self.assertEqual(len(result["post_restore_state"]["focused_window"]), server.MAX_WINDOW_TEXT_CHARS)
+        self.assertEqual(len(result["target"]), server.MAX_WINDOW_TEXT_CHARS)
 
 
 class InputTests(TestCase):
