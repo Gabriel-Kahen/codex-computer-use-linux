@@ -78,6 +78,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 node --test tests/test_lease_protocol.mjs tests/test_shell_transactions.mjs
 ```
 
-The Node suite executes the capability/caller/phase state machine and the same transaction orchestration imported by the Shell extension. Fault-injectable adapters cover Shell safety gates, activation and restoration postconditions, and virtual pointer/keyboard release cleanup. The thin Clutter, Mutter, and GNOME Shell adapter still receives syntax coverage only and requires validation in a disposable GNOME compositor session.
+The Node suite executes the capability/caller/phase state machine and the same transaction orchestration imported by the Shell extension. Fault-injectable adapters cover Shell safety gates, activation and restoration postconditions, and virtual pointer/keyboard release cleanup.
+
+The thin Clutter, Mutter, and GNOME Shell adapter also received rootless runtime validation in a disposable Fedora 39 GNOME Shell 45.10/Mutter 45.7 nested Wayland compositor on Xvfb. That run enabled the extension, exercised D-Bus status and discovery with two real Wayland windows, rejected lease creation while Overview was open, leased and unminimized a target, delivered an `F6` event through Mutter's virtual keyboard, captured the focused window as a PNG, and recovered from a fresh broker process. Recovery restored the original focus, workspace, pointer, and minimized state before clearing the journal. This does not validate a GDM/systemd-logind-managed login, a real locked or modal session, a full GNOME Xorg session, the native DRM/input backend, or contention with a physical input seat.
 
 The Shell extension is intentionally small and uses only APIs already loaded into GNOME Shell. Validate it in a real compositor session before declaring another Shell major because GNOME extensions share the Shell process and do not have a stable cross-version ABI.
