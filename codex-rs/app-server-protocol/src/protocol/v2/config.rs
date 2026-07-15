@@ -684,10 +684,13 @@ pub struct ExternalAgentConfigDetectParams {
     /// Zero or more working directories to include for repo-scoped detection.
     #[ts(optional = nullable)]
     pub cwds: Option<Vec<PathBuf>>,
-    /// Optional import-source selector. Missing or unrecognized values use the default source for
-    /// backwards compatibility.
+    /// Deprecated field retained for compatibility. This field is ignored; use `migrationSource`
+    /// to select the migration source.
     #[ts(optional = nullable)]
     pub source: Option<String>,
+    /// Optional migration-source selector. Missing or unrecognized values use the default source.
+    #[ts(optional = nullable)]
+    pub migration_source: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -695,11 +698,13 @@ pub struct ExternalAgentConfigDetectParams {
 #[ts(export_to = "v2/")]
 pub struct ExternalAgentConfigImportParams {
     pub migration_items: Vec<ExternalAgentConfigMigrationItem>,
-    /// Import-source selector used to produce the migration items. Pass the same value to detection
-    /// and import; missing or unrecognized values use the default source for backwards
-    /// compatibility.
+    /// Optional identifier for the product that initiated the import.
     #[ts(optional = nullable)]
     pub source: Option<String>,
+    /// Migration-source selector used to produce the migration items. Pass the same value to
+    /// detection and import; missing or unrecognized values use the default source.
+    #[ts(optional = nullable)]
+    pub migration_source: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -756,6 +761,23 @@ pub struct ExternalAgentConfigImportHistory {
 #[ts(export_to = "v2/")]
 pub struct ExternalAgentConfigImportHistoriesReadResponse {
     pub data: Vec<ExternalAgentConfigImportHistory>,
+    pub connectors: Vec<ExternalAgentImportedConnectorCandidate>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ExternalAgentImportedConnectorSource {
+    RemoteMcpServersConfig,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ExternalAgentImportedConnectorCandidate {
+    pub name: String,
+    pub session_count: u32,
+    pub source: ExternalAgentImportedConnectorSource,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
