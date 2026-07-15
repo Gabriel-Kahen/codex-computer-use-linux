@@ -37,7 +37,7 @@ On Arch Linux:
 sudo pacman -S python wmctrl xdotool xorg-xinput gcc pkgconf libx11 libxcomposite libxres libpng
 ```
 
-Enable your desktop's compositor if `session_status` reports `compositing_manager_active: false`. Minimized windows must be restored before exact capture. Capture is limited to 33,177,600 pixels (equivalent to 7680 × 4320), and PNGs larger than 16 MiB are rejected before transport.
+Enable your desktop's compositor if `session_status` reports `compositing_manager_active: false`. Minimized windows must be restored before exact capture. Capture is limited to 33,177,600 pixels (equivalent to 7680 × 4320), and PNGs larger than 5 MiB are rejected before transport.
 
 ## Install
 
