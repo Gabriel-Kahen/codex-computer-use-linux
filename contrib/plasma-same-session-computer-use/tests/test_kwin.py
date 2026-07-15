@@ -13,6 +13,23 @@ from plasma_same_session import kwin
 
 
 class KWinTests(TestCase):
+    @patch.object(kwin, "list_windows", return_value=[])
+    def test_resolve_window_rejects_empty_queries(self, _windows) -> None:
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            kwin.resolve_window(" ")
+
+    @patch.object(kwin, "list_windows")
+    def test_resolve_window_bounds_ambiguous_external_titles(self, windows) -> None:
+        windows.return_value = [
+            {"id": f"{{{index}}}", "capture_id": str(index), "class": "c" * 500, "title": "t" * 500}
+            for index in range(20)
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "ambiguous") as raised:
+            kwin.resolve_window("t")
+
+        self.assertLessEqual(len(str(raised.exception)), 1000)
+
     def test_geometry_parser_supports_negative_monitor_coordinates(self) -> None:
         self.assertEqual(
             kwin._geometry("Window {id}\n  Position: -1920,25 (screen: 0)\n  Geometry: 1280x720"),
@@ -81,5 +98,38 @@ class KWinTests(TestCase):
             "minimized": False,
             "fullscreen": True,
             "excluded_from_capture": False,
+            "geometry": {"x": 10, "y": 20, "width": 800, "height": 600},
+        }])
+
+    @patch.object(kwin, "active_window_id", return_value="{one}")
+    @patch.object(kwin, "window_info", return_value={})
+    @patch.object(kwin, "kdotool")
+    def test_list_windows_keeps_windows_without_optional_process_metadata(self, tool, _info, _active) -> None:
+        values = {
+            ("search", "."): "{one}",
+            ("getwindowgeometry", "{one}"): "Position: 10,20 (screen: 0)\nGeometry: 800x600",
+            ("getwindowname", "{one}"): "Terminal",
+            ("getwindowclassname", "{one}"): "org.kde.konsole",
+            ("get_desktop_for_window", "{one}"): "2",
+        }
+
+        def result(*args: str) -> str:
+            if args == ("getwindowpid", "{one}"):
+                raise RuntimeError("pid unavailable")
+            return values[args]
+
+        tool.side_effect = result
+
+        self.assertEqual(kwin.list_windows(), [{
+            "id": "{one}",
+            "capture_id": "one",
+            "title": "Terminal",
+            "class": "org.kde.konsole",
+            "pid": None,
+            "desktop": 2,
+            "active": True,
+            "minimized": None,
+            "fullscreen": None,
+            "excluded_from_capture": None,
             "geometry": {"x": 10, "y": 20, "width": 800, "height": 600},
         }])

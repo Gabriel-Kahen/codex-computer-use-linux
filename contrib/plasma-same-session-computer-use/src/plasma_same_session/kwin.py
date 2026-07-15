@@ -14,10 +14,15 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")).expanduser() / "plasma-same-session-computer-use"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")).expanduser() / "plasma-same-session-computer-use"
+MAX_COMMAND_ERROR_CHARS = 900
 
 
 def run(args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def _command_error(proc: subprocess.CompletedProcess[str], fallback: str) -> str:
+    return (proc.stderr.strip() or proc.stdout.strip() or fallback)[:MAX_COMMAND_ERROR_CHARS]
 
 
 @contextmanager
@@ -38,7 +43,7 @@ def kdotool(*args: str) -> str:
         raise RuntimeError("kdotool is required for KWin window identity and exact capture selection")
     proc = run(["kdotool", *args])
     if proc.returncode:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"kdotool {' '.join(args)} failed")
+        raise RuntimeError(_command_error(proc, f"kdotool {' '.join(args)} failed"))
     return proc.stdout.strip()
 
 
@@ -108,34 +113,50 @@ def list_windows() -> list[dict[str, Any]]:
     for window_id in ids:
         try:
             geometry = _geometry(kdotool("getwindowgeometry", window_id))
-            info = window_info(window_id)
-            windows.append({
-                "id": window_id,
-                "capture_id": window_id.strip("{}"),
-                "title": kdotool("getwindowname", window_id),
-                "class": kdotool("getwindowclassname", window_id),
-                "pid": int(kdotool("getwindowpid", window_id)),
-                "desktop": window_desktop(window_id, info),
-                "active": window_id == active,
-                "minimized": {"true": True, "false": False}.get(info.get("minimized", "").lower()),
-                "fullscreen": {"true": True, "false": False}.get(info.get("fullscreen", "").lower()),
-                "excluded_from_capture": {"true": True, "false": False}.get(info.get("excludeFromCapture", "").lower()),
-                "geometry": geometry,
-            })
         except (RuntimeError, ValueError):
             continue
+        info = window_info(window_id)
+        try:
+            title = kdotool("getwindowname", window_id)
+        except RuntimeError:
+            title = ""
+        try:
+            window_class = kdotool("getwindowclassname", window_id)
+        except RuntimeError:
+            window_class = ""
+        try:
+            pid = int(kdotool("getwindowpid", window_id))
+        except (RuntimeError, ValueError):
+            pid = None
+        windows.append({
+            "id": window_id,
+            "capture_id": window_id.strip("{}"),
+            "title": title,
+            "class": window_class,
+            "pid": pid,
+            "desktop": window_desktop(window_id, info),
+            "active": window_id == active,
+            "minimized": {"true": True, "false": False}.get(info.get("minimized", "").lower()),
+            "fullscreen": {"true": True, "false": False}.get(info.get("fullscreen", "").lower()),
+            "excluded_from_capture": {"true": True, "false": False}.get(info.get("excludeFromCapture", "").lower()),
+            "geometry": geometry,
+        })
     return windows
 
 
 def resolve_window(query: str) -> dict[str, Any]:
     windows = list_windows()
     lowered = query.lower().strip()
+    if not lowered:
+        raise ValueError("window query must not be empty")
     exact = [w for w in windows if lowered in {w["id"].lower(), w["capture_id"].lower(), w["class"].lower()}]
     matches = exact or [w for w in windows if lowered in w["title"].lower()]
     if not matches:
-        raise RuntimeError(f"no KWin window matches {query!r}")
+        raise RuntimeError(f"no KWin window matches {query[:200]!r}")
     if len(matches) > 1:
-        choices = ", ".join(f"{w['class']} {w['title']} ({w['id']})" for w in matches[:8])
+        choices = ", ".join(
+            f"{w['class'][:96]} {w['title'][:160]} ({w['id'][:80]})" for w in matches[:8]
+        )[:MAX_COMMAND_ERROR_CHARS]
         raise RuntimeError(f"window query is ambiguous; use its KWin id: {choices}")
     return matches[0]
 
@@ -199,7 +220,7 @@ def build_capture_helper() -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     flags = run(["pkg-config", "--cflags", "--libs", "Qt6Core", "Qt6Gui", "Qt6DBus"])
     if flags.returncode:
-        raise RuntimeError(flags.stderr.strip() or "failed to resolve Qt build flags")
+        raise RuntimeError(_command_error(flags, "failed to resolve Qt build flags"))
     compiler = shlex.split(os.environ.get("CXX", "c++"))
     if not compiler:
         raise RuntimeError("CXX does not name a compiler")
@@ -210,7 +231,7 @@ def build_capture_helper() -> Path:
     )
     if proc.returncode:
         temporary.unlink(missing_ok=True)
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "failed to build KWin capture helper")
+        raise RuntimeError(_command_error(proc, "failed to build KWin capture helper"))
     temporary.chmod(0o755)
     temporary.replace(helper)
     install_capture_desktop_file(helper)
@@ -245,7 +266,7 @@ def capture_window(window_id: str, output: Path) -> None:
         helper = build_capture_helper()
     proc = run([str(helper), window_id.strip("{}"), str(output)], timeout=30)
     if proc.returncode:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "KWin exact window capture failed")
+        raise RuntimeError(_command_error(proc, "KWin exact window capture failed"))
     if not output.is_file() or output.stat().st_size == 0:
         raise RuntimeError("KWin capture helper produced no image")
     marker = STATE_DIR / "exact-capture-authorized"

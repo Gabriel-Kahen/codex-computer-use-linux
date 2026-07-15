@@ -84,6 +84,15 @@ class BrokerCaptureTests(TestCase):
             server.capture_result({"window": "target"})
         resolve.assert_not_called()
 
+    @patch.object(kwin, "resolve_window", return_value=WINDOW)
+    @patch.object(kwin, "screen_locked", side_effect=[False, True])
+    def test_capture_rechecks_lock_immediately_before_compositor_action(self, _locked, _resolve) -> None:
+        with patch.object(kwin, "capture_window") as capture:
+            with self.assertRaisesRegex(RuntimeError, "session is locked"):
+                server.capture_result({"window": "target"})
+
+        capture.assert_not_called()
+
     @patch.object(kwin, "pointer_position", return_value={"x": 4, "y": 5})
     @patch.object(kwin, "current_desktop", return_value=2)
     @patch.object(kwin, "active_window_id", return_value="{other}")
@@ -294,7 +303,7 @@ exit "$status"
 
             self.assertTrue(output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
             self.assertEqual(json.loads(trace.read_text()), {
-                "bytesWritten": 16,
+                "bytesWritten": 512 * 512 * 4,
                 "handle": "test-window-uuid",
                 "includeDecoration": False,
                 "includeShadow": False,

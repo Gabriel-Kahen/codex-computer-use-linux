@@ -17,6 +17,7 @@ PROTOCOL_VERSION = "2025-11-25"
 # Base64 expansion must stay below the rmcp client's 8 MiB stdio line cap.
 MAX_CAPTURE_BYTES = 5 * 1024 * 1024
 MAX_LIST_WINDOWS = 10
+MAX_WINDOW_ID_CHARS = 80
 MAX_WINDOW_TITLE_CHARS = 160
 MAX_WINDOW_CLASS_CHARS = 96
 LEASE_FILE = kwin.STATE_DIR / "focus-lease.json"
@@ -124,6 +125,8 @@ def _require_unlocked(operation: str) -> None:
 
 def _window_for_model(window: dict[str, Any]) -> dict[str, Any]:
     bounded = dict(window)
+    bounded["id"] = str(window.get("id") or "")[:MAX_WINDOW_ID_CHARS]
+    bounded["capture_id"] = str(window.get("capture_id") or "")[:MAX_WINDOW_ID_CHARS]
     bounded["title"] = str(window.get("title") or "")[:MAX_WINDOW_TITLE_CHARS]
     bounded["class"] = str(window.get("class") or "")[:MAX_WINDOW_CLASS_CHARS]
     return bounded
@@ -178,6 +181,11 @@ def _restore(state: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         errors.append(f"window enumeration: {exc}")
         live_ids = set()
+    try:
+        _require_unlocked("focus restoration")
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        return _finish_restore(state, errors, missing_windows, verified, None)
     target_id = str(target.get("id") or "")
     target_desktop = original.get("target_desktop")
     if not target_id:
@@ -208,10 +216,6 @@ def _restore(state: dict[str, Any]) -> dict[str, Any]:
     if original.get("desktop") is not None:
         try:
             kwin.set_desktop(int(original["desktop"]))
-            observed_desktop = kwin.current_desktop()
-            verified["desktop"] = observed_desktop == int(original["desktop"])
-            if not verified["desktop"]:
-                errors.append(f"desktop verification: expected {original['desktop']}, observed {observed_desktop}")
         except Exception as exc:
             errors.append(f"desktop restore: {exc}")
     active_id = str(original.get("active_window") or "")
@@ -222,12 +226,24 @@ def _restore(state: dict[str, Any]) -> dict[str, Any]:
     elif active_id in live_ids:
         try:
             kwin.activate(active_id)
+        except Exception as exc:
+            errors.append(f"focus restore: {exc}")
+    if original.get("desktop") is not None:
+        try:
+            observed_desktop = kwin.current_desktop()
+            verified["desktop"] = observed_desktop == int(original["desktop"])
+            if not verified["desktop"]:
+                errors.append(f"desktop verification: expected {original['desktop']}, observed {observed_desktop}")
+        except Exception as exc:
+            errors.append(f"desktop verification: {exc}")
+    if active_id in live_ids:
+        try:
             observed_active = kwin.active_window_id()
             verified["focus"] = observed_active == active_id
             if not verified["focus"]:
                 errors.append(f"focus verification: expected {active_id}, observed {observed_active}")
         except Exception as exc:
-            errors.append(f"focus restore: {exc}")
+            errors.append(f"focus verification: {exc}")
     original_pointer = original.get("pointer")
     observed_pointer = None
     if original_pointer is not None:
@@ -284,6 +300,7 @@ def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
     }
     _save_lease(state)
     try:
+        _require_unlocked("focus lease")
         kwin.activate(target["id"])
         observed_active = kwin.active_window_id()
         if observed_active != target["id"]:
@@ -363,6 +380,7 @@ def capture_result(arguments: dict[str, Any]) -> dict[str, Any]:
     os.close(fd)
     temporary = Path(name)
     try:
+        _require_unlocked("window capture")
         before = {"focus": kwin.active_window_id(), "desktop": kwin.current_desktop(), "pointer": kwin.pointer_position()}
         kwin.capture_window(selected["id"], temporary)
         raw = temporary.read_bytes()

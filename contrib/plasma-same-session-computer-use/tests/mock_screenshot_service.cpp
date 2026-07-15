@@ -47,9 +47,17 @@ public:
             && fstat(descriptor.fileDescriptor(), &descriptorStat) == 0
             && S_ISFIFO(descriptorStat.st_mode);
 
-        QImage image(2, 2, QImage::Format_ARGB32_Premultiplied);
+        QImage image(512, 512, QImage::Format_ARGB32_Premultiplied);
         image.fill(qRgba(10, 20, 30, 255));
-        const auto written = write(descriptor.fileDescriptor(), image.constBits(), image.sizeInBytes());
+        qsizetype written = 0;
+        while (written < image.sizeInBytes()) {
+            const auto count = write(
+                descriptor.fileDescriptor(), image.constBits() + written, image.sizeInBytes() - written);
+            if (count <= 0) {
+                break;
+            }
+            written += count;
+        }
 
         QJsonObject trace {
             {QStringLiteral("handle"), handle},

@@ -8,9 +8,9 @@ The current focus is **same-session background computer use**: letting Codex ins
 
 ## Current support
 
-The implementation currently available on `main` is an experimental integration for **Hyprland 0.55.4**. It combines the bundled Codex Computer Use plugin with a Hyprland-specific companion plugin in [`contrib/hyprland-background-computer-use/`](./contrib/hyprland-background-computer-use/).
+The implementations currently available on `main` are experimental integrations for **Hyprland 0.55.4** and **KDE Plasma 6 on Wayland**. Each combines the bundled Codex Computer Use plugin with a compositor-specific companion plugin.
 
-The integration can:
+The Hyprland integration in [`contrib/hyprland-background-computer-use/`](./contrib/hyprland-background-computer-use/) can:
 
 - discover windows in the current Hyprland session;
 - capture a specific window, including one on an inactive workspace;
@@ -18,15 +18,17 @@ The integration can:
 - target keyboard and pointer input at native Wayland and XWayland windows without moving the physical cursor where supported; and
 - use a recoverable temporary workspace and output when an application requires real focus.
 
-This is not yet a general Linux backend. Experimental backends for [GNOME](https://github.com/Gabriel-Kahen/codex-computer-use-linux/pull/10), [generic X11 desktops](https://github.com/Gabriel-Kahen/codex-computer-use-linux/pull/11), and [Plasma/KWin](https://github.com/Gabriel-Kahen/codex-computer-use-linux/pull/12) are also in development.
+The Plasma integration in [`contrib/plasma-same-session-computer-use/`](./contrib/plasma-same-session-computer-use/) adds stable KWin window discovery, exact compositor-side capture, and recoverable focus/restoration leases. It does not claim targeted background input because Plasma exposes one shared input seat.
+
+This is not yet a general Linux backend. Experimental backends for [GNOME](https://github.com/Gabriel-Kahen/codex-computer-use-linux/pull/10) and [generic X11 desktops](https://github.com/Gabriel-Kahen/codex-computer-use-linux/pull/11) are also in development.
 
 ## Installation
 
 ### Requirements
 
-- Linux running Hyprland 0.55.4
+- Linux running Hyprland 0.55.4 or KDE Plasma 6 on Wayland
 - a current [Codex CLI](https://developers.openai.com/codex/cli) release with `codex plugin` support
-- the build and runtime dependencies listed in the [Hyprland integration guide](./contrib/hyprland-background-computer-use/README.md#requirements)
+- the build and runtime dependencies listed in the corresponding [Hyprland](./contrib/hyprland-background-computer-use/README.md#requirements) or [Plasma](./contrib/plasma-same-session-computer-use/README.md#requirements) integration guide
 
 ### Install the plugins
 
@@ -65,11 +67,11 @@ See the [Hyprland integration guide](./contrib/hyprland-background-computer-use/
 
 ## Safety and limitations
 
-Linux compositors expose different capture and input capabilities, so behavior and physical-input interference vary by desktop environment. The Hyprland integration prefers window-local operations, but its compatibility fallback can temporarily contend with the physical keyboard and pointer.
+Linux compositors expose different capture and input capabilities, so behavior and physical-input interference vary by desktop environment. The Hyprland integration prefers window-local operations, but its compatibility fallback can temporarily contend with the physical keyboard and pointer. Plasma provides exact background capture but uses an acknowledged focus/restoration lease before separately invoked global input.
 
 The fallback requires explicit acknowledgement and records compositor state so it can restore the original window, workspace, focus, fullscreen mode, and cursor position. The integration refuses input in unsafe conditions such as a locked session, active pointer constraints, or a physical button being held. It is not intended to bypass authentication surfaces, application security controls, or anti-cheat systems.
 
-Read the full [safety boundary](./contrib/hyprland-background-computer-use/README.md#safety-boundary) before using the experimental integration.
+Read the full [Hyprland](./contrib/hyprland-background-computer-use/README.md#safety-boundary) or [Plasma](./contrib/plasma-same-session-computer-use/README.md#safety) safety boundary before using an experimental integration.
 
 ## Project direction
 

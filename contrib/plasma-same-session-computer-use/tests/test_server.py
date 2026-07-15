@@ -162,6 +162,22 @@ class LeaseTests(TestCase):
             server.begin_lease({"window": "Editor", "acknowledge_interference": True})
         restore.assert_called_once()
 
+    def test_begin_rechecks_lock_before_activation_and_retains_prepared_journal(self) -> None:
+        with (
+            patch.object(kwin, "screen_locked", side_effect=[False, True, True]),
+            patch.object(kwin, "resolve_window", return_value=WINDOW),
+            patch.object(kwin, "window_info", return_value={"uuid": "original"}),
+            patch.object(kwin, "active_window_id", return_value="{original}"),
+            patch.object(kwin, "current_desktop", return_value=1),
+            patch.object(kwin, "pointer_position", return_value={"x": 5, "y": 7}),
+            patch.object(kwin, "activate") as activate,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "session is locked"):
+                server.begin_lease({"window": "Editor", "acknowledge_interference": True})
+
+        activate.assert_not_called()
+        self.assertEqual(json.loads(self.lease_file.read_text())["phase"], "prepared")
+
     @patch.object(kwin, "active_window_id", return_value="{target}")
     @patch.object(kwin, "screen_locked", return_value=False)
     @patch.object(kwin, "list_windows", return_value=[WINDOW])
@@ -269,6 +285,35 @@ class LeaseTests(TestCase):
         self.assertTrue(result["pointer_restore_required"])
         self.assertTrue(result["journal_retained"])
         self.assertTrue(self.lease_file.exists())
+
+    @patch.object(kwin, "pointer_position", return_value={"x": 5, "y": 7})
+    @patch.object(kwin, "active_window_id", return_value="{original}")
+    @patch.object(kwin, "current_desktop", return_value=2)
+    @patch.object(kwin, "window_boolean", return_value=False)
+    @patch.object(kwin, "window_desktop", return_value=3)
+    @patch.object(kwin, "activate")
+    @patch.object(kwin, "set_desktop")
+    @patch.object(kwin, "set_window_minimized")
+    @patch.object(kwin, "set_window_desktop")
+    @patch.object(kwin, "list_windows", return_value=[WINDOW, {**WINDOW, "id": "{original}"}])
+    def test_restore_verifies_desktop_after_reactivating_original_window(self, *_mocks) -> None:
+        state = {
+            "target": WINDOW,
+            "original": {
+                "active_window": "{original}",
+                "desktop": 1,
+                "target_desktop": 3,
+                "target_minimized": False,
+                "pointer": {"x": 5, "y": 7},
+            },
+        }
+        self.lease_file.write_text(json.dumps(state))
+
+        result = server._restore(state)
+
+        self.assertFalse(result["recovery_complete"])
+        self.assertFalse(result["verified"]["desktop"])
+        self.assertTrue(result["journal_retained"])
 
 
 class StatusTests(TestCase):
