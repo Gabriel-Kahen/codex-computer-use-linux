@@ -1,14 +1,75 @@
 #include <X11/Xlib.h>
+#include <X11/extensions/Xcomposite.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
-int main(void) {
+static int x_error;
+
+static int record_x_error(Display *display, XErrorEvent *event) {
+    (void)display;
+    x_error = event->error_code;
+    return 0;
+}
+
+static int wait_for_compositor(Display *display, int screen) {
+    int event_base, error_base;
+    int major, minor;
+    if (!XCompositeQueryExtension(display, &event_base, &error_base) ||
+        !XCompositeQueryVersion(display, &major, &minor) || (major == 0 && minor < 2)) {
+        fprintf(stderr, "XComposite 0.2 is unavailable\n");
+        XCloseDisplay(display);
+        return 1;
+    }
+    XSetWindowAttributes attributes = {.override_redirect = True};
+    Window window = XCreateWindow(
+        display, RootWindow(display, screen), 0, 0, 1, 1, 0, CopyFromParent, InputOutput,
+        CopyFromParent, CWOverrideRedirect, &attributes
+    );
+    XMapWindow(display, window);
+    XSetErrorHandler(record_x_error);
+    XSync(display, False);
+
+    char selection[64];
+    snprintf(selection, sizeof(selection), "_NET_WM_CM_S%d", screen);
+    Atom selection_atom = XInternAtom(display, selection, False);
+    for (int attempt = 0; attempt < 100; attempt++) {
+        x_error = 0;
+        Pixmap pixmap = XCompositeNameWindowPixmap(display, window);
+        XSync(display, False);
+        if (!x_error && pixmap) {
+            if (XGetSelectionOwner(display, selection_atom) != None) {
+                XFreePixmap(display, pixmap);
+                XDestroyWindow(display, window);
+                XCloseDisplay(display);
+                return 0;
+            }
+            XFreePixmap(display, pixmap);
+        }
+        usleep(50000);
+    }
+
+    fprintf(stderr, "compositor did not redirect the probe window\n");
+    XDestroyWindow(display, window);
+    XCloseDisplay(display);
+    return 1;
+}
+
+int main(int argc, char **argv) {
     Display *display = XOpenDisplay(NULL);
     if (!display) {
         fprintf(stderr, "cannot open DISPLAY\n");
         return 1;
     }
     int screen = DefaultScreen(display);
+    if (argc == 2 && strcmp(argv[1], "--wait-for-compositor") == 0) {
+        return wait_for_compositor(display, screen);
+    }
+    if (argc != 1) {
+        fprintf(stderr, "usage: %s [--wait-for-compositor]\n", argv[0]);
+        XCloseDisplay(display);
+        return 2;
+    }
     XColor color, exact;
     if (!XAllocNamedColor(display, DefaultColormap(display, screen), "#123456", &color, &exact)) {
         fprintf(stderr, "cannot allocate test color\n");
