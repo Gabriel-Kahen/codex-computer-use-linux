@@ -51,6 +51,17 @@ Start a new Codex task after installation so the tools and operating skill are l
 codex plugin list
 ```
 
+For Xorg/EWMH, replace the two Hyprland-specific lines above with:
+
+```shell
+codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
+  --sparse .agents/plugins \
+  --sparse contrib/x11-background-computer-use
+codex plugin add x11-background-computer-use@codex-computer-use-linux
+```
+
+See the [X11 integration README](./contrib/x11-background-computer-use/README.md) for packages, supported desktops, and the acknowledged interference boundary.
+
 See the [Hyprland integration guide](./contrib/hyprland-background-computer-use/README.md) for detailed requirements, updates, removal, manual builds, and troubleshooting.
 
 ## Safety and limitations
