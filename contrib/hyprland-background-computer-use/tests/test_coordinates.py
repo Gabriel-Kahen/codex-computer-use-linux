@@ -6,6 +6,7 @@ from same_session_computer_use.server import png_pixel_size, window_coordinate_s
 def png_header(width: int, height: int) -> bytes:
     raw = bytearray(24)
     raw[:8] = b"\x89PNG\r\n\x1a\n"
+    raw[8:16] = b"\x00\x00\x00\rIHDR"
     raw[16:20] = width.to_bytes(4, "big")
     raw[20:24] = height.to_bytes(4, "big")
     return bytes(raw)

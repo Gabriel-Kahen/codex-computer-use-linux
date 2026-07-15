@@ -117,6 +117,31 @@ class WindowTests(TestCase):
         self.assertIn("USB Mouse", held[0])
         self.assertIn("device vanished", held[1])
 
+    def test_identity_probe_recognizes_a_replaced_window(self) -> None:
+        expected = {"xid": "0x20", "pid": 20}
+        replacement = {"xid": "0x20", "pid": 30}
+        with patch.object(server, "_window_identity", return_value=replacement), patch.object(server, "run") as run:
+            result = server._identity_matches(expected)
+
+        self.assertEqual(result, server.IdentityMatch.CHANGED)
+        run.assert_not_called()
+
+    def test_identity_probe_recognizes_a_closed_window(self) -> None:
+        expected = {"xid": "0x20", "pid": 20}
+        closed = completed([], stderr="X Error of failed request: BadWindow", returncode=1)
+        with patch.object(server, "_window_identity", return_value=None), patch.object(server, "run", return_value=closed):
+            result = server._identity_matches(expected)
+
+        self.assertEqual(result, server.IdentityMatch.CHANGED)
+
+    def test_identity_probe_failure_is_indeterminate(self) -> None:
+        expected = {"xid": "0x20", "pid": 20}
+        failed = completed([], stderr="temporary XRes failure", returncode=1)
+        with patch.object(server, "_window_identity", return_value=None), patch.object(server, "run", return_value=failed):
+            result = server._identity_matches(expected)
+
+        self.assertEqual(result, server.IdentityMatch.INDETERMINATE)
+
 
 class LeaseTests(TestCase):
     def setUp(self) -> None:
@@ -149,7 +174,7 @@ class LeaseTests(TestCase):
                 self.assertTrue(server.LEASE_FILE.exists())
 
         active_identity = {"xid": "0x00000010", "pid": 10, "process_start_time": "1", "wm_class": "other"}
-        with patch.object(server, "ensure_session", return_value={"session": "same"}), patch.object(server, "_ensure_input_safe"), patch.object(server, "resolve_window", return_value=target), patch.object(server, "_window_identity", side_effect=[target_identity, active_identity]), patch.object(server, "_identity_matches", return_value=True), patch.object(server, "_active_window", return_value="0x00000010"), patch.object(server, "_desktop", return_value=3), patch.object(server, "_pointer", return_value={"x": 4, "y": 5}), patch.object(server, "_checked_xdotool", side_effect=checked), patch.object(server, "_validate_lease_binding"), patch.object(server, "_validate_session_binding"), patch.object(server, "run", return_value=completed([])) as run:
+        with patch.object(server, "ensure_session", return_value={"session": "same"}), patch.object(server, "_ensure_input_safe"), patch.object(server, "resolve_window", return_value=target), patch.object(server, "_window_identity", side_effect=[target_identity, active_identity]), patch.object(server, "_identity_matches", return_value=server.IdentityMatch.MATCH), patch.object(server, "_active_window", return_value="0x00000010"), patch.object(server, "_desktop", return_value=3), patch.object(server, "_pointer", return_value={"x": 4, "y": 5}), patch.object(server, "_checked_xdotool", side_effect=checked), patch.object(server, "_validate_lease_binding"), patch.object(server, "_validate_session_binding"), patch.object(server, "run", return_value=completed([])) as run:
             result = server.begin_lease({"window": "0x20", "acknowledge_interference": True})
             state = json.loads(server.LEASE_FILE.read_text())
             state["pressed_button"] = "1"
@@ -228,14 +253,100 @@ class LeaseTests(TestCase):
                 server.restore_lease(state)
         run.assert_not_called()
 
-    def test_changed_target_identity_does_not_block_button_release(self) -> None:
+    def test_end_restores_state_after_target_window_closes(self) -> None:
         fingerprint = {"socket_inode": 1}
-        state = {"session_fingerprint": fingerprint, "target_identity": {"xid": "0x20"}, "target": {"xid": "0x20"}, "original": {}, "pressed_button": "1"}
-        with patch.object(server, "ensure_session", return_value=fingerprint), patch.object(server, "_ensure_input_safe"), patch.object(server, "_identity_matches", return_value=False), patch.object(server, "run", return_value=completed([])) as run:
-            restored = server.restore_lease(state)
+        active_identity = {"xid": "0x10"}
+        target_identity = {"xid": "0x20"}
+        state = {
+            "token": "secret",
+            "session_fingerprint": fingerprint,
+            "target_identity": target_identity,
+            "target": {"xid": "0x20"},
+            "original": {
+                "active_xid": "0x10",
+                "active_identity": active_identity,
+                "desktop": 2,
+                "pointer": {"x": 4, "y": 5},
+                "target_minimized": True,
+            },
+            "pressed_button": "1",
+        }
+        server.save_lease(state)
 
-        self.assertTrue(restored["restored"])
-        self.assertEqual(run.call_args.args[0], ["xdotool", "mouseup", "1"])
+        def identity(xid):
+            return active_identity if xid == active_identity["xid"] else None
+
+        def run_command(args, **_kwargs):
+            if args[:2] == ["xprop", "-id"]:
+                return completed(args, stderr="X Error of failed request: BadWindow", returncode=1)
+            return completed(args)
+
+        with (
+            patch.object(server, "ensure_session", return_value=fingerprint),
+            patch.object(server, "_ensure_input_safe"),
+            patch.object(server, "_window_identity", side_effect=identity),
+            patch.object(server, "run", side_effect=run_command) as run,
+        ):
+            result = server.call_tool("end_input_lease", {"lease_token": "secret"})
+
+        self.assertTrue(result["structuredContent"]["restored"])
+        self.assertFalse(server.LEASE_FILE.exists())
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["xdotool", "mouseup", "1"], commands)
+        self.assertIn(["xdotool", "windowactivate", "--sync", "0x10"], commands)
+        self.assertIn(["xdotool", "mousemove", "--sync", "4", "5"], commands)
+        self.assertNotIn(["xdotool", "windowminimize", "0x20"], commands)
+
+    def test_end_retains_journal_when_target_identity_probe_is_indeterminate(self) -> None:
+        fingerprint = {"socket_inode": 1}
+        state = {
+            "token": "secret",
+            "session_fingerprint": fingerprint,
+            "target_identity": {"xid": "0x20"},
+            "target": {"xid": "0x20"},
+            "original": {"desktop": 2, "target_minimized": True, "pointer": {"x": 4, "y": 5}},
+            "pressed_button": "1",
+        }
+        server.save_lease(state)
+
+        with (
+            patch.object(server, "ensure_session", return_value=fingerprint),
+            patch.object(server, "_ensure_input_safe"),
+            patch.object(server, "_identity_matches", return_value=server.IdentityMatch.INDETERMINATE),
+            patch.object(server, "run", return_value=completed([])) as run,
+        ):
+            result = server.call_tool("end_input_lease", {"lease_token": "secret"})
+
+        self.assertFalse(result["structuredContent"]["restored"])
+        self.assertIn("could not be verified", result["structuredContent"]["errors"][0])
+        self.assertTrue(server.LEASE_FILE.exists())
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["xdotool", "mouseup", "1"], commands)
+        self.assertIn(["xdotool", "set_desktop", "2"], commands)
+        self.assertIn(["xdotool", "mousemove", "--sync", "4", "5"], commands)
+        self.assertNotIn(["xdotool", "windowminimize", "0x20"], commands)
+
+    def test_end_still_requires_the_lease_token(self) -> None:
+        server.save_lease({"token": "secret"})
+
+        with patch.object(server, "restore_lease") as restore:
+            with self.assertRaisesRegex(ValueError, "lease token"):
+                server.call_tool("end_input_lease", {"lease_token": "wrong"})
+
+        restore.assert_not_called()
+        self.assertTrue(server.LEASE_FILE.exists())
+
+    def test_lease_actions_still_require_the_live_target_identity(self) -> None:
+        server.save_lease({"token": "secret"})
+
+        with (
+            patch.object(server, "_validate_lease_binding", side_effect=RuntimeError("target identity changed")),
+            patch.object(server, "_checked_xdotool") as xdotool,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "target identity changed"):
+                server.lease_key({"lease_token": "secret", "key": "x"})
+
+        xdotool.assert_not_called()
 
     def test_begin_refuses_unrestorable_active_window(self) -> None:
         target = {"xid": "0x20", "pid": 20, "minimized": False, "width": 100, "height": 80}
@@ -258,6 +369,20 @@ class StatusTests(TestCase):
 
 
 class McpErrorTests(TestCase):
+    def test_initialize_echoes_known_protocol_versions(self) -> None:
+        for version in ("2024-11-05", "2025-03-26", "2025-06-18", server.PROTOCOL_VERSION):
+            with self.subTest(version=version):
+                request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": version}}
+                response = server.dispatch(request)
+
+                self.assertEqual(response["result"]["protocolVersion"], version)
+
+    def test_initialize_falls_back_for_an_unknown_protocol_version(self) -> None:
+        request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "unsupported-version"}}
+        response = server.dispatch(request)
+
+        self.assertEqual(response["result"]["protocolVersion"], server.PROTOCOL_VERSION)
+
     def test_capture_tool_resolves_window_before_capture(self) -> None:
         window = {"xid": "0x20"}
         expected = {"content": [], "isError": False}
@@ -301,6 +426,33 @@ class McpErrorTests(TestCase):
 
         self.assertNotIn("error", response)
         self.assertTrue(response["result"]["isError"])
+
+    def test_subprocess_stderr_tool_error_has_a_serialized_size_cap(self) -> None:
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "send_window_shortcut", "arguments": {"window": "0x20", "key": "x"}}}
+        failed = completed([], stderr="é" * (server.MAX_ERROR_RESULT_BYTES * 4), returncode=1)
+        with patch.object(server, "lease_guard", return_value=contextlib.nullcontext()), patch.object(server, "load_lease", return_value=None), patch.object(server, "resolve_window", return_value={"xid": "0x20"}), patch.object(server, "ensure_session"), patch.object(server, "_ensure_input_safe"), patch.object(server, "run", return_value=failed):
+            response = server.dispatch(request)
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertLessEqual(server._serialized_size(response["result"]), server.MAX_ERROR_RESULT_BYTES)
+        self.assertTrue(response["result"]["structuredContent"]["error"].endswith("…"))
+
+    def test_dispatch_error_has_a_serialized_size_cap(self) -> None:
+        class BrokenParams(dict):
+            def get(self, _key, _default=None):
+                raise RuntimeError("é" * (server.MAX_ERROR_RESULT_BYTES * 4))
+
+        request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": BrokenParams({"present": True})}
+        response = server.dispatch(request)
+
+        self.assertLessEqual(server._serialized_size(response), server.MAX_ERROR_RESULT_BYTES)
+        self.assertTrue(response["error"]["message"].endswith("…"))
+
+    def test_error_collection_has_a_single_serialized_size_cap(self) -> None:
+        errors = server._bounded_error_list(["é" * server.MAX_ERROR_RESULT_BYTES] * 4)
+
+        self.assertLessEqual(server._serialized_size(errors), server.MAX_ERROR_RESULT_BYTES)
+        self.assertTrue(errors[-1].endswith("…"))
 
     def test_direct_shortcut_checks_safety_without_clearing_modifiers(self) -> None:
         window = {"xid": "0x20"}

@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import threading
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +22,83 @@ from .capture import ensure_capture_helper
 
 SERVER_INFO = {"name": "x11-same-session-computer-use", "version": "0.1.0"}
 PROTOCOL_VERSION = "2025-11-25"
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", PROTOCOL_VERSION})
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "x11-same-session-computer-use"
 LEASE_FILE = STATE_DIR / "input-lease.json"
 LOCK_FILE = STATE_DIR / "input-lease.lock"
 MAX_WINDOW_RESULT_BYTES = 32 * 1024
 MAX_WINDOWS_PER_PAGE = 20
 MAX_WINDOW_TEXT_CHARS = 512
+MAX_ERROR_RESULT_BYTES = 8 * 1024
+
+
+class IdentityMatch(Enum):
+    MATCH = "match"
+    CHANGED = "changed"
+    INDETERMINATE = "indeterminate"
+
+
+def _serialized_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode())
+
+
+def _bounded_error_text(value: Any, max_bytes: int = MAX_ERROR_RESULT_BYTES) -> str:
+    text = str(value)
+    if _serialized_size(text) <= max_bytes:
+        return text
+    suffix = "…"
+    low = 0
+    high = len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _serialized_size(text[:middle] + suffix) <= max_bytes:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + suffix
+
+
+def _bounded_error_list(values: list[Any]) -> list[str]:
+    bounded: list[str] = []
+    for value in values:
+        text = str(value)
+        candidate = [*bounded, text]
+        if _serialized_size(candidate) <= MAX_ERROR_RESULT_BYTES:
+            bounded = candidate
+            continue
+        low = 0
+        high = len(text)
+        suffix = "…"
+        while low < high:
+            middle = (low + high + 1) // 2
+            if _serialized_size([*bounded, text[:middle] + suffix]) <= MAX_ERROR_RESULT_BYTES:
+                low = middle
+            else:
+                high = middle - 1
+        if _serialized_size([*bounded, text[:low] + suffix]) <= MAX_ERROR_RESULT_BYTES:
+            bounded.append(text[:low] + suffix)
+        break
+    return bounded
+
+
+def _jsonrpc_error(request_id: Any, code: int, message: Any) -> dict[str, Any]:
+    def response(text: str, response_id: Any = request_id) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": response_id, "error": {"code": code, "message": text}}
+
+    text = str(message)
+    if _serialized_size(response(text)) <= MAX_ERROR_RESULT_BYTES:
+        return response(text)
+    suffix = "…"
+    low = 0
+    high = len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _serialized_size(response(text[:middle] + suffix)) <= MAX_ERROR_RESULT_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    bounded = response(text[:low] + suffix)
+    return bounded if _serialized_size(bounded) <= MAX_ERROR_RESULT_BYTES else response("error response exceeded its size limit", None)
 
 
 def tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None, *, read_only: bool = False, idempotent: bool = False) -> dict[str, Any]:
@@ -253,12 +325,31 @@ def _window_identity(xid: str | None) -> dict[str, Any] | None:
     start_time = _process_start_time(pid) if pid else None
     if not pid or not start_time or not _pid_belongs_to_session(pid):
         return None
-    wm_class = _xprop(xid, "WM_CLASS")[:MAX_WINDOW_TEXT_CHARS]
-    return {"xid": xid, "pid": pid, "process_start_time": start_time, "wm_class": wm_class.strip()}
+    wm_class = run(["xprop", "-id", xid, "WM_CLASS"])
+    if wm_class.returncode:
+        return None
+    return {"xid": xid, "pid": pid, "process_start_time": start_time, "wm_class": wm_class.stdout[:MAX_WINDOW_TEXT_CHARS].strip()}
 
 
-def _identity_matches(expected: dict[str, Any] | None) -> bool:
-    return bool(expected and _window_identity(str(expected.get("xid") or "")) == expected)
+def _identity_matches(expected: dict[str, Any] | None) -> IdentityMatch:
+    if expected is None:
+        return IdentityMatch.CHANGED
+    xid = str(expected.get("xid") or "")
+    if not xid:
+        return IdentityMatch.INDETERMINATE
+    try:
+        current = _window_identity(xid)
+        if current is not None:
+            return IdentityMatch.MATCH if current == expected else IdentityMatch.CHANGED
+        existence = run(["xprop", "-id", xid, "WM_CLASS"])
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return IdentityMatch.INDETERMINATE
+    if existence.returncode == 0:
+        return IdentityMatch.INDETERMINATE
+    error = f"{existence.stdout}\n{existence.stderr}".casefold()
+    if "badwindow" in error or "no such window" in error:
+        return IdentityMatch.CHANGED
+    return IdentityMatch.INDETERMINATE
 
 
 def _validate_session_binding(state: dict[str, Any]) -> None:
@@ -270,8 +361,12 @@ def _validate_session_binding(state: dict[str, Any]) -> None:
 def _validate_lease_binding(state: dict[str, Any]) -> None:
     _validate_session_binding(state)
     target_identity = state.get("target_identity")
-    if target_identity and not _identity_matches(target_identity):
-        raise RuntimeError("refusing lease recovery because the target X11 window identity changed")
+    if target_identity:
+        identity = _identity_matches(target_identity)
+        if identity is IdentityMatch.CHANGED:
+            raise RuntimeError("refusing input because the target X11 window identity changed")
+        if identity is IdentityMatch.INDETERMINATE:
+            raise RuntimeError("refusing input because the target X11 window identity could not be verified")
 
 
 def _active_window() -> str | None:
@@ -334,10 +429,10 @@ def _lock_state() -> bool | None:
 
 def _held_physical_input() -> list[str]:
     if not shutil.which("xinput"):
-        return ["xinput unavailable, so held physical input cannot be checked"]
+        return _bounded_error_list(["xinput unavailable, so held physical input cannot be checked"])
     devices = run(["xinput", "list", "--short"])
     if devices.returncode:
-        return [devices.stderr.strip() or "xinput could not list physical devices"]
+        return _bounded_error_list([devices.stderr.strip() or "xinput could not list physical devices"])
     physical: list[tuple[str, str]] = []
     for line in devices.stdout.splitlines():
         if "XTEST" in line or not re.search(r"slave\s+(pointer|keyboard)", line):
@@ -346,7 +441,7 @@ def _held_physical_input() -> list[str]:
         if match:
             physical.append((match.group(1), line.strip()))
     if not physical:
-        return ["xinput reported no non-XTEST slave input devices"]
+        return _bounded_error_list(["xinput reported no non-XTEST slave input devices"])
     held: list[str] = []
     for identity, description in physical:
         state = run(["xinput", "query-state", identity])
@@ -355,7 +450,7 @@ def _held_physical_input() -> list[str]:
             continue
         for kind, number in re.findall(r"(button|key)\[(\d+)\]=down", state.stdout):
             held.append(f"{description}: {kind} {number}")
-    return held
+    return _bounded_error_list(held)
 
 
 def _ensure_input_safe() -> None:
@@ -395,12 +490,17 @@ def save_lease(state: dict[str, Any]) -> None:
     temporary.replace(LEASE_FILE)
 
 
-def require_lease(token: str) -> dict[str, Any]:
+def require_lease_token(token: str) -> dict[str, Any]:
     state = load_lease()
     if not state:
         raise RuntimeError("no input lease is active")
     if not secrets.compare_digest(str(state.get("token") or ""), token):
         raise ValueError("lease token does not match the active input lease")
+    return state
+
+
+def require_lease(token: str) -> dict[str, Any]:
+    state = require_lease_token(token)
     _validate_lease_binding(state)
     return state
 
@@ -479,8 +579,11 @@ def _validate_point(state: dict[str, Any], x: int, y: int) -> None:
 def _ensure_target_active(state: dict[str, Any]) -> None:
     _ensure_input_safe()
     xid = state["target"]["xid"]
-    if not _identity_matches(state.get("target_identity")):
+    identity = _identity_matches(state.get("target_identity"))
+    if identity is IdentityMatch.CHANGED:
         raise RuntimeError("the leased target window identity changed")
+    if identity is IdentityMatch.INDETERMINATE:
+        raise RuntimeError("the leased target window identity could not be verified")
     if _active_window() != xid:
         _checked_xdotool("windowactivate", "--sync", xid)
 
@@ -579,17 +682,26 @@ def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
     original = state.get("original") or {}
     target = (state.get("target") or {}).get("xid")
     active = original.get("active_xid")
+    active_identity = original.get("active_identity")
+    active_match = _identity_matches(active_identity) if active_identity else IdentityMatch.CHANGED
     try:
-        if _identity_matches(original.get("active_identity")):
+        if active_match is IdentityMatch.MATCH:
             _checked_xdotool("windowactivate", "--sync", str(active))
-        elif original.get("desktop") is not None:
-            _checked_xdotool("set_desktop", str(original["desktop"]))
+        else:
+            if active_match is IdentityMatch.INDETERMINATE:
+                errors.append("original active X11 window identity could not be verified")
+            if original.get("desktop") is not None:
+                _checked_xdotool("set_desktop", str(original["desktop"]))
     except Exception as exc:
         errors.append(f"focus/desktop restore: {exc}")
-    if original.get("target_minimized") and _identity_matches(state.get("target_identity")):
-        proc = run(["xdotool", "windowminimize", str(target)])
-        if proc.returncode:
-            errors.append(proc.stderr.strip() or "failed to restore target minimized state")
+    if original.get("target_minimized"):
+        target_match = _identity_matches(state.get("target_identity"))
+        if target_match is IdentityMatch.MATCH:
+            proc = run(["xdotool", "windowminimize", str(target)])
+            if proc.returncode:
+                errors.append(proc.stderr.strip() or "failed to restore target minimized state")
+        elif target_match is IdentityMatch.INDETERMINATE:
+            errors.append("target X11 window identity could not be verified; minimized state was not restored")
     pointer = original.get("pointer")
     if pointer:
         proc = run(["xdotool", "mousemove", "--sync", str(pointer["x"]), str(pointer["y"])])
@@ -597,7 +709,8 @@ def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
             errors.append(proc.stderr.strip() or "failed to restore pointer")
     if not errors:
         LEASE_FILE.unlink(missing_ok=True)
-    return {"restored": not errors, "errors": errors, "focus": active, "desktop": original.get("desktop"), "pointer": pointer, "released_button": pressed}
+    bounded_errors = _bounded_error_list(errors)
+    return {"restored": not bounded_errors, "errors": bounded_errors, "focus": active, "desktop": original.get("desktop"), "pointer": pointer, "released_button": pressed}
 
 
 def status() -> dict[str, Any]:
@@ -610,7 +723,7 @@ def status() -> dict[str, Any]:
         else:
             session_error = "xprop and wmctrl are required"
     except Exception as exc:
-        session_error = str(exc)
+        session_error = _bounded_error_text(exc)
     build = build_requirements()
     session_ok = session_error is None
     compositor = _compositor_active() if not session_error else False
@@ -642,8 +755,25 @@ def text_result(value: Any) -> dict[str, Any]:
 
 
 def tool_error(exc: Exception) -> dict[str, Any]:
-    value = {"error": str(exc), "type": type(exc).__name__}
-    return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "structuredContent": value, "isError": True}
+    error_type = _bounded_error_text(type(exc).__name__, 256)
+
+    def result(error: str) -> dict[str, Any]:
+        value = {"error": error, "type": error_type}
+        return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "structuredContent": value, "isError": True}
+
+    error = str(exc)
+    if _serialized_size(result(error)) <= MAX_ERROR_RESULT_BYTES:
+        return result(error)
+    suffix = "…"
+    low = 0
+    high = len(error)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _serialized_size(result(error[:middle] + suffix)) <= MAX_ERROR_RESULT_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    return result(error[:low] + suffix)
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -703,7 +833,7 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             return text_result(lease_pointer(arguments, name.removeprefix("lease_pointer_")))
     if name == "end_input_lease":
         with lease_guard():
-            return text_result(restore_lease(require_lease(str(arguments["lease_token"]))))
+            return text_result(restore_lease(require_lease_token(str(arguments["lease_token"]))))
     if name == "recover_input_lease":
         with lease_guard():
             state = load_lease()
@@ -718,8 +848,9 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
     try:
         method = message.get("method")
         if method == "initialize":
-            requested = (message.get("params") or {}).get("protocolVersion", PROTOCOL_VERSION)
-            result = {"protocolVersion": requested, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate only same-UID windows in the current local EWMH Xorg login. Prefer AT-SPI through the separate Computer Use plugin; use exact XComposite capture here, and acknowledge a journaled input lease for reliable coordinate or keyboard input."}
+            requested = (message.get("params") or {}).get("protocolVersion")
+            negotiated = requested if isinstance(requested, str) and requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
+            result = {"protocolVersion": negotiated, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate only same-UID windows in the current local EWMH Xorg login. Prefer AT-SPI through the separate Computer Use plugin; use exact XComposite capture here, and acknowledge a journaled input lease for reliable coordinate or keyboard input."}
         elif method == "tools/list":
             result = {"tools": TOOLS}
         elif method == "tools/call":
@@ -734,10 +865,10 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
         elif method == "ping":
             result = {}
         else:
-            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"method not found: {method}"}}
+            return _jsonrpc_error(request_id, -32601, f"method not found: {method}")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except Exception as exc:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": str(exc)}}
+        return _jsonrpc_error(request_id, -32000, exc)
 
 
 def main() -> int:
@@ -753,7 +884,7 @@ def main() -> int:
             message = json.loads(line)
         except Exception as exc:
             with output_lock:
-                print(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}), flush=True)
+                print(json.dumps(_jsonrpc_error(None, -32700, exc)), flush=True)
             continue
         worker = threading.Thread(target=process, args=(message,))
         workers.append(worker)
