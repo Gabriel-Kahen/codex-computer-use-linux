@@ -23,8 +23,13 @@ def run(args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProces
 
 @contextmanager
 def file_guard(path: Path):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.chmod(0o700)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+") as handle:
+    path.parent.chmod(0o700)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    os.chmod(path, 0o600)
+    with os.fdopen(descriptor, "a+") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
