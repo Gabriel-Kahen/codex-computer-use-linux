@@ -1,0 +1,24 @@
+{
+  "name": "gnome-same-session-computer-use",
+  "version": "0.1.0",
+  "description": "Operate existing GNOME/Mutter windows through a recoverable focus lease.",
+  "author": {"name": "Gabe", "url": "https://github.com/Gabriel-Kahen"},
+  "homepage": "https://github.com/Gabriel-Kahen/codex-computer-use-linux/tree/main/contrib/gnome-same-session-computer-use",
+  "repository": "https://github.com/Gabriel-Kahen/codex-computer-use-linux",
+  "license": "Apache-2.0",
+  "keywords": ["computer-use", "gnome", "mutter", "wayland", "desktop-control"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "GNOME Same-session Computer Use",
+    "shortDescription": "Recoverable control of existing GNOME apps.",
+    "longDescription": "Adds stable GNOME window discovery, focused-window capture, and explicitly acknowledged global-seat input transactions which restore focus, workspace, and pointer state.",
+    "developerName": "Gabe",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write", "Local Desktop"],
+    "defaultPrompt": [
+      "Use my existing logged-in GNOME app to complete this task.",
+      "Operate this GNOME window with a recoverable focus lease."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

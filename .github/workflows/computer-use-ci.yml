@@ -38,6 +38,44 @@ jobs:
             -p 'test_*.py' \
             -v
 
+      - name: Compile and test GNOME computer use
+        env:
+          PYTHONPATH: contrib/gnome-same-session-computer-use/src
+        run: |
+          python3 -m compileall -q \
+            contrib/gnome-same-session-computer-use/src \
+            contrib/gnome-same-session-computer-use/tests \
+            contrib/gnome-same-session-computer-use/bin
+          python3 -m unittest discover \
+            -s contrib/gnome-same-session-computer-use/tests \
+            -p 'test_*.py' \
+            -v
+
+      - name: Validate GNOME plugin manifests and Shell syntax
+        run: |
+          python3 -m json.tool contrib/gnome-same-session-computer-use/.codex-plugin/plugin.json >/dev/null
+          python3 -m json.tool contrib/gnome-same-session-computer-use/.mcp.json >/dev/null
+          python3 -m json.tool contrib/gnome-same-session-computer-use/gnome-shell/background-computer-use@openai.com/metadata.json >/dev/null
+          python3 -m json.tool contrib/gnome-same-session-computer-use/gnome-shell/background-computer-use@openai.com/package.json >/dev/null
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("contrib/gnome-same-session-computer-use")
+          manifest = json.loads((root / ".codex-plugin/plugin.json").read_text())
+          mcp = json.loads((root / manifest["mcpServers"]).read_text())
+          assert root.name == manifest["name"]
+          command = root / mcp["mcpServers"][manifest["name"]]["command"]
+          assert command.is_file() and os.access(command, os.X_OK)
+          PY
+          node --check contrib/gnome-same-session-computer-use/gnome-shell/background-computer-use@openai.com/lease_protocol.js
+          node --check contrib/gnome-same-session-computer-use/gnome-shell/background-computer-use@openai.com/shell_transactions.js
+          node --check contrib/gnome-same-session-computer-use/gnome-shell/background-computer-use@openai.com/extension.js
+          node --test \
+            contrib/gnome-same-session-computer-use/tests/test_lease_protocol.mjs \
+            contrib/gnome-same-session-computer-use/tests/test_shell_transactions.mjs
+
       - name: Install X11 and Plasma computer use build dependencies
         run: |
           sudo apt-get update

@@ -1,0 +1,7 @@
+{
+  "uuid": "background-computer-use@openai.com",
+  "name": "Background Computer Use Bridge",
+  "description": "Local D-Bus bridge for explicitly acknowledged Codex focus leases.",
+  "shell-version": ["45"],
+  "version": 1
+}

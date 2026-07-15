@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+uuid=background-computer-use@openai.com
+destination=${XDG_DATA_HOME:-"$HOME/.local/share"}/gnome-shell/extensions/$uuid
+mkdir -p "$(dirname -- "$destination")"
+rm -rf "$destination"
+cp -R "$root/gnome-shell/$uuid" "$destination"
+if gnome-extensions enable "$uuid"; then
+    printf '%s\n' "Installed and enabled $uuid."
+else
+    printf '%s\n' "Installed $uuid. Log out and back in, then run: gnome-extensions enable $uuid"
+fi
