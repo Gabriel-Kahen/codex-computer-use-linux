@@ -2,7 +2,6 @@
 set -euo pipefail
 
 helper=${1:?usage: native_smoke.sh /path/to/x11-window-capture}
-display=:99
 temporary=$(mktemp -d)
 pids=()
 
@@ -18,19 +17,24 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-export DISPLAY=$display
+unset DISPLAY
 export HOME=$temporary/home
 mkdir -p "$HOME"
 cc -O2 -Wall -Wextra -Werror \
   -o "$temporary/x11-test-window" \
   "$(dirname "$0")/x11-test-window.c" \
-  $(pkg-config --cflags --libs x11)
+  $(pkg-config --cflags --libs x11 xcomposite)
 
-Xvfb "$display" -screen 0 1024x768x24 -nolisten tcp >"$temporary/xvfb.log" 2>&1 &
+Xvfb -displayfd 3 -screen 0 1024x768x24 -nolisten tcp -noreset \
+  3>"$temporary/display" >"$temporary/xvfb.log" 2>&1 &
 pids+=("$!")
 ready=false
 for _ in $(seq 1 100); do
-  if xdpyinfo >/dev/null 2>&1; then
+  if [[ -s $temporary/display ]]; then
+    display_number=$(<"$temporary/display")
+    export DISPLAY=":$display_number"
+  fi
+  if [[ -n ${DISPLAY:-} ]] && xdpyinfo >/dev/null 2>&1; then
     ready=true
     break
   fi
@@ -42,17 +46,29 @@ if [[ $ready != true ]]; then
   exit 1
 fi
 
-openbox --sm-disable >"$temporary/openbox.log" 2>&1 &
-pids+=("$!")
-xcompmgr -n >"$temporary/xcompmgr.log" 2>&1 &
-pids+=("$!")
 "$temporary/x11-test-window" >"$temporary/test-window.log" 2>&1 &
 window_pid=$!
 pids+=("$window_pid")
+xcompmgr -n >"$temporary/xcompmgr.log" 2>&1 &
+pids+=("$!")
+if ! "$temporary/x11-test-window" --wait-for-compositor \
+  >"$temporary/compositor-probe.log" 2>&1; then
+  cat "$temporary/xcompmgr.log" "$temporary/compositor-probe.log"
+  echo "XComposite manager did not become ready" >&2
+  exit 1
+fi
+openbox --sm-disable >"$temporary/openbox.log" 2>&1 &
+pids+=("$!")
 
 window_id=
 for _ in $(seq 1 100); do
-  window_id=$(xdotool search --onlyvisible --name '^Codex-X11-Native-Smoke$' 2>/dev/null | head -n 1 || true)
+  while read -r candidate; do
+    candidate_pid=$($helper --pid "$candidate" 2>/dev/null || true)
+    if [[ $candidate_pid == "$window_pid" ]]; then
+      window_id=$candidate
+      break
+    fi
+  done < <(xdotool search --onlyvisible --name '^Codex-X11-Native-Smoke$' 2>/dev/null || true)
   if [[ -n $window_id ]] && xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id'; then
     break
   fi

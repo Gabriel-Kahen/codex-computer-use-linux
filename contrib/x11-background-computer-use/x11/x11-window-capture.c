@@ -104,29 +104,73 @@ int main(int argc, char **argv) {
         return 1;
     }
     XSetErrorHandler(record_x_error);
-    Pixmap pixmap = XCompositeNameWindowPixmap(display, xid);
-    XSync(display, False);
+    Window pixmap_window = xid;
+    Pixmap pixmap = None;
+    for (;;) {
+        x_error = 0;
+        pixmap = XCompositeNameWindowPixmap(display, pixmap_window);
+        XSync(display, False);
+        if (!x_error && pixmap) break;
+
+        Window root, parent;
+        Window *children = NULL;
+        unsigned child_count = 0;
+        if (!XQueryTree(display, pixmap_window, &root, &parent, &children, &child_count)) break;
+        if (children) XFree(children);
+        if (parent == None || parent == root || parent == pixmap_window) break;
+        pixmap_window = parent;
+    }
     if (x_error || !pixmap) {
-        fprintf(stderr, "the compositor did not expose a named window pixmap\n");
+        fprintf(stderr, "the compositor did not expose a named window or frame pixmap\n");
         XCloseDisplay(display);
         return 1;
     }
+    XWindowAttributes pixmap_attributes;
+    if (!XGetWindowAttributes(display, pixmap_window, &pixmap_attributes)) {
+        fprintf(stderr, "failed to read compositor pixmap attributes\n");
+        XFreePixmap(display, pixmap);
+        XCloseDisplay(display);
+        return 1;
+    }
+    int capture_x = 0;
+    int capture_y = 0;
+    if (pixmap_window != xid) {
+        Window child;
+        if (!XTranslateCoordinates(
+                display, xid, pixmap_window, 0, 0, &capture_x, &capture_y, &child)) {
+            fprintf(stderr, "failed to locate window content within compositor frame\n");
+            XFreePixmap(display, pixmap);
+            XCloseDisplay(display);
+            return 1;
+        }
+    }
     Window root;
     int x, y;
-    unsigned width, height, border, depth;
-    if (!XGetGeometry(display, pixmap, &root, &x, &y, &width, &height, &border, &depth)) {
+    unsigned pixmap_width, pixmap_height, border, depth;
+    if (!XGetGeometry(
+            display, pixmap, &root, &x, &y, &pixmap_width, &pixmap_height, &border, &depth)) {
         fprintf(stderr, "failed to read window pixmap geometry\n");
         XFreePixmap(display, pixmap);
         XCloseDisplay(display);
         return 1;
     }
+    unsigned width = (unsigned)attributes.width;
+    unsigned height = (unsigned)attributes.height;
     if (!width || !height || (uint64_t)width * height > MAX_CAPTURE_PIXELS) {
         fprintf(stderr, "window pixmap exceeds the 33,177,600-pixel capture budget\n");
         XFreePixmap(display, pixmap);
         XCloseDisplay(display);
         return 1;
     }
-    XImage *image = XGetImage(display, pixmap, 0, 0, width, height, AllPlanes, ZPixmap);
+    if (capture_x < 0 || capture_y < 0 || (uint64_t)capture_x + width > pixmap_width ||
+        (uint64_t)capture_y + height > pixmap_height) {
+        fprintf(stderr, "window content is outside the compositor frame pixmap\n");
+        XFreePixmap(display, pixmap);
+        XCloseDisplay(display);
+        return 1;
+    }
+    XImage *image =
+        XGetImage(display, pixmap, capture_x, capture_y, width, height, AllPlanes, ZPixmap);
     if (!image) {
         fprintf(stderr, "failed to read compositor window pixmap\n");
         XFreePixmap(display, pixmap);
@@ -161,9 +205,9 @@ int main(int argc, char **argv) {
     for (unsigned py = 0; py < height; py++) {
         for (unsigned px = 0; px < width; px++) {
             unsigned long pixel = XGetPixel(image, px, py);
-            row[px * 3] = component(pixel, attributes.visual->red_mask);
-            row[px * 3 + 1] = component(pixel, attributes.visual->green_mask);
-            row[px * 3 + 2] = component(pixel, attributes.visual->blue_mask);
+            row[px * 3] = component(pixel, pixmap_attributes.visual->red_mask);
+            row[px * 3 + 1] = component(pixel, pixmap_attributes.visual->green_mask);
+            row[px * 3 + 2] = component(pixel, pixmap_attributes.visual->blue_mask);
         }
         png_write_row(png, row);
     }
