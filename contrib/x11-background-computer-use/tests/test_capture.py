@@ -14,7 +14,6 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from x11_session_computer_use import capture
-from x11_session_computer_use import server
 
 
 def png(width: int, height: int) -> bytes:
@@ -73,8 +72,8 @@ class BrokerCaptureTests(TestCase):
             Path(args[2]).write_bytes(raw)
             return CompletedProcess(args, 0, "", "")
 
-        with patch.object(server, "resolve_window", return_value=self.window), patch.object(server, "ensure_capture_helper", return_value=Path("/helper")), patch.object(server, "run", side_effect=fake_run):
-            result = server.capture({"window": self.window["xid"]})
+        with patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
+            result = capture.capture_window(self.window, None)
 
         self.assertEqual(base64.b64decode(result["content"][1]["data"]), raw)
         self.assertNotIn("structuredContent", result)
@@ -98,8 +97,8 @@ class BrokerCaptureTests(TestCase):
                 output.write_bytes(raw)
                 return CompletedProcess(args, 0, "", "")
 
-            with patch.object(server, "resolve_window", return_value=self.window), patch.object(server, "ensure_capture_helper", return_value=Path("/helper")), patch.object(server, "run", side_effect=fake_run):
-                result = server.capture({"window": self.window["xid"], "save_path": str(destination)})
+            with patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
+                result = capture.capture_window(self.window, str(destination))
 
             self.assertEqual(destination.read_bytes(), raw)
             self.assertEqual(json.loads(result["content"][0]["text"])["saved_to"], str(destination))
@@ -111,9 +110,9 @@ class BrokerCaptureTests(TestCase):
             destination.write_bytes(b"old")
             failed = CompletedProcess([], 1, "", "capture failed")
 
-            with patch.object(server, "resolve_window", return_value=self.window), patch.object(server, "ensure_capture_helper", return_value=Path("/helper")), patch.object(server, "run", return_value=failed):
+            with patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", return_value=failed):
                 with self.assertRaisesRegex(RuntimeError, "capture failed"):
-                    server.capture({"window": self.window["xid"], "save_path": str(destination)})
+                    capture.capture_window(self.window, str(destination))
 
             self.assertEqual(destination.read_bytes(), b"old")
             self.assertEqual(list(Path(temporary).iterdir()), [destination])
@@ -127,8 +126,31 @@ class BrokerCaptureTests(TestCase):
                 Path(args[2]).write_bytes(b"not a PNG")
                 return CompletedProcess(args, 0, "", "")
 
-            with patch.object(server, "resolve_window", return_value=self.window), patch.object(server, "ensure_capture_helper", return_value=Path("/helper")), patch.object(server, "run", side_effect=fake_run):
+            with patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
                 with self.assertRaisesRegex(RuntimeError, "invalid PNG"):
-                    server.capture({"window": self.window["xid"], "save_path": str(destination)})
+                    capture.capture_window(self.window, str(destination))
 
             self.assertEqual(destination.read_bytes(), b"old")
+
+    def test_oversized_capture_is_not_read_or_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "capture.png"
+            destination.write_bytes(b"old")
+
+            def fake_run(args, **_kwargs):
+                Path(args[2]).write_bytes(png(640, 480) + b"x" * 32)
+                return CompletedProcess(args, 0, "", "")
+
+            original_read_bytes = Path.read_bytes
+
+            def checked_read_bytes(path):
+                if path != destination:
+                    self.fail("oversized capture was read into memory")
+                return original_read_bytes(path)
+
+            with patch.object(capture, "MAX_CAPTURE_BYTES", 31), patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run), patch.object(Path, "read_bytes", checked_read_bytes):
+                with self.assertRaisesRegex(RuntimeError, "maximum transport size is 31 bytes"):
+                    capture.capture_window(self.window, str(destination))
+
+            self.assertEqual(destination.read_bytes(), b"old")
+            self.assertEqual(list(Path(temporary).iterdir()), [destination])

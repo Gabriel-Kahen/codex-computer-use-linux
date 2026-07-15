@@ -5,11 +5,13 @@
 #include <png.h>
 #include <errno.h>
 #include <setjmp.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static int x_error;
+static const uint64_t MAX_CAPTURE_PIXELS = 7680ULL * 4320ULL;
 
 static int record_x_error(Display *display, XErrorEvent *event) {
     (void)display;
@@ -114,6 +116,12 @@ int main(int argc, char **argv) {
     unsigned width, height, border, depth;
     if (!XGetGeometry(display, pixmap, &root, &x, &y, &width, &height, &border, &depth)) {
         fprintf(stderr, "failed to read window pixmap geometry\n");
+        XFreePixmap(display, pixmap);
+        XCloseDisplay(display);
+        return 1;
+    }
+    if (!width || !height || (uint64_t)width * height > MAX_CAPTURE_PIXELS) {
+        fprintf(stderr, "window pixmap exceeds the 33,177,600-pixel capture budget\n");
         XFreePixmap(display, pixmap);
         XCloseDisplay(display);
         return 1;

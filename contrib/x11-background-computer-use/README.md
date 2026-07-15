@@ -4,7 +4,7 @@ This experimental Codex plugin operates existing applications in the user's curr
 
 ## Capabilities
 
-- EWMH discovery with XRes-authenticated PID ownership, XID, desktop, geometry, title, WM_CLASS, and AT-SPI correlation hints.
+- Paginated EWMH discovery with XRes-authenticated PID ownership, XID, desktop, geometry, bounded title and WM_CLASS, and AT-SPI correlation hints.
 - Exact unobscured capture of mapped windows through the compositor's XComposite named pixmap, without focus, desktop, stacking, or pointer changes.
 - Best-effort no-focus shortcuts with an explicit unconfirmed-delivery result.
 - Reliable keyboard, click, scroll, and drag input through an explicitly acknowledged XTEST focus/pointer lease.
@@ -37,7 +37,7 @@ On Arch Linux:
 sudo pacman -S python wmctrl xdotool xorg-xinput gcc pkgconf libx11 libxcomposite libxres libpng
 ```
 
-Enable your desktop's compositor if `session_status` reports `compositing_manager_active: false`. Minimized windows must be restored before exact capture.
+Enable your desktop's compositor if `session_status` reports `compositing_manager_active: false`. Minimized windows must be restored before exact capture. Capture is limited to 33,177,600 pixels (equivalent to 7680 × 4320), and PNGs larger than 16 MiB are rejected before transport.
 
 ## Install
 

@@ -1,4 +1,3 @@
-import base64
 import contextlib
 import ctypes
 import ctypes.util
@@ -11,12 +10,12 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 from pathlib import Path
 from typing import Any
 
 from .capture import build_requirements
+from .capture import capture_window
 from .capture import ensure_capture_helper
 
 
@@ -25,6 +24,9 @@ PROTOCOL_VERSION = "2025-11-25"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "x11-same-session-computer-use"
 LEASE_FILE = STATE_DIR / "input-lease.json"
 LOCK_FILE = STATE_DIR / "input-lease.lock"
+MAX_WINDOW_RESULT_BYTES = 32 * 1024
+MAX_WINDOWS_PER_PAGE = 20
+MAX_WINDOW_TEXT_CHARS = 512
 
 
 def tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None, *, read_only: bool = False, idempotent: bool = False) -> dict[str, Any]:
@@ -48,7 +50,7 @@ WINDOW = {"window": {"type": "string", "description": "Live XID, exact WM_CLASS,
 TOKEN = {"lease_token": {"type": "string"}}
 TOOLS = [
     tool("session_status", "Inspect EWMH X11 session support and the exact safety boundary.", {}, read_only=True, idempotent=True),
-    tool("list_session_windows", "List same-UID windows advertised by the current EWMH window manager, including stable-for-lifetime XIDs and AT-SPI correlation hints.", {}, read_only=True, idempotent=True),
+    tool("list_session_windows", "List one bounded page of same-UID windows advertised by the current EWMH window manager, including stable-for-lifetime XIDs and AT-SPI correlation hints.", {"cursor": {"type": ["string", "null"]}, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_WINDOWS_PER_PAGE}}, read_only=True, idempotent=True),
     tool("capture_session_window", "Capture the compositor's exact unobscured pixmap for one mapped X11 window without focusing it, changing desktops, or moving the pointer.", {**WINDOW, "save_path": {"type": ["string", "null"]}}, ["window"], idempotent=True),
     tool("send_window_shortcut", "Best-effort no-focus XSendEvent shortcut delivery. Many modern clients reject synthetic events; use an acknowledged input lease when reliable delivery is required.", {**WINDOW, "key": {"type": "string"}, "modifiers": {"type": "string", "default": ""}}, ["window", "key"]),
     tool("begin_input_lease", "Begin an explicit journaled focus/pointer lease for reliable XTEST input, snapshotting the active desktop, focus, pointer, and target minimized state for restoration.", {**WINDOW, "acknowledge_interference": {"type": "boolean"}}, ["window", "acknowledge_interference"]),
@@ -152,7 +154,8 @@ def _window_state(xid: str) -> dict[str, Any]:
 
 
 def _normalized_display(display: str) -> str:
-    return re.sub(r"\.0$", "", display)
+    match = re.fullmatch(r"(?:(?:unix)?):([0-9]+)(?:\.[0-9]+)?", display)
+    return f":{match.group(1)}" if match else display
 
 
 def _pid_belongs_to_session(pid: int) -> bool:
@@ -188,6 +191,9 @@ def list_windows() -> list[dict[str, Any]]:
         if len(fields) < 10:
             continue
         raw_xid, desktop, advertised_pid, x, y, width, height, wm_class, host, title = fields
+        wm_class = wm_class[:MAX_WINDOW_TEXT_CHARS]
+        host = host[:MAX_WINDOW_TEXT_CHARS]
+        title = title[:MAX_WINDOW_TEXT_CHARS]
         try:
             xid = f"0x{int(raw_xid, 16):08x}"
             numeric_pid = _authenticated_pid(xid)
@@ -247,7 +253,7 @@ def _window_identity(xid: str | None) -> dict[str, Any] | None:
     start_time = _process_start_time(pid) if pid else None
     if not pid or not start_time or not _pid_belongs_to_session(pid):
         return None
-    wm_class = _xprop(xid, "WM_CLASS")
+    wm_class = _xprop(xid, "WM_CLASS")[:MAX_WINDOW_TEXT_CHARS]
     return {"xid": xid, "pid": pid, "process_start_time": start_time, "wm_class": wm_class.strip()}
 
 
@@ -594,54 +600,6 @@ def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
     return {"restored": not errors, "errors": errors, "focus": active, "desktop": original.get("desktop"), "pointer": pointer, "released_button": pressed}
 
 
-def png_size(raw: bytes) -> dict[str, int] | None:
-    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
-        return None
-    width = int.from_bytes(raw[16:20], "big")
-    height = int.from_bytes(raw[20:24], "big")
-    return {"width": width, "height": height} if width and height else None
-
-
-def capture(arguments: dict[str, Any]) -> dict[str, Any]:
-    window = resolve_window(str(arguments["window"]))
-    if window["minimized"] or not window["mapped"]:
-        raise RuntimeError("exact XComposite capture requires a mapped, non-minimized window")
-    requested = arguments.get("save_path")
-    if requested:
-        destination = Path(str(requested)).expanduser()
-        if not destination.is_absolute():
-            raise ValueError("save_path must be absolute")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
-    else:
-        destination = None
-        fd, name = tempfile.mkstemp(prefix="x11-window-", suffix=".png")
-    os.close(fd)
-    temporary = Path(name)
-    try:
-        proc = run([str(ensure_capture_helper()), window["xid"], str(temporary)], timeout=20)
-        if proc.returncode:
-            raise RuntimeError(proc.stderr.strip() or "exact XComposite window capture failed")
-        raw = temporary.read_bytes()
-        image_size = png_size(raw)
-        if image_size is None:
-            raise RuntimeError("exact XComposite window capture returned an invalid PNG")
-        if destination:
-            temporary.replace(destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-    metadata = {
-        "window": window,
-        "saved_to": str(destination) if destination else None,
-        "coordinate_space": {"window_local": {"width": window["width"], "height": window["height"]}, "screenshot_pixels": image_size},
-        "capture_backend": "XComposite named window pixmap",
-        "focus_changed": False,
-        "pointer_moved": False,
-        "desktop_changed": False,
-    }
-    return {"content": [{"type": "text", "text": json.dumps(metadata, indent=2)}, {"type": "image", "data": base64.b64encode(raw).decode(), "mimeType": "image/png"}], "isError": False}
-
-
 def status() -> dict[str, Any]:
     checks = {name: shutil.which(name) is not None for name in ("xprop", "wmctrl", "xdotool", "xinput")}
     session_error = None
@@ -692,9 +650,36 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "session_status":
         return text_result(status())
     if name == "list_session_windows":
-        return text_result({"windows": list_windows()})
+        limit = arguments.get("limit", MAX_WINDOWS_PER_PAGE)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_WINDOWS_PER_PAGE:
+            raise ValueError(f"limit must be an integer between 1 and {MAX_WINDOWS_PER_PAGE}")
+        cursor = arguments.get("cursor")
+        if cursor is None:
+            offset = 0
+        elif isinstance(cursor, str) and cursor.isascii() and cursor.isdigit():
+            offset = int(cursor)
+        else:
+            raise ValueError("cursor must be the next_cursor string from a previous result")
+        windows = list_windows()
+        page: list[dict[str, Any]] = []
+        end = offset
+        while end < len(windows) and len(page) < limit:
+            candidate = [*page, windows[end]]
+            candidate_end = end + 1
+            candidate_result = {
+                "windows": candidate,
+                "next_cursor": str(candidate_end) if candidate_end < len(windows) else None,
+            }
+            encoded = json.dumps(candidate_result, ensure_ascii=False, separators=(",", ":")).encode()
+            if len(encoded) > MAX_WINDOW_RESULT_BYTES:
+                break
+            page = candidate
+            end = candidate_end
+        if not page and offset < len(windows):
+            raise RuntimeError("a window entry exceeds the bounded listing result size")
+        return text_result({"windows": page, "next_cursor": str(end) if end < len(windows) else None})
     if name == "capture_session_window":
-        return capture(arguments)
+        return capture_window(resolve_window(str(arguments["window"])), arguments.get("save_path"))
     if name == "send_window_shortcut":
         with lease_guard():
             if load_lease():

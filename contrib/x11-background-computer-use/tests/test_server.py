@@ -19,8 +19,9 @@ def completed(args, stdout="", stderr="", returncode=0):
 
 
 class WindowTests(TestCase):
-    def test_display_screen_zero_is_same_x_server(self) -> None:
-        self.assertEqual(server._normalized_display(":0.0"), server._normalized_display(":0"))
+    def test_display_screens_and_unix_prefix_are_same_x_server(self) -> None:
+        displays = [":0", ":0.0", ":0.1", "unix:0", "unix:0.1"]
+        self.assertEqual([server._normalized_display(display) for display in displays], [":0"] * 5)
 
     def test_process_start_time_handles_spaces_in_process_name(self) -> None:
         stat = "42 (process with spaces) S " + " ".join([*(str(index) for index in range(4, 22)), "start-time"])
@@ -257,6 +258,43 @@ class StatusTests(TestCase):
 
 
 class McpErrorTests(TestCase):
+    def test_capture_tool_resolves_window_before_capture(self) -> None:
+        window = {"xid": "0x20"}
+        expected = {"content": [], "isError": False}
+        with patch.object(server, "resolve_window", return_value=window) as resolve, patch.object(server, "capture_window", return_value=expected) as capture_window:
+            result = server.call_tool("capture_session_window", {"window": "App", "save_path": None})
+
+        self.assertEqual(result, expected)
+        resolve.assert_called_once_with("App")
+        capture_window.assert_called_once_with(window, None)
+
+    def test_window_listing_is_paginated(self) -> None:
+        windows = [{"xid": f"0x{index:08x}"} for index in range(3)]
+        with patch.object(server, "list_windows", return_value=windows):
+            first = server.call_tool("list_session_windows", {"limit": 2})
+            second = server.call_tool("list_session_windows", {"limit": 2, "cursor": "2"})
+
+        self.assertEqual(first["structuredContent"], {"windows": windows[:2], "next_cursor": "2"})
+        self.assertEqual(second["structuredContent"], {"windows": windows[2:], "next_cursor": None})
+
+    def test_window_listing_rejects_invalid_page_arguments(self) -> None:
+        with patch.object(server, "list_windows") as list_windows:
+            with self.assertRaisesRegex(ValueError, "limit"):
+                server.call_tool("list_session_windows", {"limit": True})
+            with self.assertRaisesRegex(ValueError, "cursor"):
+                server.call_tool("list_session_windows", {"cursor": "-1"})
+
+        list_windows.assert_not_called()
+
+    def test_window_listing_has_a_serialized_size_cap(self) -> None:
+        windows = [{"xid": f"0x{index:08x}", "title": "x" * 100} for index in range(3)]
+        first = {"windows": windows[:1], "next_cursor": "1"}
+        size = len(json.dumps(first, ensure_ascii=False, separators=(",", ":")).encode())
+        with patch.object(server, "MAX_WINDOW_RESULT_BYTES", size), patch.object(server, "list_windows", return_value=windows):
+            result = server.call_tool("list_session_windows", {})
+
+        self.assertEqual(result["structuredContent"], first)
+
     def test_expected_tool_failure_is_an_is_error_result(self) -> None:
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "missing", "arguments": {}}}
         response = server.dispatch(request)
