@@ -22,19 +22,83 @@ from .capture import ensure_capture_helper
 
 SERVER_INFO = {"name": "x11-same-session-computer-use", "version": "0.1.0"}
 PROTOCOL_VERSION = "2025-11-25"
-SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2025-06-18", PROTOCOL_VERSION})
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", PROTOCOL_VERSION})
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "x11-same-session-computer-use"
 LEASE_FILE = STATE_DIR / "input-lease.json"
 LOCK_FILE = STATE_DIR / "input-lease.lock"
 MAX_WINDOW_RESULT_BYTES = 32 * 1024
 MAX_WINDOWS_PER_PAGE = 20
 MAX_WINDOW_TEXT_CHARS = 512
+MAX_ERROR_RESULT_BYTES = 8 * 1024
 
 
 class IdentityMatch(Enum):
     MATCH = "match"
     CHANGED = "changed"
     INDETERMINATE = "indeterminate"
+
+
+def _serialized_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode())
+
+
+def _bounded_error_text(value: Any, max_bytes: int = MAX_ERROR_RESULT_BYTES) -> str:
+    text = str(value)
+    if _serialized_size(text) <= max_bytes:
+        return text
+    suffix = "…"
+    low = 0
+    high = len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _serialized_size(text[:middle] + suffix) <= max_bytes:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + suffix
+
+
+def _bounded_error_list(values: list[Any]) -> list[str]:
+    bounded: list[str] = []
+    for value in values:
+        text = str(value)
+        candidate = [*bounded, text]
+        if _serialized_size(candidate) <= MAX_ERROR_RESULT_BYTES:
+            bounded = candidate
+            continue
+        low = 0
+        high = len(text)
+        suffix = "…"
+        while low < high:
+            middle = (low + high + 1) // 2
+            if _serialized_size([*bounded, text[:middle] + suffix]) <= MAX_ERROR_RESULT_BYTES:
+                low = middle
+            else:
+                high = middle - 1
+        if _serialized_size([*bounded, text[:low] + suffix]) <= MAX_ERROR_RESULT_BYTES:
+            bounded.append(text[:low] + suffix)
+        break
+    return bounded
+
+
+def _jsonrpc_error(request_id: Any, code: int, message: Any) -> dict[str, Any]:
+    def response(text: str, response_id: Any = request_id) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": response_id, "error": {"code": code, "message": text}}
+
+    text = str(message)
+    if _serialized_size(response(text)) <= MAX_ERROR_RESULT_BYTES:
+        return response(text)
+    suffix = "…"
+    low = 0
+    high = len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _serialized_size(response(text[:middle] + suffix)) <= MAX_ERROR_RESULT_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    bounded = response(text[:low] + suffix)
+    return bounded if _serialized_size(bounded) <= MAX_ERROR_RESULT_BYTES else response("error response exceeded its size limit", None)
 
 
 def tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None, *, read_only: bool = False, idempotent: bool = False) -> dict[str, Any]:
@@ -365,10 +429,10 @@ def _lock_state() -> bool | None:
 
 def _held_physical_input() -> list[str]:
     if not shutil.which("xinput"):
-        return ["xinput unavailable, so held physical input cannot be checked"]
+        return _bounded_error_list(["xinput unavailable, so held physical input cannot be checked"])
     devices = run(["xinput", "list", "--short"])
     if devices.returncode:
-        return [devices.stderr.strip() or "xinput could not list physical devices"]
+        return _bounded_error_list([devices.stderr.strip() or "xinput could not list physical devices"])
     physical: list[tuple[str, str]] = []
     for line in devices.stdout.splitlines():
         if "XTEST" in line or not re.search(r"slave\s+(pointer|keyboard)", line):
@@ -377,7 +441,7 @@ def _held_physical_input() -> list[str]:
         if match:
             physical.append((match.group(1), line.strip()))
     if not physical:
-        return ["xinput reported no non-XTEST slave input devices"]
+        return _bounded_error_list(["xinput reported no non-XTEST slave input devices"])
     held: list[str] = []
     for identity, description in physical:
         state = run(["xinput", "query-state", identity])
@@ -386,7 +450,7 @@ def _held_physical_input() -> list[str]:
             continue
         for kind, number in re.findall(r"(button|key)\[(\d+)\]=down", state.stdout):
             held.append(f"{description}: {kind} {number}")
-    return held
+    return _bounded_error_list(held)
 
 
 def _ensure_input_safe() -> None:
@@ -645,7 +709,8 @@ def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
             errors.append(proc.stderr.strip() or "failed to restore pointer")
     if not errors:
         LEASE_FILE.unlink(missing_ok=True)
-    return {"restored": not errors, "errors": errors, "focus": active, "desktop": original.get("desktop"), "pointer": pointer, "released_button": pressed}
+    bounded_errors = _bounded_error_list(errors)
+    return {"restored": not bounded_errors, "errors": bounded_errors, "focus": active, "desktop": original.get("desktop"), "pointer": pointer, "released_button": pressed}
 
 
 def status() -> dict[str, Any]:
@@ -658,7 +723,7 @@ def status() -> dict[str, Any]:
         else:
             session_error = "xprop and wmctrl are required"
     except Exception as exc:
-        session_error = str(exc)
+        session_error = _bounded_error_text(exc)
     build = build_requirements()
     session_ok = session_error is None
     compositor = _compositor_active() if not session_error else False
@@ -690,8 +755,25 @@ def text_result(value: Any) -> dict[str, Any]:
 
 
 def tool_error(exc: Exception) -> dict[str, Any]:
-    value = {"error": str(exc), "type": type(exc).__name__}
-    return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "structuredContent": value, "isError": True}
+    error_type = _bounded_error_text(type(exc).__name__, 256)
+
+    def result(error: str) -> dict[str, Any]:
+        value = {"error": error, "type": error_type}
+        return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "structuredContent": value, "isError": True}
+
+    error = str(exc)
+    if _serialized_size(result(error)) <= MAX_ERROR_RESULT_BYTES:
+        return result(error)
+    suffix = "…"
+    low = 0
+    high = len(error)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _serialized_size(result(error[:middle] + suffix)) <= MAX_ERROR_RESULT_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    return result(error[:low] + suffix)
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -783,10 +865,10 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
         elif method == "ping":
             result = {}
         else:
-            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"method not found: {method}"}}
+            return _jsonrpc_error(request_id, -32601, f"method not found: {method}")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except Exception as exc:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": str(exc)}}
+        return _jsonrpc_error(request_id, -32000, exc)
 
 
 def main() -> int:
@@ -802,7 +884,7 @@ def main() -> int:
             message = json.loads(line)
         except Exception as exc:
             with output_lock:
-                print(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}), flush=True)
+                print(json.dumps(_jsonrpc_error(None, -32700, exc)), flush=True)
             continue
         worker = threading.Thread(target=process, args=(message,))
         workers.append(worker)

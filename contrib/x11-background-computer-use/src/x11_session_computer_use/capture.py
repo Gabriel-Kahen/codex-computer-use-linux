@@ -13,7 +13,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "x11/x11-window-capture.c"
 CACHE_ROOT = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "codex-x11-background-computer-use"
-MAX_CAPTURE_BYTES = 16 * 1024 * 1024
+MAX_CAPTURE_BYTES = 5 * 1024 * 1024
 
 
 def build_requirements() -> dict[str, bool]:

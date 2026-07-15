@@ -126,6 +126,14 @@ class WindowTests(TestCase):
         self.assertEqual(result, server.IdentityMatch.CHANGED)
         run.assert_not_called()
 
+    def test_identity_probe_recognizes_a_closed_window(self) -> None:
+        expected = {"xid": "0x20", "pid": 20}
+        closed = completed([], stderr="X Error of failed request: BadWindow", returncode=1)
+        with patch.object(server, "_window_identity", return_value=None), patch.object(server, "run", return_value=closed):
+            result = server._identity_matches(expected)
+
+        self.assertEqual(result, server.IdentityMatch.CHANGED)
+
     def test_identity_probe_failure_is_indeterminate(self) -> None:
         expected = {"xid": "0x20", "pid": 20}
         failed = completed([], stderr="temporary XRes failure", returncode=1)
@@ -245,7 +253,7 @@ class LeaseTests(TestCase):
                 server.restore_lease(state)
         run.assert_not_called()
 
-    def test_end_restores_state_after_target_window_identity_changes(self) -> None:
+    def test_end_restores_state_after_target_window_closes(self) -> None:
         fingerprint = {"socket_inode": 1}
         active_identity = {"xid": "0x10"}
         target_identity = {"xid": "0x20"}
@@ -265,15 +273,19 @@ class LeaseTests(TestCase):
         }
         server.save_lease(state)
 
+        def identity(xid):
+            return active_identity if xid == active_identity["xid"] else None
+
+        def run_command(args, **_kwargs):
+            if args[:2] == ["xprop", "-id"]:
+                return completed(args, stderr="X Error of failed request: BadWindow", returncode=1)
+            return completed(args)
+
         with (
             patch.object(server, "ensure_session", return_value=fingerprint),
             patch.object(server, "_ensure_input_safe"),
-            patch.object(
-                server,
-                "_identity_matches",
-                side_effect=lambda identity: server.IdentityMatch.MATCH if identity == active_identity else server.IdentityMatch.CHANGED,
-            ),
-            patch.object(server, "run", return_value=completed([])) as run,
+            patch.object(server, "_window_identity", side_effect=identity),
+            patch.object(server, "run", side_effect=run_command) as run,
         ):
             result = server.call_tool("end_input_lease", {"lease_token": "secret"})
 
@@ -358,7 +370,7 @@ class StatusTests(TestCase):
 
 class McpErrorTests(TestCase):
     def test_initialize_echoes_known_protocol_versions(self) -> None:
-        for version in ("2025-06-18", server.PROTOCOL_VERSION):
+        for version in ("2024-11-05", "2025-03-26", "2025-06-18", server.PROTOCOL_VERSION):
             with self.subTest(version=version):
                 request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": version}}
                 response = server.dispatch(request)
@@ -414,6 +426,33 @@ class McpErrorTests(TestCase):
 
         self.assertNotIn("error", response)
         self.assertTrue(response["result"]["isError"])
+
+    def test_subprocess_stderr_tool_error_has_a_serialized_size_cap(self) -> None:
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "send_window_shortcut", "arguments": {"window": "0x20", "key": "x"}}}
+        failed = completed([], stderr="é" * (server.MAX_ERROR_RESULT_BYTES * 4), returncode=1)
+        with patch.object(server, "lease_guard", return_value=contextlib.nullcontext()), patch.object(server, "load_lease", return_value=None), patch.object(server, "resolve_window", return_value={"xid": "0x20"}), patch.object(server, "ensure_session"), patch.object(server, "_ensure_input_safe"), patch.object(server, "run", return_value=failed):
+            response = server.dispatch(request)
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertLessEqual(server._serialized_size(response["result"]), server.MAX_ERROR_RESULT_BYTES)
+        self.assertTrue(response["result"]["structuredContent"]["error"].endswith("…"))
+
+    def test_dispatch_error_has_a_serialized_size_cap(self) -> None:
+        class BrokenParams(dict):
+            def get(self, _key, _default=None):
+                raise RuntimeError("é" * (server.MAX_ERROR_RESULT_BYTES * 4))
+
+        request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": BrokenParams({"present": True})}
+        response = server.dispatch(request)
+
+        self.assertLessEqual(server._serialized_size(response), server.MAX_ERROR_RESULT_BYTES)
+        self.assertTrue(response["error"]["message"].endswith("…"))
+
+    def test_error_collection_has_a_single_serialized_size_cap(self) -> None:
+        errors = server._bounded_error_list(["é" * server.MAX_ERROR_RESULT_BYTES] * 4)
+
+        self.assertLessEqual(server._serialized_size(errors), server.MAX_ERROR_RESULT_BYTES)
+        self.assertTrue(errors[-1].endswith("…"))
 
     def test_direct_shortcut_checks_safety_without_clearing_modifiers(self) -> None:
         window = {"xid": "0x20"}
