@@ -149,9 +149,17 @@ for _ in range(height):
             raise SystemExit(f"unsupported PNG filter: {filter_type}")
     rows.append(row)
     previous = row
-sample_offset = (width // 2) * 3
-sample = bytes(rows[height * 3 // 4][sample_offset:sample_offset + 3])
-if sample != bytes.fromhex("123456"):
-    raise SystemExit(f"captured background pixel is {sample.hex()}, expected 123456")
+expected_samples = {
+    (width // 2, height * 3 // 4): "123456",
+    (0, 0): "ff0000",
+    (width - 1, 0): "00ff00",
+    (0, height - 1): "0000ff",
+    (width - 1, height - 1): "ffff00",
+}
+for (x, y), expected in expected_samples.items():
+    sample_offset = x * 3
+    sample = bytes(rows[y][sample_offset:sample_offset + 3]).hex()
+    if sample != expected:
+        raise SystemExit(f"captured pixel at {x},{y} is {sample}, expected {expected}")
 print(f"XComposite PNG {width}x{height}")
 PY
