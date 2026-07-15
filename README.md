@@ -8,7 +8,7 @@ The current focus is **same-session background computer use**: letting Codex ins
 
 ## Current support
 
-The implementations currently available on `main` are experimental integrations for **Hyprland 0.55.4** and **KDE Plasma 6 on Wayland**. Each combines the bundled Codex Computer Use plugin with a compositor-specific companion plugin.
+The implementations currently available on `main` are experimental integrations for **Hyprland 0.55.4**, **generic X11/EWMH desktops**, and **KDE Plasma 6 on Wayland**. Each combines the bundled Codex Computer Use plugin with a desktop-specific companion plugin.
 
 The Hyprland integration in [`contrib/hyprland-background-computer-use/`](./contrib/hyprland-background-computer-use/) can:
 
@@ -20,15 +20,17 @@ The Hyprland integration in [`contrib/hyprland-background-computer-use/`](./cont
 
 The Plasma integration in [`contrib/plasma-same-session-computer-use/`](./contrib/plasma-same-session-computer-use/) adds stable KWin window discovery, exact compositor-side capture, and recoverable focus/restoration leases. It does not claim targeted background input because Plasma exposes one shared input seat.
 
-This is not yet a general Linux backend. Experimental backends for [GNOME](https://github.com/Gabriel-Kahen/codex-computer-use-linux/pull/10) and [generic X11 desktops](https://github.com/Gabriel-Kahen/codex-computer-use-linux/pull/11) are also in development.
+The X11 integration in [`contrib/x11-background-computer-use/`](./contrib/x11-background-computer-use/) supports EWMH window discovery, XComposite capture, and an acknowledged interference lease for desktops running a real Xorg session.
+
+This is not yet a general Linux backend. An experimental [GNOME backend](https://github.com/Gabriel-Kahen/codex-computer-use-linux/pull/10) is also in development.
 
 ## Installation
 
 ### Requirements
 
-- Linux running Hyprland 0.55.4 or KDE Plasma 6 on Wayland
+- Linux running Hyprland 0.55.4, a supported Xorg/EWMH desktop, or KDE Plasma 6 on Wayland
 - a current [Codex CLI](https://developers.openai.com/codex/cli) release with `codex plugin` support
-- the build and runtime dependencies listed in the corresponding [Hyprland](./contrib/hyprland-background-computer-use/README.md#requirements) or [Plasma](./contrib/plasma-same-session-computer-use/README.md#requirements) integration guide
+- the build and runtime dependencies listed in the corresponding [Hyprland](./contrib/hyprland-background-computer-use/README.md#requirements), [X11](./contrib/x11-background-computer-use/README.md#requirements), or [Plasma](./contrib/plasma-same-session-computer-use/README.md#requirements) integration guide
 
 ### Install the plugins
 
@@ -63,15 +65,24 @@ Start a new Codex task after installation so the tools and operating skill are l
 codex plugin list
 ```
 
-See the [Hyprland integration guide](./contrib/hyprland-background-computer-use/README.md) or [Plasma integration guide](./contrib/plasma-same-session-computer-use/README.md) for detailed requirements, updates, removal, manual builds, safety boundaries, and troubleshooting.
+For Xorg/EWMH, replace the two Hyprland-specific lines above with:
+
+```shell
+codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
+  --sparse .agents/plugins \
+  --sparse contrib/x11-background-computer-use
+codex plugin add x11-background-computer-use@codex-computer-use-linux
+```
+
+See the [Hyprland integration guide](./contrib/hyprland-background-computer-use/README.md), [X11 integration guide](./contrib/x11-background-computer-use/README.md), or [Plasma integration guide](./contrib/plasma-same-session-computer-use/README.md) for detailed requirements, updates, removal, manual builds, safety boundaries, and troubleshooting.
 
 ## Safety and limitations
 
-Linux compositors expose different capture and input capabilities, so behavior and physical-input interference vary by desktop environment. The Hyprland integration prefers window-local operations, but its compatibility fallback can temporarily contend with the physical keyboard and pointer. Plasma provides exact background capture but uses an acknowledged focus/restoration lease before separately invoked global input.
+Linux display servers and compositors expose different capture and input capabilities, so behavior and physical-input interference vary by desktop environment. The Hyprland integration prefers window-local operations, while its compatibility fallback and the X11 integration can temporarily contend with the physical keyboard and pointer. Plasma provides exact background capture but uses an acknowledged focus/restoration lease before separately invoked global input.
 
 The fallback requires explicit acknowledgement and records compositor state so it can restore the original window, workspace, focus, fullscreen mode, and cursor position. The integration refuses input in unsafe conditions such as a locked session, active pointer constraints, or a physical button being held. It is not intended to bypass authentication surfaces, application security controls, or anti-cheat systems.
 
-Read the full [Hyprland](./contrib/hyprland-background-computer-use/README.md#safety-boundary) or [Plasma](./contrib/plasma-same-session-computer-use/README.md#safety) safety boundary before using an experimental integration.
+Read the full [Hyprland](./contrib/hyprland-background-computer-use/README.md#safety-boundary), [X11](./contrib/x11-background-computer-use/README.md), or [Plasma](./contrib/plasma-same-session-computer-use/README.md#safety) safety boundary before using an experimental integration.
 
 ## Project direction
 

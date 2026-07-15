@@ -38,14 +38,42 @@ jobs:
             -p 'test_*.py' \
             -v
 
-      - name: Install Plasma computer use build dependencies
+      - name: Install X11 and Plasma computer use build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             dbus \
             g++ \
+            libpng-dev \
+            libx11-dev \
+            libxcomposite-dev \
+            libxres-dev \
+            openbox \
             pkg-config \
-            qt6-base-dev
+            qt6-base-dev \
+            x11-utils \
+            xcompmgr \
+            xdotool \
+            xvfb
+
+      - name: Compile and test X11 computer use
+        env:
+          PYTHONPATH: contrib/x11-background-computer-use/src
+        run: |
+          python3 -m compileall -q \
+            contrib/x11-background-computer-use/src \
+            contrib/x11-background-computer-use/tests \
+            contrib/x11-background-computer-use/bin
+          cc -O2 -Wall -Wextra -Werror \
+            -o /tmp/x11-window-capture \
+            contrib/x11-background-computer-use/x11/x11-window-capture.c \
+            $(pkg-config --cflags --libs x11 xcomposite xres libpng)
+          python3 -m unittest discover \
+            -s contrib/x11-background-computer-use/tests \
+            -p 'test_*.py' \
+            -v
+          contrib/x11-background-computer-use/tests/native_smoke.sh \
+            /tmp/x11-window-capture
 
       - name: Compile and test Plasma computer use
         env:
