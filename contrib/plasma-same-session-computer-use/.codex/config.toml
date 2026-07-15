@@ -1,0 +1,2 @@
+[mcp_servers.plasma-same-session-computer-use]
+command = "./bin/plasma-same-session-computer-use-mcp"
