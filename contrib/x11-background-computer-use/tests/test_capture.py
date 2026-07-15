@@ -84,6 +84,19 @@ class BrokerCaptureTests(TestCase):
         })
         self.assertEqual(metadata["capture_backend"], "XComposite named window pixmap")
 
+    def test_largest_capture_fits_the_stdio_json_rpc_limit(self) -> None:
+        raw = png(1280, 960) + b"x" * (capture.MAX_CAPTURE_BYTES - 24)
+
+        def fake_run(args, **_kwargs):
+            Path(args[2]).write_bytes(raw)
+            return CompletedProcess(args, 0, "", "")
+
+        with patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
+            result = capture.capture_window(self.window, None)
+
+        response = {"jsonrpc": "2.0", "id": 1, "result": result}
+        self.assertLess(len(json.dumps(response, separators=(",", ":")).encode()), 8 * 1024 * 1024)
+
     def test_save_path_replaces_destination_only_after_capture_succeeds(self) -> None:
         raw = png(640, 480)
         with tempfile.TemporaryDirectory() as temporary:
