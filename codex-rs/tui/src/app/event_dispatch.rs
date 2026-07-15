@@ -832,10 +832,19 @@ impl App {
                 self.chat_widget
                     .finish_add_credits_nudge_email_request(result);
             }
-            AppEvent::RateLimitsLoaded { origin, result } => match result {
+            AppEvent::RateLimitsLoaded {
+                origin,
+                hard_stop_generation,
+                result,
+            } => match result {
                 Ok(response) => {
                     let rate_limit_reset_credits = response.rate_limit_reset_credits.clone();
-                    let snapshots = app_server_rate_limit_snapshots(response);
+                    let snapshots = if hard_stop_generation == self.rate_limit_hard_stop_generation
+                    {
+                        app_server_rate_limit_snapshots(response)
+                    } else {
+                        Vec::new()
+                    };
                     match origin {
                         RateLimitRefreshOrigin::StartupPrefetch {
                             reset_hint_request_id,
@@ -1832,9 +1841,6 @@ impl App {
             AppEvent::SkipNextWorldWritableScan => {
                 self.windows_sandbox.skip_world_writable_scan_once = true;
             }
-            AppEvent::UpdateFullAccessWarningAcknowledged(ack) => {
-                self.chat_widget.set_full_access_warning_acknowledged(ack);
-            }
             AppEvent::UpdateWorldWritableWarningAcknowledged(ack) => {
                 self.chat_widget
                     .set_world_writable_warning_acknowledged(ack);
@@ -1846,21 +1852,6 @@ impl App {
                 self.on_update_plan_mode_reasoning_effort(effort);
                 self.sync_active_thread_plan_mode_reasoning_setting(app_server)
                     .await;
-            }
-            AppEvent::PersistFullAccessWarningAcknowledged => {
-                if let Err(err) = ConfigEditsBuilder::for_config(&self.config)
-                    .set_hide_full_access_warning(/*acknowledged*/ true)
-                    .apply()
-                    .await
-                {
-                    tracing::error!(
-                        error = %err,
-                        "failed to persist full access warning acknowledgement"
-                    );
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to save full access confirmation preference: {err}"
-                    ));
-                }
             }
             AppEvent::PersistWorldWritableWarningAcknowledged => {
                 if let Err(err) = ConfigEditsBuilder::for_config(&self.config)

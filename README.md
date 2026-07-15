@@ -1,100 +1,86 @@
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+# Codex Computer Use on Linux
 
----
+Improve how Codex sees, understands, and operates Linux desktops.
 
-## Quickstart
+This repository is a fork of [OpenAI Codex](https://github.com/openai/codex) and a home for work that makes Codex computer use more capable, reliable, safe, and native-feeling on Linux. The vision is broader than any one desktop environment, application, or interaction backend.
 
-### Installing and running Codex CLI
+The current focus is **same-session background computer use**: letting Codex inspect and operate applications that are already running in the user's real desktop session while preserving their processes, profiles, signed-in state, files, and open windows. Whenever possible, Codex can work without taking over the user's focus, cursor, or workspace. Background app control is the first major workstream, not the limit of the project.
 
-Run the following on Mac or Linux to install Codex CLI:
+## Current support
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-```
+The implementations currently available on `main` are experimental integrations for **Hyprland 0.55.4** and **GNOME Shell 45**. Each combines the bundled Codex Computer Use plugin with a desktop-specific companion plugin.
 
-Run the following on Windows to install Codex CLI:
+The integration can:
 
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
+- discover windows in the current Hyprland session;
+- capture a specific window, including one on an inactive workspace;
+- use AT-SPI accessibility controls for semantic interaction;
+- target keyboard and pointer input at native Wayland and XWayland windows without moving the physical cursor where supported; and
+- use a recoverable temporary workspace and output when an application requires real focus.
 
-Codex CLI can also be installed via the following package managers:
+The GNOME integration in [`contrib/gnome-same-session-computer-use/`](./contrib/gnome-same-session-computer-use/) discovers and captures windows through a GNOME Shell extension. Because GNOME exposes a global input seat, coordinate and keyboard operations require an explicitly acknowledged, journaled focus lease rather than claiming non-interfering background targeting.
 
-```shell
-# Install using npm
-npm install -g @openai/codex
-```
+This is not yet general Linux desktop support. Experimental backends for [generic X11 desktops](https://github.com/Gabriel-Kahen/codex-computer-use-linux/pull/11) and [Plasma/KWin](https://github.com/Gabriel-Kahen/codex-computer-use-linux/pull/12) are also in development.
 
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
+## Installation
 
-Then simply run `codex` to get started.
+### Requirements
 
-### Experimental Linux Computer Use fork
+- Linux running Hyprland 0.55.4 or GNOME Shell 45
+- a current [Codex CLI](https://developers.openai.com/codex/cli) release with `codex plugin` support
+- the build and runtime dependencies listed in the [Hyprland](./contrib/hyprland-background-computer-use/README.md#requirements) or [GNOME](./contrib/gnome-same-session-computer-use/README.md#requirements) integration guide
 
-This fork includes experimental Hyprland and GNOME/Mutter integrations that let Codex inspect and operate windows in your existing desktop session. They are separate plugins with different capability and safety boundaries.
+### Install the plugins
 
-Install the bundled Computer Use plugin first. It supplies the accessibility and global-input tools. Then add this repository as a marketplace and install the Hyprland companion:
+First install the bundled Computer Use plugin, which provides accessibility and global-input tools:
 
 ```shell
 codex plugin add computer-use@openai-bundled
+```
+
+Then add this repository as a Codex plugin marketplace and install the companion for your desktop.
+
+For Hyprland:
+
+```shell
 codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
   --sparse .agents/plugins \
   --sparse contrib/hyprland-background-computer-use
 codex plugin add same-session-computer-use@codex-computer-use-linux
 ```
 
-Start a new Codex task after installation so the new tools and skill are loaded. See the [Hyprland integration README](./contrib/hyprland-background-computer-use/README.md) for system requirements, updates, removal, and the safety boundary.
-
-The GNOME integration currently declares Shell 45 through a user-level bridge and companion plugin; later releases need compositor-session validation. GNOME uses a global input seat, so coordinate and keyboard operations use an explicitly acknowledged, journaled focus lease rather than claiming non-interfering background targeting:
+For GNOME, first install its Shell extension and then install its companion plugin:
 
 ```shell
 ./contrib/gnome-same-session-computer-use/bin/install-gnome-integration
-codex plugin add computer-use@openai-bundled
 codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
   --sparse .agents/plugins \
   --sparse contrib/gnome-same-session-computer-use
 codex plugin add gnome-same-session-computer-use@codex-computer-use-linux
 ```
 
-See the [GNOME integration README](./contrib/gnome-same-session-computer-use/README.md) for its exact limitations and recovery workflow.
+Start a new Codex task after installation so the tools and operating skill are loaded. Confirm that both plugins are available:
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+```shell
+codex plugin list
+```
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+See the [Hyprland](./contrib/hyprland-background-computer-use/README.md) or [GNOME](./contrib/gnome-same-session-computer-use/README.md) integration guide for detailed requirements, updates, removal, and troubleshooting.
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+## Safety and limitations
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+Linux compositors expose different capture and input capabilities, so behavior and physical-input interference vary by desktop environment. The Hyprland integration prefers window-local operations, but its compatibility fallback can temporarily contend with the physical keyboard and pointer. GNOME coordinate and keyboard input always uses a global virtual seat and therefore requires a focus lease.
 
-</details>
+The fallback requires explicit acknowledgement and records compositor state so it can restore the original window, workspace, focus, fullscreen mode, and cursor position. The integration refuses input in unsafe conditions such as a locked session, active pointer constraints, or a physical button being held. It is not intended to bypass authentication surfaces, application security controls, or anti-cheat systems.
 
-### Using Codex with your ChatGPT plan
+Read the relevant [Hyprland](./contrib/hyprland-background-computer-use/README.md#safety-boundary) or [GNOME](./contrib/gnome-same-session-computer-use/README.md#safety-boundary) safety boundary before using an experimental integration.
 
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
+## Project direction
 
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
+Background operation is the current technical focus, but the broader goal is to improve the complete Codex computer-use experience on Linux. That includes wider desktop support, better application compatibility, stronger accessibility integration, more reliable visual and semantic interaction, safer recovery, and less disruption to the person using the computer.
 
-## Docs
+## Upstream and license
 
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
+This fork tracks the [OpenAI Codex](https://github.com/openai/codex) project. Refer to the [official Codex documentation](https://developers.openai.com/codex) for general Codex installation, authentication, IDE, app, and cloud usage.
 
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+Licensed under the [Apache-2.0 License](LICENSE).
