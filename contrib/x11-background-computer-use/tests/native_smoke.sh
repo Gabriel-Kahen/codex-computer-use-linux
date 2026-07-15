@@ -28,9 +28,11 @@ exec {xvfb_lock_fd}>"${TMPDIR:-/tmp}/codex-x11-native-smoke-xvfb.lock"
 flock "$xvfb_lock_fd"
 Xvfb -displayfd 3 -screen 0 1024x768x24 -nolisten tcp -noreset \
   3>"$temporary/display" >"$temporary/xvfb.log" 2>&1 &
-pids+=("$!")
+xvfb_pid=$!
+pids+=("$xvfb_pid")
 ready=false
-for _ in $(seq 1 100); do
+xvfb_exited=false
+for ((attempt=0; attempt<600; attempt++)); do
   if [[ -s $temporary/display ]]; then
     display_number=$(<"$temporary/display")
     export DISPLAY=":$display_number"
@@ -39,13 +41,21 @@ for _ in $(seq 1 100); do
       break
     fi
   fi
+  if ! kill -0 "$xvfb_pid" 2>/dev/null; then
+    xvfb_exited=true
+    break
+  fi
   sleep 0.05
 done
 flock -u "$xvfb_lock_fd"
 exec {xvfb_lock_fd}>&-
 if [[ $ready != true ]]; then
   cat "$temporary/xvfb.log"
-  echo "Xvfb did not become ready" >&2
+  if [[ $xvfb_exited == true ]]; then
+    echo "Xvfb exited before becoming ready" >&2
+  else
+    echo "Xvfb did not become ready within 30 seconds" >&2
+  fi
   exit 1
 fi
 
