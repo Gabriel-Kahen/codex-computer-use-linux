@@ -258,7 +258,13 @@ export default class BackgroundComputerUseExtension extends Extension {
             throw new Error('cannot restore a focus lease while the GNOME session is locked');
         if (lease.phase === 'pending') {
             this._clearLease();
-            return {restored: true, errors: [], state: this._state()};
+            return {
+                restored: true,
+                recovery_complete: true,
+                errors: [],
+                missing_windows: [],
+                state: this._state(),
+            };
         }
         const time = global.get_current_time();
         const result = restoreLeaseTransaction(lease, {
@@ -273,7 +279,7 @@ export default class BackgroundComputerUseExtension extends Extension {
                 GLib.get_monotonic_time(), point.x, point.y),
             state: () => this._state(),
         });
-        this._protocol.finishRestore(result.restored);
+        this._protocol.finishRestore(result.recovery_complete);
         return result;
     }
 

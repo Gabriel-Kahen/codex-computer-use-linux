@@ -89,8 +89,8 @@ export class LeaseProtocol {
         return this.lease;
     }
 
-    finishRestore(restored) {
-        if (restored)
+    finishRestore(recoveryComplete) {
+        if (recoveryComplete)
             this.lease = null;
     }
 

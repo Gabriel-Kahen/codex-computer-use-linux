@@ -31,8 +31,11 @@ export function activateLeaseTransaction(lease, adapter) {
 export function restoreLeaseTransaction(lease, adapter) {
     const original = lease.original;
     const leaseTarget = adapter.findWindow(lease.target);
+    const missingWindows = [];
     if (leaseTarget && lease.targetMinimized)
         adapter.minimizeWindow(leaseTarget);
+    else if (!leaseTarget)
+        missingWindows.push(`target:${lease.target}`);
 
     const focused = original.focused_window
         ? adapter.findWindow(original.focused_window)
@@ -53,7 +56,7 @@ export function restoreLeaseTransaction(lease, adapter) {
     const state = adapter.state();
     const errors = [];
     if (original.focused_window && !focused)
-        errors.push('the originally focused window no longer exists');
+        missingWindows.push(`original-focused:${original.focused_window}`);
     else if (state.focused_window !== original.focused_window)
         errors.push(`focused window mismatch: expected ${original.focused_window}, got ${state.focused_window}`);
     if (state.workspace !== original.workspace)
@@ -62,7 +65,16 @@ export function restoreLeaseTransaction(lease, adapter) {
         errors.push('pointer restoration mismatch');
     if (leaseTarget && Boolean(adapter.isMinimized(leaseTarget)) !== lease.targetMinimized)
         errors.push('lease target minimized-state mismatch');
-    return {restored: errors.length === 0, errors, state};
+    const recoveryComplete = errors.length === 0;
+    return {
+        // Older brokers only understand `restored`; keep it as the terminal
+        // cleanup signal while newer brokers use `missing_windows` for fidelity.
+        restored: recoveryComplete,
+        recovery_complete: recoveryComplete,
+        errors,
+        missing_windows: missingWindows,
+        state,
+    };
 }
 
 export function injectPointerTransaction(request, frame, adapter) {
