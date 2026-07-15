@@ -70,3 +70,43 @@ class CaptureBoundaryTests(TestCase):
                 "note": "Pointer tools use logical window-local coordinates; multiply screenshot x/y by pixel_to_window_scale.",
             },
         )
+
+    def test_oversized_capture_is_rejected_before_replacing_destination(self) -> None:
+        window = {"id": "11", "focused": True, "frame": {"width": 1, "height": 1}}
+        with TemporaryDirectory() as directory:
+            destination = Path(directory) / "capture.png"
+            destination.write_bytes(b"old")
+
+            def capture(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                Path(args[-1]).write_bytes(b"x" * (server.MAX_CAPTURE_PNG_BYTES + 1))
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with (
+                patch.object(server, "resolve_window", return_value=window),
+                patch.object(server, "load_lease", return_value=None),
+                patch.object(server, "run", side_effect=capture),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "MCP transport limit"):
+                    server.capture_window({"window": "11", "save_path": str(destination)})
+
+            self.assertEqual(destination.read_bytes(), b"old")
+            self.assertEqual(list(destination.parent.glob(".capture.png.*.png")), [])
+
+    def test_maximum_capture_fits_codex_stdio_line(self) -> None:
+        window = {"id": "11", "focused": True, "frame": {"width": 1, "height": 1}}
+
+        def capture(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            raw = png(1, 1) + b"x" * (server.MAX_CAPTURE_PNG_BYTES - 24)
+            Path(args[-1]).write_bytes(raw)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with (
+            patch.object(server, "resolve_window", return_value=window),
+            patch.object(server, "load_lease", return_value=None),
+            patch.object(server, "run", side_effect=capture),
+        ):
+            result = server.capture_window({"window": "11"})
+
+        response = {"jsonrpc": "2.0", "id": 1, "result": result}
+        encoded = json.dumps(response, separators=(",", ":")).encode()
+        self.assertLess(len(encoded), server.MAX_MCP_STDOUT_LINE_BYTES)

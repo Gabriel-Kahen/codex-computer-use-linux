@@ -26,6 +26,8 @@ except (ImportError, ValueError):
 
 SERVER_INFO = {"name": "gnome-same-session-computer-use", "version": "0.1.0"}
 PROTOCOL_VERSION = "2025-11-25"
+MAX_MCP_STDOUT_LINE_BYTES = 8 * 1024 * 1024
+MAX_CAPTURE_PNG_BYTES = 5 * 1024 * 1024
 BUS_NAME = "org.gnome.Shell.Extensions.BackgroundComputerUse"
 OBJECT_PATH = "/org/gnome/Shell/Extensions/BackgroundComputerUse"
 INTERFACE = BUS_NAME
@@ -290,7 +292,12 @@ def capture_window(arguments: dict[str, Any]) -> dict[str, Any]:
         if not current.get("focused"):
             raise RuntimeError("the leased window lost focus during capture; screenshot discarded")
         temporary.chmod(0o600)
-        raw = temporary.read_bytes()
+        with temporary.open("rb") as image:
+            raw = image.read(MAX_CAPTURE_PNG_BYTES + 1)
+        if len(raw) > MAX_CAPTURE_PNG_BYTES:
+            raise RuntimeError(
+                f"captured PNG exceeds the {MAX_CAPTURE_PNG_BYTES}-byte MCP transport limit"
+            )
         if destination:
             temporary.replace(destination)
     finally:
