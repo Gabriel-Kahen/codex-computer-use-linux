@@ -1,7 +1,7 @@
 {
   "name": "x11-background-computer-use",
-  "version": "0.1.0",
-  "description": "Exact background capture and guarded same-session input for EWMH Xorg desktops.",
+  "version": "0.2.0",
+  "description": "Parallel claimed-window capture and guarded same-session input for EWMH Xorg desktops.",
   "author": {
     "name": "Gabe",
     "url": "https://github.com/Gabriel-Kahen"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "X11 Codex Background Computer Use",
     "shortDescription": "Background capture and guarded control for Xorg.",
-    "longDescription": "Extends Computer Use on local EWMH Xorg sessions with exact XComposite window capture, best-effort no-focus shortcuts, and an explicitly acknowledged, journaled focus/pointer lease for reliable XTEST input. Supports Xfce, Cinnamon, MATE, LXQt/Openbox, and legacy GNOME or KDE Xorg sessions when their window manager exposes EWMH.",
+    "longDescription": "Extends Computer Use on local EWMH Xorg sessions with expiring per-agent window claims, parallel exact XComposite capture, per-window best-effort no-focus shortcuts, and one explicitly acknowledged, journaled global-seat lease for reliable XTEST input. Supports Xfce, Cinnamon, MATE, LXQt/Openbox, and legacy GNOME or KDE Xorg sessions when their window manager exposes EWMH.",
     "developerName": "Gabe",
     "category": "Productivity",
     "capabilities": [

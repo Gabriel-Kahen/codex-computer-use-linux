@@ -36,8 +36,19 @@ class McpSmokeTests(TestCase):
         self.assertIn("AT-SPI", responses[1]["result"]["instructions"])
         tools = responses[2]["result"]["tools"]
         names = [tool["name"] for tool in tools]
-        self.assertEqual(len(names), 11)
+        self.assertEqual(len(names), 14)
         self.assertEqual(len(names), len(set(names)))
+        self.assertLessEqual(
+            {"claim_session_window", "release_session_window", "list_window_claims"},
+            set(names),
+        )
+        release_tool = next(
+            tool for tool in tools if tool["name"] == "release_session_window"
+        )
+        self.assertEqual(
+            release_tool["inputSchema"]["properties"]["claim_token"]["maxLength"],
+            128,
+        )
         self.assertEqual(responses[3]["result"], {})
         for tool in tools:
             self.assertEqual(tool["inputSchema"]["type"], "object")
