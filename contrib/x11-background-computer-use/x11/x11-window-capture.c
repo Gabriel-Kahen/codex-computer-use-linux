@@ -83,6 +83,13 @@ int main(int argc, char **argv) {
         XCloseDisplay(display);
         return 1;
     }
+    int composite_major, composite_minor;
+    if (!XCompositeQueryVersion(display, &composite_major, &composite_minor) ||
+        (composite_major == 0 && composite_minor < 2)) {
+        fprintf(stderr, "XComposite 0.2 named window pixmaps are unavailable\n");
+        XCloseDisplay(display);
+        return 1;
+    }
     int screen = DefaultScreen(display);
     char selection[64];
     snprintf(selection, sizeof(selection), "_NET_WM_CM_S%d", screen);
@@ -104,6 +111,16 @@ int main(int argc, char **argv) {
         return 1;
     }
     XSetErrorHandler(record_x_error);
+    /* Give reparented clients scoped storage; automatic redirection ends on close. */
+    x_error = 0;
+    XCompositeRedirectWindow(display, xid, CompositeRedirectAutomatic);
+    XSync(display, False);
+    if (x_error) {
+        fprintf(stderr, "failed to redirect the window for exact capture\n");
+        XCloseDisplay(display);
+        return 1;
+    }
+    x_error = 0;
     Pixmap pixmap = XCompositeNameWindowPixmap(display, xid);
     XSync(display, False);
     if (x_error || !pixmap) {

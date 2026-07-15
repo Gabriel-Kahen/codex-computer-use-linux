@@ -2,72 +2,104 @@
 set -euo pipefail
 
 helper=${1:?usage: native_smoke.sh /path/to/x11-window-capture}
-display=:99
 temporary=$(mktemp -d)
 pids=()
 
 cleanup() {
-  for pid in "${pids[@]}"; do
-    kill "$pid" 2>/dev/null || true
+  for ((index=${#pids[@]} - 1; index >= 0; index--)); do
+    kill "${pids[index]}" 2>/dev/null || true
   done
-  for pid in "${pids[@]}"; do
-    wait "$pid" 2>/dev/null || true
+  for ((index=${#pids[@]} - 1; index >= 0; index--)); do
+    wait "${pids[index]}" 2>/dev/null || true
   done
   rm -rf "$temporary"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-export DISPLAY=$display
 export HOME=$temporary/home
 mkdir -p "$HOME"
 cc -O2 -Wall -Wextra -Werror \
   -o "$temporary/x11-test-window" \
   "$(dirname "$0")/x11-test-window.c" \
-  $(pkg-config --cflags --libs x11)
+  $(pkg-config --cflags --libs x11 xcomposite)
 
-Xvfb "$display" -screen 0 1024x768x24 -nolisten tcp >"$temporary/xvfb.log" 2>&1 &
+exec {xvfb_lock_fd}>"${TMPDIR:-/tmp}/codex-x11-native-smoke-xvfb.lock"
+flock "$xvfb_lock_fd"
+Xvfb -displayfd 3 -screen 0 1024x768x24 -nolisten tcp -noreset \
+  3>"$temporary/display" >"$temporary/xvfb.log" 2>&1 &
 pids+=("$!")
 ready=false
 for _ in $(seq 1 100); do
-  if xdpyinfo >/dev/null 2>&1; then
-    ready=true
-    break
+  if [[ -s $temporary/display ]]; then
+    display_number=$(<"$temporary/display")
+    export DISPLAY=":$display_number"
+    if xdpyinfo >/dev/null 2>&1; then
+      ready=true
+      break
+    fi
   fi
   sleep 0.05
 done
+flock -u "$xvfb_lock_fd"
+exec {xvfb_lock_fd}>&-
 if [[ $ready != true ]]; then
   cat "$temporary/xvfb.log"
   echo "Xvfb did not become ready" >&2
   exit 1
 fi
 
-openbox --sm-disable >"$temporary/openbox.log" 2>&1 &
-pids+=("$!")
-xcompmgr -n >"$temporary/xcompmgr.log" 2>&1 &
-pids+=("$!")
 "$temporary/x11-test-window" >"$temporary/test-window.log" 2>&1 &
 window_pid=$!
 pids+=("$window_pid")
 
 window_id=
 for _ in $(seq 1 100); do
-  window_id=$(xdotool search --onlyvisible --name '^Codex-X11-Native-Smoke$' 2>/dev/null | head -n 1 || true)
-  if [[ -n $window_id ]] && xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id'; then
-    break
-  fi
-  window_id=
+  while read -r candidate; do
+    candidate_pid=$($helper --pid "$candidate" 2>/dev/null || true)
+    if [[ $candidate_pid == "$window_pid" ]]; then
+      window_id=$candidate
+      break
+    fi
+  done < <(xdotool search --onlyvisible --name '^Codex-X11-Native-Smoke$' 2>/dev/null || true)
+  [[ -n $window_id ]] && break
   sleep 0.05
 done
 if [[ -z $window_id ]]; then
-  cat "$temporary/openbox.log" "$temporary/test-window.log"
-  echo "EWMH window manager or test client did not become ready" >&2
+  cat "$temporary/test-window.log"
+  echo "test client did not become ready" >&2
   exit 1
 fi
 
 authenticated_pid=$($helper --pid "$window_id")
 if [[ $authenticated_pid != "$window_pid" ]]; then
   echo "XRes authenticated PID $authenticated_pid, expected $window_pid" >&2
+  exit 1
+fi
+
+xcompmgr -n >"$temporary/xcompmgr.log" 2>&1 &
+pids+=("$!")
+if ! "$temporary/x11-test-window" --wait-for-compositor \
+  >"$temporary/compositor-probe.log" 2>&1; then
+  cat "$temporary/xcompmgr.log" "$temporary/compositor-probe.log"
+  echo "XComposite manager did not become ready" >&2
+  exit 1
+fi
+
+openbox --sm-disable >"$temporary/openbox.log" 2>&1 &
+pids+=("$!")
+managed=false
+for _ in $(seq 1 100); do
+  if xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id' &&
+    xprop -id "$window_id" _NET_FRAME_EXTENTS 2>/dev/null | grep -q '= '; then
+    managed=true
+    break
+  fi
+  sleep 0.05
+done
+if [[ $managed != true ]]; then
+  cat "$temporary/openbox.log" "$temporary/test-window.log"
+  echo "EWMH window manager did not reparent the test client" >&2
   exit 1
 fi
 
