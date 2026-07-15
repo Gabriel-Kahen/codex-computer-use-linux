@@ -1,5 +1,7 @@
 import json
 import subprocess
+import struct
+import zlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -8,12 +10,19 @@ from unittest.mock import patch
 from gnome_same_session import server
 
 
-def png(width: int, height: int) -> bytes:
-    raw = bytearray(24)
-    raw[:8] = b"\x89PNG\r\n\x1a\n"
-    raw[16:20] = width.to_bytes(4, "big")
-    raw[20:24] = height.to_bytes(4, "big")
-    return bytes(raw)
+def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(data, zlib.crc32(chunk_type))
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
+
+
+def png(width: int, height: int, padding: int = 0) -> bytes:
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    pixels = b"".join(b"\0" + b"\0\0\0" * width for _ in range(height))
+    chunks = [png_chunk(b"IHDR", header)]
+    if padding:
+        chunks.append(png_chunk(b"npAD", b"x" * padding))
+    chunks.extend((png_chunk(b"IDAT", zlib.compress(pixels)), png_chunk(b"IEND", b"")))
+    return b"\x89PNG\r\n\x1a\n" + b"".join(chunks)
 
 
 class CaptureBoundaryTests(TestCase):
@@ -92,11 +101,92 @@ class CaptureBoundaryTests(TestCase):
             self.assertEqual(destination.read_bytes(), b"old")
             self.assertEqual(list(destination.parent.glob(".capture.png.*.png")), [])
 
+    def test_header_only_capture_is_rejected_before_replacing_destination(self) -> None:
+        window = {"id": "11", "focused": True, "frame": {"width": 1, "height": 1}}
+        with TemporaryDirectory() as directory:
+            destination = Path(directory) / "capture.png"
+            destination.write_bytes(b"old")
+
+            def capture(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                Path(args[-1]).write_bytes(png(1, 1)[:24])
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with (
+                patch.object(server, "resolve_window", return_value=window),
+                patch.object(server, "load_lease", return_value=None),
+                patch.object(server, "run", side_effect=capture),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invalid PNG"):
+                    server.capture_window({"window": "11", "save_path": str(destination)})
+
+            self.assertEqual(destination.read_bytes(), b"old")
+
+    def test_corrupt_scanline_is_rejected_before_replacing_destination(self) -> None:
+        window = {"id": "11", "focused": True, "frame": {"width": 1, "height": 1}}
+        corrupt = bytearray(png(1, 1))
+        idat = corrupt.index(b"IDAT")
+        data_start = idat + 4
+        data_length = int.from_bytes(corrupt[idat - 4:idat], "big")
+        invalid_pixels = zlib.compress(b"\x05\0\0\0")
+        self.assertEqual(len(invalid_pixels), data_length)
+        corrupt[data_start : data_start + data_length] = invalid_pixels
+        corrupt[data_start + data_length : data_start + data_length + 4] = struct.pack(
+            ">I", zlib.crc32(invalid_pixels, zlib.crc32(b"IDAT"))
+        )
+        with TemporaryDirectory() as directory:
+            destination = Path(directory) / "capture.png"
+            destination.write_bytes(b"old")
+
+            def capture(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                Path(args[-1]).write_bytes(corrupt)
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with (
+                patch.object(server, "resolve_window", return_value=window),
+                patch.object(server, "load_lease", return_value=None),
+                patch.object(server, "run", side_effect=capture),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invalid PNG"):
+                    server.capture_window({"window": "11", "save_path": str(destination)})
+
+            self.assertEqual(destination.read_bytes(), b"old")
+
+    def test_excessive_pixel_count_is_rejected_before_replacing_destination(self) -> None:
+        window = {"id": "11", "focused": True, "frame": {"width": 1, "height": 1}}
+        width = server.MAX_CAPTURE_PIXELS + 1
+        header = struct.pack(">IIBBBBB", width, 1, 8, 2, 0, 0, 0)
+        raw = b"\x89PNG\r\n\x1a\n" + b"".join(
+            (
+                png_chunk(b"IHDR", header),
+                png_chunk(b"IDAT", zlib.compress(b"")),
+                png_chunk(b"IEND", b""),
+            )
+        )
+        with TemporaryDirectory() as directory:
+            destination = Path(directory) / "capture.png"
+            destination.write_bytes(b"old")
+
+            def capture(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                Path(args[-1]).write_bytes(raw)
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with (
+                patch.object(server, "resolve_window", return_value=window),
+                patch.object(server, "load_lease", return_value=None),
+                patch.object(server, "run", side_effect=capture),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invalid PNG"):
+                    server.capture_window({"window": "11", "save_path": str(destination)})
+
+            self.assertEqual(destination.read_bytes(), b"old")
+
     def test_maximum_capture_fits_codex_stdio_line(self) -> None:
         window = {"id": "11", "focused": True, "frame": {"width": 1, "height": 1}}
 
         def capture(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-            raw = png(1, 1) + b"x" * (server.MAX_CAPTURE_PNG_BYTES - 24)
+            base = png(1, 1)
+            raw = png(1, 1, server.MAX_CAPTURE_PNG_BYTES - len(base) - 12)
+            self.assertEqual(len(raw), server.MAX_CAPTURE_PNG_BYTES)
             Path(args[-1]).write_bytes(raw)
             return subprocess.CompletedProcess(args, 0, "", "")
 

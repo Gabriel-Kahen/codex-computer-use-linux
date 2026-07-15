@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ SERVER_INFO = {"name": "gnome-same-session-computer-use", "version": "0.1.0"}
 PROTOCOL_VERSION = "2025-11-25"
 MAX_MCP_STDOUT_LINE_BYTES = 8 * 1024 * 1024
 MAX_CAPTURE_PNG_BYTES = 5 * 1024 * 1024
+MAX_CAPTURE_PIXELS = 7680 * 4320
 MAX_WINDOW_TEXT_CHARS = 512
 MAX_ERROR_TEXT_CHARS = 2048
 MAX_RESPONSE_COLLECTION_ITEMS = 8
@@ -300,9 +302,114 @@ def restore_lease(state: dict[str, Any], *, recovery: bool = False) -> dict[str,
 
 
 def png_pixel_size(raw: bytes) -> dict[str, int] | None:
-    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n":
+    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
         return None
-    return {"width": int.from_bytes(raw[16:20], "big"), "height": int.from_bytes(raw[20:24], "big")}
+    width = int.from_bytes(raw[16:20], "big")
+    height = int.from_bytes(raw[20:24], "big")
+    return {"width": width, "height": height} if width and height else None
+
+
+def valid_png(raw: bytes) -> bool:
+    if raw[:8] != b"\x89PNG\r\n\x1a\n":
+        return False
+    offset = 8
+    decoder = None
+    decoded = 0
+    expected_decoded = 0
+    row_bytes = 0
+    saw_idat = False
+    idat_ended = False
+    saw_iend = False
+    while offset + 12 <= len(raw):
+        length = int.from_bytes(raw[offset : offset + 4], "big")
+        chunk_type = raw[offset + 4 : offset + 8]
+        data_start = offset + 8
+        data_end = data_start + length
+        chunk_end = data_end + 4
+        if chunk_end > len(raw):
+            return False
+        chunk_data = memoryview(raw)[data_start:data_end]
+        expected_crc = int.from_bytes(raw[data_end:chunk_end], "big")
+        if zlib.crc32(chunk_data, zlib.crc32(chunk_type)) & 0xFFFFFFFF != expected_crc:
+            return False
+        if offset == 8:
+            if chunk_type != b"IHDR" or length != 13:
+                return False
+            width = int.from_bytes(chunk_data[:4], "big")
+            height = int.from_bytes(chunk_data[4:8], "big")
+            bit_depth = chunk_data[8]
+            color_type = chunk_data[9]
+            valid_depths = {
+                0: {1, 2, 4, 8, 16},
+                2: {8, 16},
+                3: {1, 2, 4, 8},
+                4: {8, 16},
+                6: {8, 16},
+            }
+            if (
+                not width
+                or not height
+                or width * height > MAX_CAPTURE_PIXELS
+                or bit_depth not in valid_depths.get(color_type, set())
+                or bytes(chunk_data[10:13]) != b"\x00\x00\x00"
+            ):
+                return False
+            channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
+            row_bytes = (width * channels * bit_depth + 7) // 8 + 1
+            expected_decoded = row_bytes * height
+            decoder = zlib.decompressobj()
+        elif chunk_type == b"IHDR":
+            return False
+        elif chunk_type == b"IDAT":
+            if decoder is None or idat_ended or saw_iend:
+                return False
+            saw_idat = True
+            compressed: bytes | memoryview = chunk_data
+            while True:
+                remaining = expected_decoded - decoded + 1
+                if remaining <= 0:
+                    return False
+                maximum = min(64 * 1024, remaining)
+                try:
+                    output = decoder.decompress(compressed, maximum)
+                except zlib.error:
+                    return False
+                first_filter = (-decoded) % row_bytes
+                if any(output[index] > 4 for index in range(first_filter, len(output), row_bytes)):
+                    return False
+                decoded += len(output)
+                compressed = decoder.unconsumed_tail
+                if compressed:
+                    continue
+                if len(output) == maximum and not decoder.eof:
+                    compressed = b""
+                    continue
+                break
+            if decoder.unused_data:
+                return False
+        else:
+            if saw_idat:
+                idat_ended = True
+            if chunk_type == b"IEND":
+                if length or not saw_idat or decoder is None or not decoder.eof:
+                    return False
+                saw_iend = True
+                offset = chunk_end
+                break
+        offset = chunk_end
+    return saw_iend and offset == len(raw) and decoded == expected_decoded
+
+
+def read_bounded_png(path: Path) -> bytes:
+    if path.stat().st_size > MAX_CAPTURE_PNG_BYTES:
+        raise RuntimeError(f"captured PNG exceeds the {MAX_CAPTURE_PNG_BYTES}-byte MCP transport limit")
+    with path.open("rb") as image:
+        raw = image.read(MAX_CAPTURE_PNG_BYTES + 1)
+    if len(raw) > MAX_CAPTURE_PNG_BYTES:
+        raise RuntimeError(f"captured PNG exceeds the {MAX_CAPTURE_PNG_BYTES}-byte MCP transport limit")
+    if not valid_png(raw):
+        raise RuntimeError("focused-window capture returned an invalid PNG")
+    return raw
 
 
 def coordinate_space(frame: dict[str, Any], raw: bytes) -> dict[str, Any]:
@@ -355,13 +462,8 @@ def capture_window(arguments: dict[str, Any]) -> dict[str, Any]:
         current = resolve_window(str(selected["id"]))
         if not current.get("focused"):
             raise RuntimeError("the leased window lost focus during capture; screenshot discarded")
+        raw = read_bounded_png(temporary)
         temporary.chmod(0o600)
-        with temporary.open("rb") as image:
-            raw = image.read(MAX_CAPTURE_PNG_BYTES + 1)
-        if len(raw) > MAX_CAPTURE_PNG_BYTES:
-            raise RuntimeError(
-                f"captured PNG exceeds the {MAX_CAPTURE_PNG_BYTES}-byte MCP transport limit"
-            )
         if destination:
             temporary.replace(destination)
     finally:
