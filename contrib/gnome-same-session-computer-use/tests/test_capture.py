@@ -151,6 +151,35 @@ class CaptureBoundaryTests(TestCase):
 
             self.assertEqual(destination.read_bytes(), b"old")
 
+    def test_excessive_pixel_count_is_rejected_before_replacing_destination(self) -> None:
+        window = {"id": "11", "focused": True, "frame": {"width": 1, "height": 1}}
+        width = server.MAX_CAPTURE_PIXELS + 1
+        header = struct.pack(">IIBBBBB", width, 1, 8, 2, 0, 0, 0)
+        raw = b"\x89PNG\r\n\x1a\n" + b"".join(
+            (
+                png_chunk(b"IHDR", header),
+                png_chunk(b"IDAT", zlib.compress(b"")),
+                png_chunk(b"IEND", b""),
+            )
+        )
+        with TemporaryDirectory() as directory:
+            destination = Path(directory) / "capture.png"
+            destination.write_bytes(b"old")
+
+            def capture(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                Path(args[-1]).write_bytes(raw)
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with (
+                patch.object(server, "resolve_window", return_value=window),
+                patch.object(server, "load_lease", return_value=None),
+                patch.object(server, "run", side_effect=capture),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invalid PNG"):
+                    server.capture_window({"window": "11", "save_path": str(destination)})
+
+            self.assertEqual(destination.read_bytes(), b"old")
+
     def test_maximum_capture_fits_codex_stdio_line(self) -> None:
         window = {"id": "11", "focused": True, "frame": {"width": 1, "height": 1}}
 
