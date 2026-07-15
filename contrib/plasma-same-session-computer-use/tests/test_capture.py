@@ -18,6 +18,7 @@ import sys
 
 sys.path.insert(0, str(MODULE_ROOT))
 
+from plasma_same_session import coordination
 from plasma_same_session import kwin
 from plasma_same_session import server
 
@@ -41,6 +42,56 @@ WINDOW = {
 
 
 class BrokerCaptureTests(TestCase):
+    def test_capture_rejects_an_active_foreign_window_claim(self) -> None:
+        session = {
+            "uid": os.getuid(),
+            "boot_id": "boot-test",
+            "wayland_display": "wayland-test",
+            "wayland_socket": {"device": 1, "inode": 2},
+            "session_id": "session-test",
+            "kwin_service_owner": ":1.42",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(coordination, "CLAIMS_DIR", Path(directory) / "claims"),
+                patch.object(coordination, "current_session_identity", return_value=session),
+            ):
+                coordination.claim_window(WINDOW, "owner-a", 60)
+                with (
+                    patch.object(kwin, "screen_locked", return_value=False),
+                    patch.object(kwin, "resolve_window", return_value=WINDOW),
+                    patch.object(kwin, "capture_window") as capture,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "another agent"):
+                        server.capture_result({"window": "target"}, "owner-b")
+
+                capture.assert_not_called()
+
+    def test_capture_rejects_a_same_owner_claim_without_its_token(self) -> None:
+        session = {
+            "uid": os.getuid(),
+            "boot_id": "boot-test",
+            "wayland_display": "wayland-test",
+            "wayland_socket": {"device": 1, "inode": 2},
+            "session_id": "session-test",
+            "kwin_service_owner": ":1.42",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(coordination, "CLAIMS_DIR", Path(directory) / "claims"),
+                patch.object(coordination, "current_session_identity", return_value=session),
+            ):
+                coordination.claim_window(WINDOW, "owner-a", 60)
+                with (
+                    patch.object(kwin, "screen_locked", return_value=False),
+                    patch.object(kwin, "resolve_window", return_value=WINDOW),
+                    patch.object(kwin, "capture_window") as capture,
+                ):
+                    with self.assertRaisesRegex(ValueError, "requires its claim_token"):
+                        server.capture_result({"window": "target"}, "owner-a")
+
+                capture.assert_not_called()
+
     @patch.object(kwin, "screen_locked", return_value=False)
     @patch.object(kwin, "pointer_position", side_effect=[{"x": 4, "y": 5}, {"x": 4, "y": 5}])
     @patch.object(kwin, "current_desktop", side_effect=[2, 2])
@@ -68,12 +119,18 @@ class BrokerCaptureTests(TestCase):
             self.assertEqual(
                 json.loads(result["content"][0]["text"]),
                 {
-                    "window": WINDOW,
+                    "window": {
+                        "id": "{target}",
+                        "capture_id": "target",
+                        "title": "Editor",
+                        "class": "code",
+                    },
                     "saved_to": str(destination),
                     "compositor_capture": "org.kde.KWin.ScreenShot2.CaptureWindow",
                     "observed_physical_state_unchanged": True,
                     "physical_state_before": {"focus": "{other}", "desktop": 2, "pointer": {"x": 4, "y": 5}},
                     "physical_state_after": {"focus": "{other}", "desktop": 2, "pointer": {"x": 4, "y": 5}},
+                    "window_claim_enforced": True,
                 },
             )
 
@@ -109,6 +166,7 @@ class BrokerCaptureTests(TestCase):
             with (
                 patch.object(kwin, "capture_window", side_effect=write_capture),
                 patch.object(server, "MAX_CAPTURE_BYTES", len(PNG) - 1),
+                patch.object(Path, "read_bytes", side_effect=AssertionError("unbounded read")),
             ):
                 with self.assertRaisesRegex(RuntimeError, "safety limit"):
                     server.capture_result({"window": "target", "save_path": str(destination)})
@@ -131,11 +189,13 @@ class KWinCaptureTests(TestCase):
                 "wayland_display": "wayland-test",
                 "wayland_socket": None,
                 "session_id": "session-test",
+                "kwin_service_owner": ":1.42",
             }
 
             def run_helper(args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
                 self.assertEqual(args, [str(helper), "target", str(output)])
                 self.assertEqual(timeout, 30)
+                self.assertEqual(session_identity.call_count, 1)
                 output.write_bytes(PNG)
                 return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -143,7 +203,7 @@ class KWinCaptureTests(TestCase):
                 patch.object(kwin, "STATE_DIR", state),
                 patch.object(kwin, "build_capture_helper", return_value=helper),
                 patch.object(kwin, "run", side_effect=run_helper),
-                patch.object(kwin, "_session_identity", return_value=identity),
+                patch.object(kwin, "session_identity", return_value=identity) as session_identity,
             ):
                 kwin.capture_window("{target}", output)
                 self.assertTrue(kwin.capture_authorized_in_current_session())
@@ -153,6 +213,75 @@ class KWinCaptureTests(TestCase):
             self.assertEqual(json.loads(marker.read_text()), identity)
             self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+
+    def test_capture_window_does_not_publish_authorization_after_a_session_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "plasma-same-session-capture"
+            output = root / "window.png"
+            state = root / "state"
+            identity = {
+                "uid": os.getuid(),
+                "boot_id": "boot-test",
+                "wayland_display": "wayland-test",
+                "wayland_socket": None,
+                "session_id": "session-test",
+                "kwin_service_owner": ":1.42",
+            }
+            changed = {**identity, "kwin_service_owner": ":1.99"}
+
+            def run_helper(_args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(timeout, 30)
+                output.write_bytes(PNG)
+                return subprocess.CompletedProcess(_args, 0, "", "")
+
+            with (
+                patch.object(kwin, "STATE_DIR", state),
+                patch.object(kwin, "build_capture_helper", return_value=helper),
+                patch.object(kwin, "run", side_effect=run_helper),
+                patch.object(kwin, "session_identity", side_effect=[identity, changed]),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "session identity changed"):
+                    kwin.capture_window("{target}", output)
+
+            self.assertTrue(output.exists())
+            self.assertFalse((state / "exact-capture-authorized").exists())
+
+    def test_capture_window_requires_positive_kwin_ownership_after_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "plasma-same-session-capture"
+            output = root / "window.png"
+            state = root / "state"
+            identity = {
+                "uid": os.getuid(),
+                "boot_id": "boot-test",
+                "wayland_display": "wayland-test",
+                "wayland_socket": None,
+                "session_id": "session-test",
+                "kwin_service_owner": ":1.42",
+            }
+
+            def run_helper(_args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(timeout, 30)
+                output.write_bytes(PNG)
+                return subprocess.CompletedProcess(_args, 0, "", "")
+
+            with (
+                patch.object(kwin, "STATE_DIR", state),
+                patch.object(kwin, "build_capture_helper", return_value=helper),
+                patch.object(kwin, "run", side_effect=run_helper),
+                patch.object(
+                    kwin,
+                    "session_identity",
+                    side_effect=[identity, {**identity, "kwin_service_owner": None}],
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "ownership could not be positively identified"):
+                    kwin.capture_window("{target}", output)
+
+            self.assertTrue(output.exists())
+            self.assertFalse((state / "exact-capture-authorized").exists())
 
     def test_successful_helper_build_atomically_replaces_cache_and_installs_desktop_entry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -212,6 +341,7 @@ class KWinCaptureTests(TestCase):
                 "wayland_display": "wayland-0",
                 "wayland_socket": None,
                 "session_id": None,
+                "kwin_service_owner": ":1.42",
             }
             marker = state / "exact-capture-authorized"
             marker.parent.mkdir(parents=True, exist_ok=True)
@@ -219,7 +349,7 @@ class KWinCaptureTests(TestCase):
 
             with (
                 patch.object(kwin, "STATE_DIR", state),
-                patch.object(kwin, "_session_identity", return_value=identity),
+                patch.object(kwin, "session_identity", return_value=identity),
             ):
                 self.assertFalse(kwin.capture_authorized_in_current_session())
 
