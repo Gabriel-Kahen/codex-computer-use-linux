@@ -33,6 +33,8 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::LazyLock;
 
+const FUNCTION_OUTPUT_MAX_MODEL_VISIBLE_TOKENS: usize = 10_000;
+
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextManager {
@@ -369,7 +371,7 @@ impl ContextManager {
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
         let policy_with_serialization_budget = policy * 1.2;
-        match item {
+        let item = match item {
             ResponseItem::FunctionCallOutput {
                 id,
                 call_id,
@@ -409,7 +411,8 @@ impl ContextManager {
             | ResponseItem::CompactionTrigger { .. }
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => item.clone(),
-        }
+        };
+        hard_cap_response_item_output(item)
     }
 
     /// Walk backward from a rollback cut and trim contiguous pre-turn context-update items.
@@ -477,6 +480,138 @@ pub(crate) fn truncate_function_output_payload(
         body,
         success: output.success,
     }
+}
+
+fn hard_cap_response_item_output(mut item: ResponseItem) -> ResponseItem {
+    let output = match &item {
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => output.clone(),
+        _ => return item,
+    };
+    let output = hard_cap_function_output_payload(
+        output,
+        FUNCTION_OUTPUT_MAX_MODEL_VISIBLE_TOKENS,
+        |output| {
+            let mut candidate = item.clone();
+            match &mut candidate {
+                ResponseItem::FunctionCallOutput {
+                    output: candidate_output,
+                    ..
+                }
+                | ResponseItem::CustomToolCallOutput {
+                    output: candidate_output,
+                    ..
+                } => *candidate_output = output.clone(),
+                _ => unreachable!("function output candidate changed variants"),
+            }
+            estimate_item_token_count(&candidate)
+        },
+    );
+    match &mut item {
+        ResponseItem::FunctionCallOutput {
+            output: item_output,
+            ..
+        }
+        | ResponseItem::CustomToolCallOutput {
+            output: item_output,
+            ..
+        } => *item_output = output,
+        _ => unreachable!("function output changed variants"),
+    }
+    item
+}
+
+/// Caps the model-visible function output while preserving its call envelope.
+///
+/// The caller's estimator includes the full response item. Call identifiers and passthrough
+/// metadata are deliberately not rewritten because doing so would break call pairing and rollout
+/// identity. They are expected to satisfy their protocol-level bounds and leave room for the
+/// minimal omission marker.
+fn hard_cap_function_output_payload(
+    mut output: FunctionCallOutputPayload,
+    max_tokens: usize,
+    estimate_tokens: impl Fn(&FunctionCallOutputPayload) -> i64,
+) -> FunctionCallOutputPayload {
+    let max_tokens_i64 = i64::try_from(max_tokens).unwrap_or(i64::MAX);
+    if estimate_tokens(&output) <= max_tokens_i64 {
+        return output;
+    }
+
+    let mut omitted_non_text_items = 0usize;
+    let minimum = loop {
+        let minimum = hard_cap_candidate(&output, /*text_budget*/ 0, omitted_non_text_items);
+        if estimate_tokens(&minimum) <= max_tokens_i64 {
+            break minimum;
+        }
+
+        let FunctionCallOutputBody::ContentItems(items) = &mut output.body else {
+            break minimum;
+        };
+        let Some(index) = items.iter().rposition(|item| {
+            matches!(
+                item,
+                FunctionCallOutputContentItem::InputImage { .. }
+                    | FunctionCallOutputContentItem::EncryptedContent { .. }
+            )
+        }) else {
+            break minimum;
+        };
+        items.remove(index);
+        omitted_non_text_items = omitted_non_text_items.saturating_add(1);
+    };
+    if estimate_tokens(&minimum) > max_tokens_i64 {
+        tracing::warn!(
+            max_tokens,
+            "function output envelope exceeds the model-context limit after minimizing its body"
+        );
+        return minimum;
+    }
+
+    let mut low = 0usize;
+    let mut high = max_tokens;
+    let mut best = minimum;
+    while low <= high {
+        let text_budget = low + (high - low) / 2;
+        let candidate = hard_cap_candidate(&output, text_budget, omitted_non_text_items);
+        if estimate_tokens(&candidate) <= max_tokens_i64 {
+            best = candidate;
+            low = text_budget.saturating_add(1);
+        } else if text_budget == 0 {
+            break;
+        } else {
+            high = text_budget - 1;
+        }
+    }
+
+    debug_assert!(estimate_tokens(&best) <= max_tokens_i64);
+    best
+}
+
+fn hard_cap_candidate(
+    output: &FunctionCallOutputPayload,
+    text_budget: usize,
+    omitted_non_text_items: usize,
+) -> FunctionCallOutputPayload {
+    let mut candidate =
+        truncate_function_output_payload(output, TruncationPolicy::Tokens(text_budget));
+    if omitted_non_text_items == 0 {
+        return candidate;
+    }
+
+    let FunctionCallOutputBody::ContentItems(items) = &mut candidate.body else {
+        return candidate;
+    };
+    let marker = FunctionCallOutputContentItem::InputText {
+        text: format!(
+            "[omitted {omitted_non_text_items} image or encrypted content items to fit the model-context limit]"
+        ),
+    };
+    let insertion_index = items
+        .iter()
+        .position(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
+        .map_or(0, |index| index + 1);
+    items.insert(insertion_index, marker);
+    candidate
 }
 
 /// API messages include every non-system item (user/assistant messages, reasoning,
