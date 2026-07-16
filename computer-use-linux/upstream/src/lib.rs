@@ -1,4 +1,5 @@
 mod abs_pointer;
+mod action_batch;
 #[path = "atspi_tree.rs"]
 mod atspi_tree_impl;
 mod cli;

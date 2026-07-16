@@ -75,13 +75,15 @@ If the binary is not on `PATH`, use the absolute path (typically `~/.local/bin/c
 5. Prefer semantic targeting from `get_app_state`: use element indices or role/name/text/states selectors.
 6. Use coordinates only when the UI surface has no useful accessibility tree.
 7. For text input, prefer `type_text` with a target selector (`window_id`, `pid`, `app_id`, `wm_class`, `title`, `tty`, `terminal_pid`, `terminal_command`, or `terminal_cwd`) rather than relying on current focus.
-8. After mutating actions, re-check state with `get_app_state`, `focused_window`, or an app-specific readback.
+8. Use `run_action_batch` to avoid round trips for a short sequence against one exact `window_id`, such as `Ctrl+L` → type text → `Enter`, or click a field → type text → `Enter`. A batch is fail-fast and may contain at most one click, first, because clicks can invalidate later coordinates or element indices.
+9. After mutating actions, re-check state with `get_app_state`, `focused_window`, or an app-specific readback.
 
 ## Pitfalls
 
 - Already-running GTK, Qt, and Electron apps may need a restart after AT-SPI is enabled.
 - GNOME may show a portal prompt on the first screenshot or `get_app_state` call with screenshots enabled.
 - Desktop input is stateful. Avoid concurrent tool calls against this MCP server.
+- An action batch is sequential and fail-fast, not transactional; successful earlier actions are not rolled back when a later action fails.
 - `click`, `drag`, `press_key`, `type_text`, `perform_action`, and `set_value` can change real application state.
 - `ydotoold` should run as a per-user service with its socket under `/run/user/$UID`, not as a system-wide service.
 - On COSMIC, the standard npm, Cargo, and install-script paths install the `computer-use-linux-cosmic` helper automatically. Manual binary installs must copy both binaries.
