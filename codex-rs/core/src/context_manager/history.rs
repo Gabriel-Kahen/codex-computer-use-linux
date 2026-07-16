@@ -367,6 +367,26 @@ impl ContextManager {
 
         // strip images when model does not support them
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
+
+        let max_tokens =
+            i64::try_from(FUNCTION_OUTPUT_MAX_MODEL_VISIBLE_TOKENS).unwrap_or(i64::MAX);
+        let mut removed_pairs = 0usize;
+        while let Some(index) = self.items.iter().position(|item| {
+            matches!(
+                item,
+                ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+            ) && estimate_item_token_count(item) > max_tokens
+        }) {
+            let output = self.items.remove(index);
+            normalize::remove_corresponding_for(&mut self.items, &output);
+            removed_pairs = removed_pairs.saturating_add(1);
+        }
+        if removed_pairs > 0 {
+            tracing::warn!(
+                removed_pairs,
+                "removed oversized tool call pairs from model-visible history"
+            );
+        }
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
@@ -521,12 +541,7 @@ fn hard_cap_response_item_output(mut item: ResponseItem) -> ResponseItem {
     item
 }
 
-/// Caps the model-visible function output while preserving its call envelope.
-///
-/// The caller's estimator includes the full response item. Call identifiers and passthrough
-/// metadata are deliberately not rewritten because doing so would break call pairing and rollout
-/// identity. They are expected to satisfy their protocol-level bounds and leave room for the
-/// minimal omission marker.
+/// Caps the function output body while preserving its call envelope.
 fn hard_cap_function_output_payload(
     mut output: FunctionCallOutputPayload,
     max_tokens: usize,
