@@ -8,6 +8,8 @@ This experimental Codex plugin operates existing applications in the user's curr
 - Exact unobscured capture of mapped windows through the compositor's XComposite named pixmap, without focus, desktop, stacking, or pointer changes.
 - Best-effort no-focus shortcuts with an explicit unconfirmed-delivery result.
 - Reliable keyboard, click, scroll, and drag input through an explicitly acknowledged XTEST focus/pointer lease.
+- Cross-process, session-bound window claims keyed to Codex's host-supplied agent identity. Different windows can be captured or receive targeted shortcuts concurrently, while the same window is fenced to one agent for its observe-act-verify cycle.
+- Expiring ownership, atomic private journals, per-window locks, and crash recovery that prevents another agent from ending or recovering a live owner's work.
 - Crash-recoverable state journaling, held-input and lock-screen guards, button-release recovery, and restoration of desktop, focus, pointer, and target minimized state.
 
 Generic X11 cannot provide both reliable input and zero interference. Many applications reject targeted XSendEvent input, so reliable actions use the shared physical seat and can briefly interrupt the user. The plugin reports this limitation rather than claiming Hyprland-equivalent targeted input.
@@ -53,6 +55,25 @@ Start a new Codex task after installation. Call `session_status` before the firs
 
 Capture on another virtual desktop is window-manager dependent: the window must remain mapped and its compositor must retain the named pixmap. Cancellation does not stop an input mutation already executing; wait for the tool result and then end or recover the lease.
 
+## Parallel agents
+
+Each agent should call `claim_session_window` before its first capture and retain the returned `claim_token` through the complete observe-act-verify cycle. Pass that token to window and input tools, then call `release_session_window` in finally-style cleanup. Calls from Codex are owned by the host-provided MCP `_meta.threadId`; a model cannot impersonate another owner with a tool argument.
+
+Claims are atomic across MCP server processes, bound to the verified X server, window XID, authenticated PID, and process lifetime, and expire after 60 seconds by default (configurable from 5 to 300 seconds). Successful claimed operations renew the deadline. A crashed agent therefore cannot strand a window indefinitely, while a second live agent cannot steal, mutate, release, end, or recover the first agent's active work.
+
+`list_window_claims` returns compact token-free records under a serialized byte cap and reports `truncated: true` if necessary. A claim bound to an input lease cannot be released or reacquired by another agent until that lease is ended or recovered, even if its ordinary claim deadline passes.
+
+Parallelism follows the facilities X11 actually exposes:
+
+| Operation | Concurrency |
+| --- | --- |
+| Window discovery | Fully concurrent |
+| Exact XComposite capture | Concurrent across distinct claimed windows |
+| Targeted XSendEvent shortcut | Concurrent across distinct claimed windows; delivery remains unconfirmed |
+| Reliable XTEST key/pointer input | One serialized global-seat lane for the whole X11 session |
+
+The global lane is intentional: stock X11 has only one reliable keyboard focus and physical pointer. Agents can keep reasoning, reading files, claiming other windows, and capturing other windows while a peer owns that lane, but reliable XTEST mutations cannot safely run at the same instant.
+
 ## Update and remove
 
 Update by reinstalling from the marketplace:
@@ -62,7 +83,7 @@ codex plugin remove x11-background-computer-use@codex-computer-use-linux
 codex plugin add x11-background-computer-use@codex-computer-use-linux
 ```
 
-Remove cached binaries and unfinished state only after calling `recover_input_lease`:
+Remove cached binaries and unfinished state only after calling `recover_input_lease` and releasing live window claims:
 
 ```shell
 rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/codex-x11-background-computer-use"
