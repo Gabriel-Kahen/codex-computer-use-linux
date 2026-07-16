@@ -148,11 +148,11 @@ TOOLS = [
     tool("capture_session_window", "Capture the compositor's exact unobscured pixmap for one mapped X11 window without focusing it, changing desktops, or moving the pointer.", {**WINDOW, **CLAIM_TOKEN, "save_path": {"type": ["string", "null"]}}, ["window"], idempotent=True),
     tool("send_window_shortcut", "Best-effort no-focus XSendEvent shortcut delivery. Many modern clients reject synthetic events; use an acknowledged input lease when reliable delivery is required.", {**WINDOW, **CLAIM_TOKEN, "key": {"type": "string", "minLength": 1, "maxLength": MAX_SHORTCUT_KEY_CHARS}, "modifiers": {"type": "string", "maxLength": MAX_SHORTCUT_MODIFIERS_CHARS, "default": ""}}, ["window", "key"]),
     tool("begin_input_lease", "Begin an explicit journaled focus/pointer lease bound to an existing or implicit window claim, snapshotting the active desktop, focus, pointer, and target minimized state for restoration.", {**WINDOW, **CLAIM_TOKEN, "acknowledge_interference": {"type": "boolean"}}, ["window", "acknowledge_interference"]),
-    tool("lease_key", "Send a reliable key or shortcut while the acknowledged target input lease is active.", {**TOKEN, "key": {"type": "string", "minLength": 1, "maxLength": MAX_SHORTCUT_KEY_CHARS}, "modifiers": {"type": "string", "maxLength": MAX_SHORTCUT_MODIFIERS_CHARS, "default": ""}}, ["lease_token", "key"]),
-    tool("lease_pointer_click", "Click a target-window-local coordinate during an acknowledged input lease, then restore the pointer position.", {**TOKEN, "x": {"type": "integer"}, "y": {"type": "integer"}, "button": {"type": "string", "enum": ["left", "middle", "right"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
-    tool("lease_pointer_scroll", "Scroll a target-window-local coordinate during an acknowledged input lease, then restore the pointer position.", {**TOKEN, "x": {"type": "integer"}, "y": {"type": "integer"}, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
-    tool("lease_pointer_drag", "Drag between target-window-local coordinates during an acknowledged input lease. A journaled pressed-button marker allows crash recovery.", {**TOKEN, "start_x": {"type": "integer"}, "start_y": {"type": "integer"}, "end_x": {"type": "integer"}, "end_y": {"type": "integer"}, "button": {"type": "string", "enum": ["left", "middle", "right"], "default": "left"}, "motion_steps": {"type": "integer", "minimum": 2, "maximum": 32, "default": 8}}, ["lease_token", "start_x", "start_y", "end_x", "end_y"]),
-    tool("end_input_lease", "Release held synthetic input and restore the pre-lease desktop, focus, pointer, and target minimized state.", TOKEN, ["lease_token"], idempotent=True),
+    tool("lease_key", "Send a reliable key or shortcut while the acknowledged target input lease is active.", {**TOKEN, **CLAIM_TOKEN, "key": {"type": "string", "minLength": 1, "maxLength": MAX_SHORTCUT_KEY_CHARS}, "modifiers": {"type": "string", "maxLength": MAX_SHORTCUT_MODIFIERS_CHARS, "default": ""}}, ["lease_token", "key"]),
+    tool("lease_pointer_click", "Click a target-window-local coordinate during an acknowledged input lease, then restore the pointer position.", {**TOKEN, **CLAIM_TOKEN, "x": {"type": "integer"}, "y": {"type": "integer"}, "button": {"type": "string", "enum": ["left", "middle", "right"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
+    tool("lease_pointer_scroll", "Scroll a target-window-local coordinate during an acknowledged input lease, then restore the pointer position.", {**TOKEN, **CLAIM_TOKEN, "x": {"type": "integer"}, "y": {"type": "integer"}, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
+    tool("lease_pointer_drag", "Drag between target-window-local coordinates during an acknowledged input lease. A journaled pressed-button marker allows crash recovery.", {**TOKEN, **CLAIM_TOKEN, "start_x": {"type": "integer"}, "start_y": {"type": "integer"}, "end_x": {"type": "integer"}, "end_y": {"type": "integer"}, "button": {"type": "string", "enum": ["left", "middle", "right"], "default": "left"}, "motion_steps": {"type": "integer", "minimum": 2, "maximum": 32, "default": 8}}, ["lease_token", "start_x", "start_y", "end_x", "end_y"]),
+    tool("end_input_lease", "Release held synthetic input and restore the pre-lease desktop, focus, pointer, and target minimized state.", {**TOKEN, **CLAIM_TOKEN}, ["lease_token"], idempotent=True),
     tool("recover_input_lease", "Recover an unfinished input lease from its journal after interruption or broker failure.", {}, idempotent=True),
 ]
 
@@ -607,19 +607,106 @@ def save_lease(state: dict[str, Any]) -> None:
     temporary.replace(LEASE_FILE)
 
 
-def require_lease_token(token: str) -> dict[str, Any]:
+def require_lease_token(
+    token: str,
+    owner_thread_id: str | None = None,
+    claim_token: str | None = None,
+) -> dict[str, Any]:
     state = load_lease()
     if not state:
         raise RuntimeError("no input lease is active")
     if not secrets.compare_digest(str(state.get("token") or ""), token):
         raise ValueError("lease token does not match the active input lease")
+    owner_thread_id = owner_thread_id or _request_owner(None)
+    lease_owner = state.get("owner_thread_id")
+    if lease_owner and lease_owner != owner_thread_id:
+        raise RuntimeError("the active input lease belongs to another computer-use agent")
+    state["owner_thread_id"] = owner_thread_id
+    stored_claim_token = state.get("window_claim_token")
+    if claim_token is not None and stored_claim_token and not secrets.compare_digest(stored_claim_token, claim_token):
+        raise ValueError("claim token does not match the input lease's window claim")
     return state
 
 
-def require_lease(token: str) -> dict[str, Any]:
-    state = require_lease_token(token)
+def require_lease(
+    token: str,
+    owner_thread_id: str | None = None,
+    claim_token: str | None = None,
+) -> dict[str, Any]:
+    state = require_lease_token(token, owner_thread_id, claim_token)
+    owner_thread_id = str(state["owner_thread_id"])
+    stored_claim_token = state.get("window_claim_token")
     _validate_lease_binding(state)
+    session_fingerprint = state.get("session_fingerprint")
+    target_identity = state.get("target_identity")
+    store = None
+    claim = None
+    if isinstance(session_fingerprint, dict) and isinstance(target_identity, dict):
+        store = _claim_store(session_fingerprint)
+        claim = store.assert_access(
+            owner_thread_id,
+            target_identity,
+            claim_token or stored_claim_token,
+            mark_inflight=True,
+        )
+    state["owner_inflight_until"] = time.time() + MAX_INFLIGHT_SECONDS
+    try:
+        save_lease(state)
+    except Exception:
+        if store and claim:
+            store.finish_access(
+                owner_thread_id,
+                target_identity,
+                claim["claim_token"],
+                renew=False,
+            )
+        raise
     return state
+
+
+@contextlib.contextmanager
+def _active_lease_operation(
+    token: str,
+    owner_thread_id: str | None,
+    claim_token: str | None,
+):
+    state = require_lease(token, owner_thread_id, claim_token)
+    succeeded = False
+    try:
+        yield state
+        succeeded = True
+    finally:
+        session_fingerprint = state.get("session_fingerprint")
+        target_identity = state.get("target_identity")
+        stored_claim_token = state.get("window_claim_token")
+        store = None
+        if (
+            isinstance(session_fingerprint, dict)
+            and isinstance(target_identity, dict)
+            and isinstance(stored_claim_token, str)
+            and stored_claim_token
+        ):
+            store = _claim_store(session_fingerprint)
+            store.finish_access(
+                str(state["owner_thread_id"]),
+                target_identity,
+                stored_claim_token,
+                renew=succeeded,
+            )
+        state.pop("owner_inflight_until", None)
+        if succeeded:
+            state["owner_expires_at"] = time.time() + DEFAULT_LEASE_SECONDS
+        try:
+            save_lease(state)
+        except Exception:
+            if store:
+                store.assert_access(
+                    str(state["owner_thread_id"]),
+                    target_identity,
+                    stored_claim_token,
+                    mark_inflight=True,
+                )
+            raise
 
 
 def _recovery_allowed(state: dict[str, Any], owner_thread_id: str) -> None:
@@ -837,12 +924,16 @@ def _shortcut(arguments: dict[str, Any]) -> str:
     return "+".join([*names, key])
 
 
-def lease_key(arguments: dict[str, Any]) -> dict[str, Any]:
-    state = require_lease(str(arguments["lease_token"]))
-    _ensure_target_active(state)
-    shortcut = _shortcut(arguments)
-    _checked_xdotool("key", "--clearmodifiers", shortcut)
-    return {"sent": True, "shortcut": shortcut, "delivery": "XTEST to acknowledged focused lease target"}
+def lease_key(arguments: dict[str, Any], owner_thread_id: str | None = None) -> dict[str, Any]:
+    with _active_lease_operation(
+        str(arguments["lease_token"]),
+        owner_thread_id,
+        _claim_token(arguments),
+    ) as state:
+        _ensure_target_active(state)
+        shortcut = _shortcut(arguments)
+        _checked_xdotool("key", "--clearmodifiers", shortcut)
+        return {"sent": True, "shortcut": shortcut, "delivery": "XTEST to acknowledged focused lease target"}
 
 
 def _with_pointer_restore(action) -> None:
@@ -855,56 +946,63 @@ def _with_pointer_restore(action) -> None:
         _checked_xdotool("mousemove", "--sync", str(pointer["x"]), str(pointer["y"]))
 
 
-def lease_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
-    state = require_lease(str(arguments["lease_token"]))
-    _ensure_target_active(state)
-    xid = state["target"]["xid"]
-    button = _button(arguments)
-    if action in {"click", "scroll"}:
-        x, y = int(arguments["x"]), int(arguments["y"])
-        _validate_point(state, x, y)
-        if action == "click":
-            count = int(arguments.get("count", 1))
-            if not 1 <= count <= 3:
-                raise ValueError("count must be between 1 and 3")
-            def perform() -> None:
-                _checked_xdotool("mousemove", "--sync", "--window", xid, str(x), str(y))
-                _checked_xdotool("click", "--repeat", str(count), "--delay", "40", button)
-        else:
-            steps = int(arguments["steps"])
-            if steps == 0 or abs(steps) > 20:
-                raise ValueError("steps must be between -20 and 20, excluding zero")
-            wheel = "5" if steps > 0 else "4"
-            def perform() -> None:
-                _checked_xdotool("mousemove", "--sync", "--window", xid, str(x), str(y))
-                _checked_xdotool("click", "--repeat", str(abs(steps)), "--delay", "20", wheel)
-        _with_pointer_restore(perform)
-    else:
-        sx, sy = int(arguments["start_x"]), int(arguments["start_y"])
-        ex, ey = int(arguments["end_x"]), int(arguments["end_y"])
-        _validate_point(state, sx, sy)
-        _validate_point(state, ex, ey)
-        steps = int(arguments.get("motion_steps", 8))
-        if not 2 <= steps <= 32:
-            raise ValueError("motion_steps must be between 2 and 32")
-        def perform() -> None:
-            _checked_xdotool("mousemove", "--sync", "--window", xid, str(sx), str(sy))
-            state["pressed_button"] = button
-            save_lease(state)
-            _checked_xdotool("mousedown", button)
-            try:
-                for index in range(1, steps + 1):
-                    x = round(sx + (ex - sx) * index / steps)
-                    y = round(sy + (ey - sy) * index / steps)
+def lease_pointer(arguments: dict[str, Any], action: str, owner_thread_id: str | None = None) -> dict[str, Any]:
+    with _active_lease_operation(
+        str(arguments["lease_token"]),
+        owner_thread_id,
+        _claim_token(arguments),
+    ) as state:
+        _ensure_target_active(state)
+        xid = state["target"]["xid"]
+        button = _button(arguments)
+        if action in {"click", "scroll"}:
+            x, y = int(arguments["x"]), int(arguments["y"])
+            _validate_point(state, x, y)
+            if action == "click":
+                count = int(arguments.get("count", 1))
+                if not 1 <= count <= 3:
+                    raise ValueError("count must be between 1 and 3")
+
+                def perform() -> None:
                     _checked_xdotool("mousemove", "--sync", "--window", xid, str(x), str(y))
-            finally:
-                released = run(["xdotool", "mouseup", button])
-                if released.returncode:
-                    raise RuntimeError(released.stderr.strip() or "failed to release synthetic drag button; recover_input_lease is required")
-                state["pressed_button"] = None
+                    _checked_xdotool("click", "--repeat", str(count), "--delay", "40", button)
+            else:
+                steps = int(arguments["steps"])
+                if steps == 0 or abs(steps) > 20:
+                    raise ValueError("steps must be between -20 and 20, excluding zero")
+                wheel = "5" if steps > 0 else "4"
+
+                def perform() -> None:
+                    _checked_xdotool("mousemove", "--sync", "--window", xid, str(x), str(y))
+                    _checked_xdotool("click", "--repeat", str(abs(steps)), "--delay", "20", wheel)
+            _with_pointer_restore(perform)
+        else:
+            sx, sy = int(arguments["start_x"]), int(arguments["start_y"])
+            ex, ey = int(arguments["end_x"]), int(arguments["end_y"])
+            _validate_point(state, sx, sy)
+            _validate_point(state, ex, ey)
+            steps = int(arguments.get("motion_steps", 8))
+            if not 2 <= steps <= 32:
+                raise ValueError("motion_steps must be between 2 and 32")
+
+            def perform() -> None:
+                _checked_xdotool("mousemove", "--sync", "--window", xid, str(sx), str(sy))
+                state["pressed_button"] = button
                 save_lease(state)
-        _with_pointer_restore(perform)
-    return {"action": action, "window": state["target"], "pointer_restored": True, "focus_lease_remains_active": True}
+                _checked_xdotool("mousedown", button)
+                try:
+                    for index in range(1, steps + 1):
+                        x = round(sx + (ex - sx) * index / steps)
+                        y = round(sy + (ey - sy) * index / steps)
+                        _checked_xdotool("mousemove", "--sync", "--window", xid, str(x), str(y))
+                finally:
+                    released = run(["xdotool", "mouseup", button])
+                    if released.returncode:
+                        raise RuntimeError(released.stderr.strip() or "failed to release synthetic drag button; recover_input_lease is required")
+                    state["pressed_button"] = None
+                    save_lease(state)
+            _with_pointer_restore(perform)
+        return {"action": action, "window": state["target"], "pointer_restored": True, "focus_lease_remains_active": True}
 
 
 def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
@@ -1189,13 +1287,27 @@ def call_tool(
                 )
     if name == "lease_key":
         with lease_guard():
-            return text_result(lease_key(arguments))
+            with _lease_window_guard():
+                return text_result(lease_key(arguments, owner_thread_id))
     if name.startswith("lease_pointer_"):
         with lease_guard():
-            return text_result(lease_pointer(arguments, name.removeprefix("lease_pointer_")))
+            with _lease_window_guard():
+                return text_result(
+                    lease_pointer(
+                        arguments,
+                        name.removeprefix("lease_pointer_"),
+                        owner_thread_id,
+                    )
+                )
     if name == "end_input_lease":
         with lease_guard():
-            return text_result(restore_lease(require_lease_token(str(arguments["lease_token"]))))
+            with _lease_window_guard():
+                state = require_lease_token(
+                    str(arguments["lease_token"]),
+                    owner_thread_id,
+                    _claim_token(arguments),
+                )
+                return text_result(restore_lease(state))
     if name == "recover_input_lease":
         with lease_guard():
             selected_state = load_lease()

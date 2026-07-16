@@ -71,6 +71,11 @@ class McpSmokeTests(TestCase):
                 "capture_session_window",
                 "send_window_shortcut",
                 "begin_input_lease",
+                "lease_key",
+                "lease_pointer_click",
+                "lease_pointer_scroll",
+                "lease_pointer_drag",
+                "end_input_lease",
             },
         )
         self.assertEqual(responses[3]["result"], {})

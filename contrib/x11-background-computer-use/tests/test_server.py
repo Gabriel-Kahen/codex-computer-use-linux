@@ -271,6 +271,123 @@ class LeaseTests(TestCase):
 
         self.assertEqual(json.loads(server.LEASE_FILE.read_text())["pressed_button"], "1")
 
+    def test_lease_operation_marks_both_owners_and_renews_after_success(self) -> None:
+        fingerprint = {
+            "display": ":42",
+            "socket_inode": 123,
+            "wm_start_time": "1",
+        }
+        identity = {"xid": "0x20", "pid": 20, "process_start_time": "1"}
+        now = [100.0]
+        store = server.WindowClaimStore(
+            server.STATE_DIR,
+            fingerprint,
+            clock=lambda: now[0],
+        )
+        claim = store.claim(
+            "thread-a",
+            {"xid": "0x20"},
+            identity,
+            lease_seconds=5,
+        )
+        server.save_lease(
+            {
+                "token": "lease-token",
+                "owner_thread_id": "thread-a",
+                "owner_expires_at": 1.0,
+                "session_fingerprint": fingerprint,
+                "target_identity": identity,
+                "target": {"xid": "0x20"},
+                "window_claim_token": claim["claim_token"],
+            }
+        )
+        now[0] = 102.0
+
+        def checked(*_args, **_kwargs):
+            lease_state = json.loads(server.LEASE_FILE.read_text())
+            claim_state = json.loads(
+                (server.STATE_DIR / "window-claims.json").read_text()
+            )["claims"][0]
+            self.assertGreater(lease_state["owner_inflight_until"], time.time())
+            self.assertEqual(claim_state["inflight_until"], 402.0)
+
+        with (
+            patch.object(server, "_validate_lease_binding"),
+            patch.object(server, "_ensure_target_active"),
+            patch.object(server, "_claim_store", return_value=store),
+            patch.object(server, "_checked_xdotool", side_effect=checked),
+        ):
+            server.lease_key(
+                {
+                    "lease_token": "lease-token",
+                    "claim_token": claim["claim_token"],
+                    "key": "x",
+                },
+                "thread-a",
+            )
+
+        lease_state = json.loads(server.LEASE_FILE.read_text())
+        claim_state = json.loads(
+            (server.STATE_DIR / "window-claims.json").read_text()
+        )["claims"][0]
+        self.assertNotIn("owner_inflight_until", lease_state)
+        self.assertGreater(lease_state["owner_expires_at"], time.time())
+        self.assertNotIn("inflight_until", claim_state)
+        self.assertEqual(claim_state["expires_at"], 107.0)
+
+    def test_failed_lease_operation_does_not_renew_either_owner(self) -> None:
+        fingerprint = {"display": ":42", "socket_inode": 123}
+        identity = {"xid": "0x20", "pid": 20, "process_start_time": "1"}
+        now = [100.0]
+        store = server.WindowClaimStore(
+            server.STATE_DIR,
+            fingerprint,
+            clock=lambda: now[0],
+        )
+        claim = store.claim(
+            "thread-a",
+            {"xid": "0x20"},
+            identity,
+            lease_seconds=5,
+        )
+        server.save_lease(
+            {
+                "token": "lease-token",
+                "owner_thread_id": "thread-a",
+                "owner_expires_at": 50.0,
+                "session_fingerprint": fingerprint,
+                "target_identity": identity,
+                "target": {"xid": "0x20"},
+                "window_claim_token": claim["claim_token"],
+            }
+        )
+        now[0] = 102.0
+
+        with (
+            patch.object(server, "_validate_lease_binding"),
+            patch.object(server, "_ensure_target_active"),
+            patch.object(server, "_claim_store", return_value=store),
+            patch.object(server, "_checked_xdotool", side_effect=RuntimeError("failed")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                server.lease_key(
+                    {
+                        "lease_token": "lease-token",
+                        "claim_token": claim["claim_token"],
+                        "key": "x",
+                    },
+                    "thread-a",
+                )
+
+        lease_state = json.loads(server.LEASE_FILE.read_text())
+        claim_state = json.loads(
+            (server.STATE_DIR / "window-claims.json").read_text()
+        )["claims"][0]
+        self.assertNotIn("owner_inflight_until", lease_state)
+        self.assertEqual(lease_state["owner_expires_at"], 50.0)
+        self.assertNotIn("inflight_until", claim_state)
+        self.assertEqual(claim_state["expires_at"], 105.0)
+
     def test_begin_tool_guards_revalidates_and_forwards_the_owner(self) -> None:
         target = {"xid": "0x20", "minimized": False, "width": 100, "height": 80}
         identity = {"xid": "0x20", "pid": 20, "process_start_time": "1"}
@@ -364,6 +481,214 @@ class LeaseTests(TestCase):
 
         begin.assert_not_called()
 
+    def test_key_tool_orders_guards_revalidation_and_claim_fencing(self) -> None:
+        fingerprint = {"display": ":42", "socket_inode": 123}
+        identity = {"xid": "0x20", "pid": 20, "process_start_time": "1"}
+        server.save_lease(
+            {
+                "token": "lease-token",
+                "owner_thread_id": "thread-a",
+                "session_fingerprint": fingerprint,
+                "target_identity": identity,
+                "target": {"xid": "0x20", "width": 100, "height": 80},
+                "window_claim_token": "claim-token",
+            }
+        )
+        events = []
+        store = Mock(unsafe=True)
+
+        @contextlib.contextmanager
+        def lease_guard():
+            events.append("lease-enter")
+            try:
+                yield
+            finally:
+                events.append("lease-exit")
+
+        @contextlib.contextmanager
+        def window_guard():
+            events.append("window-enter")
+            try:
+                yield
+            finally:
+                events.append("window-exit")
+
+        def assert_access(owner, target_identity, token, *, mark_inflight):
+            self.assertEqual(
+                (owner, target_identity, token, mark_inflight),
+                ("thread-a", identity, "claim-token", True),
+            )
+            events.append("claim-access")
+            return {"claim_token": "claim-token"}
+
+        def finish_access(owner, target_identity, token, *, renew):
+            self.assertEqual(
+                (owner, target_identity, token, renew),
+                ("thread-a", identity, "claim-token", True),
+            )
+            events.append("claim-finish")
+
+        store.assert_access.side_effect = assert_access
+        store.finish_access.side_effect = finish_access
+        with (
+            patch.object(server, "lease_guard", side_effect=lease_guard),
+            patch.object(server, "_lease_window_guard", side_effect=window_guard),
+            patch.object(server, "_validate_lease_binding", side_effect=lambda _state: events.append("revalidate")),
+            patch.object(server, "_claim_store", return_value=store),
+            patch.object(server, "_ensure_target_active", side_effect=lambda _state: events.append("target-active")),
+            patch.object(server, "_checked_xdotool", side_effect=lambda *_args: events.append("key")),
+        ):
+            result = server.call_tool(
+                "lease_key",
+                {
+                    "lease_token": "lease-token",
+                    "claim_token": "claim-token",
+                    "key": "x",
+                },
+                "thread-a",
+            )
+
+        self.assertTrue(result["structuredContent"]["sent"])
+        self.assertEqual(
+            events,
+            [
+                "lease-enter",
+                "window-enter",
+                "revalidate",
+                "claim-access",
+                "target-active",
+                "key",
+                "claim-finish",
+                "window-exit",
+                "lease-exit",
+            ],
+        )
+
+    def test_pointer_tools_route_each_action_successfully(self) -> None:
+        cases = {
+            "lease_pointer_click": {
+                "lease_token": "secret",
+                "x": 1,
+                "y": 2,
+            },
+            "lease_pointer_scroll": {
+                "lease_token": "secret",
+                "x": 1,
+                "y": 2,
+                "steps": 2,
+            },
+            "lease_pointer_drag": {
+                "lease_token": "secret",
+                "start_x": 1,
+                "start_y": 2,
+                "end_x": 20,
+                "end_y": 30,
+            },
+        }
+        for name, arguments in cases.items():
+            with self.subTest(name=name):
+                server.save_lease(
+                    {
+                        "token": "secret",
+                        "owner_thread_id": "thread-a",
+                        "target": {"xid": "0x20", "width": 100, "height": 80},
+                        "pressed_button": None,
+                    }
+                )
+                with (
+                    patch.object(server, "_validate_lease_binding"),
+                    patch.object(server, "_ensure_target_active"),
+                    patch.object(server, "_pointer", return_value={"x": 9, "y": 9}),
+                    patch.object(server, "_checked_xdotool"),
+                    patch.object(server, "run", return_value=completed([])),
+                ):
+                    result = server.call_tool(name, arguments, "thread-a")
+
+                self.assertEqual(
+                    result["structuredContent"]["action"],
+                    name.removeprefix("lease_pointer_"),
+                )
+                self.assertTrue(result["structuredContent"]["pointer_restored"])
+
+    def test_lease_tools_reject_foreign_owners_and_tokens_before_input(self) -> None:
+        cases = {
+            "lease_key": {"lease_token": "secret", "key": "x"},
+            "lease_pointer_click": {"lease_token": "secret", "x": 1, "y": 2},
+            "lease_pointer_scroll": {
+                "lease_token": "secret",
+                "x": 1,
+                "y": 2,
+                "steps": 1,
+            },
+            "lease_pointer_drag": {
+                "lease_token": "secret",
+                "start_x": 1,
+                "start_y": 2,
+                "end_x": 20,
+                "end_y": 30,
+            },
+        }
+        server.save_lease(
+            {
+                "token": "secret",
+                "owner_thread_id": "thread-a",
+                "target": {"xid": "0x20", "width": 100, "height": 80},
+            }
+        )
+        with patch.object(server, "_ensure_target_active") as ensure_target_active:
+            for name, arguments in cases.items():
+                with self.subTest(name=name, failure="owner"):
+                    with self.assertRaisesRegex(RuntimeError, "belongs to another"):
+                        server.call_tool(name, arguments, "thread-b")
+                with self.subTest(name=name, failure="token"):
+                    with self.assertRaisesRegex(ValueError, "lease token"):
+                        server.call_tool(
+                            name,
+                            {**arguments, "lease_token": "wrong"},
+                            "thread-a",
+                        )
+
+        ensure_target_active.assert_not_called()
+
+    def test_pointer_tools_reject_invalid_actions_before_pointer_mutation(self) -> None:
+        cases = {
+            "lease_pointer_click": (
+                {"lease_token": "secret", "x": 100, "y": 2},
+                "outside window",
+            ),
+            "lease_pointer_scroll": (
+                {"lease_token": "secret", "x": 1, "y": 2, "steps": 0},
+                "excluding zero",
+            ),
+            "lease_pointer_drag": (
+                {
+                    "lease_token": "secret",
+                    "start_x": 1,
+                    "start_y": 2,
+                    "end_x": 100,
+                    "end_y": 30,
+                },
+                "outside window",
+            ),
+        }
+        for name, (arguments, error) in cases.items():
+            with self.subTest(name=name):
+                server.save_lease(
+                    {
+                        "token": "secret",
+                        "owner_thread_id": "thread-a",
+                        "target": {"xid": "0x20", "width": 100, "height": 80},
+                    }
+                )
+                with (
+                    patch.object(server, "_validate_lease_binding"),
+                    patch.object(server, "_ensure_target_active"),
+                    patch.object(server, "_pointer") as pointer,
+                ):
+                    with self.assertRaisesRegex((ValueError, RuntimeError), error):
+                        server.call_tool(name, arguments, "thread-a")
+
+                pointer.assert_not_called()
 
     def test_pointer_restore_failure_is_not_reported_as_success(self) -> None:
         with patch.object(server, "_pointer", return_value={"x": 1, "y": 2}), patch.object(server, "_checked_xdotool", side_effect=RuntimeError("restore failed")):
@@ -494,81 +819,16 @@ class LeaseTests(TestCase):
 
         xdotool.assert_not_called()
 
-
-    def test_unfinished_input_lease_blocks_foreign_reclaim_after_claim_expiry(self) -> None:
-        identity = {"xid": "0x20", "pid": 20, "process_start_time": "1"}
+    def test_foreign_agent_cannot_use_a_live_input_lease(self) -> None:
         state = {
-            "token": "lease-token",
+            "token": "secret",
             "owner_thread_id": "thread-a",
-            "target_identity": identity,
+            "owner_expires_at": time.time() + 60,
         }
         server.save_lease(state)
-        window = {"xid": "0x20", "pid": 20}
 
-        fingerprint = {"display": ":42", "socket_inode": 123, "wm_start_time": "1"}
-        with patch.object(server, "_resolve_bound_target", return_value=(window, identity, fingerprint)), patch.object(server, "ensure_session", return_value=fingerprint), patch.object(server, "_identity_matches", return_value=server.IdentityMatch.MATCH):
-            with self.assertRaisesRegex(RuntimeError, "unfinished input lease"):
-                server.call_tool("claim_session_window", {"window": "0x20"}, "thread-b")
-
-    def test_same_owner_cannot_replace_claim_bound_to_an_unfinished_lease(self) -> None:
-        identity = {"xid": "0x20", "pid": 20, "process_start_time": "1"}
-        fingerprint = {"display": ":42", "socket_inode": 123, "wm_start_time": "1"}
-        server.save_lease(
-            {
-                "token": "lease-token",
-                "owner_thread_id": "thread-a",
-                "owner_expires_at": time.time() - 1,
-                "target_identity": identity,
-                "window_claim_token": "expired-claim-token",
-            }
-        )
-        window = {"xid": "0x20", "pid": 20}
-        store = Mock(unsafe=True)
-        store.window_guard.return_value = contextlib.nullcontext()
-
-        with (
-            patch.object(server, "_resolve_bound_target", return_value=(window, identity, fingerprint)),
-            patch.object(server, "ensure_session", return_value=fingerprint),
-            patch.object(server, "_identity_matches", return_value=server.IdentityMatch.MATCH),
-            patch.object(server, "_claim_store", return_value=store),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "end or recover"):
-                server.call_tool("claim_session_window", {"window": "0x20"}, "thread-a")
-
-        store.claim.assert_not_called()
-
-    def test_bound_claim_cannot_be_released_before_input_lease_cleanup(self) -> None:
-        server.save_lease({"token": "lease-token", "window_claim_token": "claim-token"})
-
-        store = Mock()
-
-        def release(_owner, _token, *, validate_guarded, before_release):
-            validate_guarded()
-            before_release(
-                {
-                    "token": "claim-token",
-                    "window_identity": {
-                        "xid": "0x20",
-                        "pid": 20,
-                        "process_start_time": "1",
-                    },
-                }
-            )
-
-        store.release.side_effect = release
-        store.session_fingerprint = {"display": ":42", "socket_inode": 123}
-        with patch.object(server, "_claim_store", return_value=store), patch.object(
-            server,
-            "ensure_session",
-            return_value=store.session_fingerprint,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "end or recover"):
-                server.call_tool(
-                    "release_session_window",
-                    {"claim_token": "claim-token"},
-                    "thread-a",
-                )
-
+        with self.assertRaisesRegex(RuntimeError, "belongs to another"):
+            server.require_lease("secret", "thread-b")
 
     def test_foreign_recovery_waits_for_owner_expiry(self) -> None:
         state = {
@@ -706,11 +966,80 @@ class LeaseTests(TestCase):
         recovery_allowed.assert_not_called()
         restore.assert_not_called()
 
+    def test_unfinished_input_lease_blocks_foreign_reclaim_after_claim_expiry(self) -> None:
+        identity = {"xid": "0x20", "pid": 20, "process_start_time": "1"}
+        state = {
+            "token": "lease-token",
+            "owner_thread_id": "thread-a",
+            "target_identity": identity,
+        }
+        server.save_lease(state)
+        window = {"xid": "0x20", "pid": 20}
 
-class StatusTests(TestCase):
-    def test_invalid_session_disables_input_capabilities(self) -> None:
-        with patch.object(server.shutil, "which", return_value="/bin/tool"), patch.object(server, "list_windows", side_effect=RuntimeError("not an EWMH session")), patch.object(server, "build_requirements", return_value={"capture": True}):
-            result = server.status()
+        fingerprint = {"display": ":42", "socket_inode": 123, "wm_start_time": "1"}
+        with patch.object(server, "_resolve_bound_target", return_value=(window, identity, fingerprint)), patch.object(server, "ensure_session", return_value=fingerprint), patch.object(server, "_identity_matches", return_value=server.IdentityMatch.MATCH):
+            with self.assertRaisesRegex(RuntimeError, "unfinished input lease"):
+                server.call_tool("claim_session_window", {"window": "0x20"}, "thread-b")
+
+    def test_same_owner_cannot_replace_claim_bound_to_an_unfinished_lease(self) -> None:
+        identity = {"xid": "0x20", "pid": 20, "process_start_time": "1"}
+        fingerprint = {"display": ":42", "socket_inode": 123, "wm_start_time": "1"}
+        server.save_lease(
+            {
+                "token": "lease-token",
+                "owner_thread_id": "thread-a",
+                "owner_expires_at": time.time() - 1,
+                "target_identity": identity,
+                "window_claim_token": "expired-claim-token",
+            }
+        )
+        window = {"xid": "0x20", "pid": 20}
+        store = Mock(unsafe=True)
+        store.window_guard.return_value = contextlib.nullcontext()
+
+        with (
+            patch.object(server, "_resolve_bound_target", return_value=(window, identity, fingerprint)),
+            patch.object(server, "ensure_session", return_value=fingerprint),
+            patch.object(server, "_identity_matches", return_value=server.IdentityMatch.MATCH),
+            patch.object(server, "_claim_store", return_value=store),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "end or recover"):
+                server.call_tool("claim_session_window", {"window": "0x20"}, "thread-a")
+
+        store.claim.assert_not_called()
+
+    def test_bound_claim_cannot_be_released_before_input_lease_cleanup(self) -> None:
+        server.save_lease({"token": "lease-token", "window_claim_token": "claim-token"})
+
+        store = Mock()
+
+        def release(_owner, _token, *, validate_guarded, before_release):
+            validate_guarded()
+            before_release(
+                {
+                    "token": "claim-token",
+                    "window_identity": {
+                        "xid": "0x20",
+                        "pid": 20,
+                        "process_start_time": "1",
+                    },
+                }
+            )
+
+        store.release.side_effect = release
+        store.session_fingerprint = {"display": ":42", "socket_inode": 123}
+        with patch.object(server, "_claim_store", return_value=store), patch.object(
+            server,
+            "ensure_session",
+            return_value=store.session_fingerprint,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "end or recover"):
+                server.call_tool(
+                    "release_session_window",
+                    {"claim_token": "claim-token"},
+                    "thread-a",
+                )
+
 
 class StatusTests(TestCase):
     def test_invalid_session_disables_input_capabilities(self) -> None:
