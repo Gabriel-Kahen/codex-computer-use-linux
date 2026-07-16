@@ -18,6 +18,7 @@ import sys
 
 sys.path.insert(0, str(MODULE_ROOT))
 
+from plasma_same_session import coordination
 from plasma_same_session import kwin
 from plasma_same_session import server
 
@@ -38,9 +39,56 @@ WINDOW = {
     "excluded_from_capture": False,
     "geometry": {"x": 0, "y": 0, "width": 1000, "height": 700},
 }
+SESSION = {
+    "uid": os.getuid(),
+    "boot_id": "boot-test",
+    "wayland_display": "wayland-test",
+    "wayland_socket": {"device": 1, "inode": 2},
+    "session_id": "session-test",
+    "kwin_service_owner": ":1.42",
+}
 
 
 class BrokerCaptureTests(TestCase):
+    def setUp(self) -> None:
+        self.session_patch = patch.object(coordination, "current_session_identity", return_value=SESSION)
+        self.session_patch.start()
+
+    def tearDown(self) -> None:
+        self.session_patch.stop()
+
+    def test_capture_rejects_an_active_foreign_window_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(coordination, "CLAIMS_DIR", Path(directory) / "claims"),
+            ):
+                coordination.claim_window(WINDOW, "owner-a", 60)
+                with (
+                    patch.object(kwin, "screen_locked", return_value=False),
+                    patch.object(kwin, "resolve_window", return_value=WINDOW),
+                    patch.object(kwin, "capture_window") as capture,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "another agent"):
+                        server.capture_result({"window": "target"}, "owner-b")
+
+                capture.assert_not_called()
+
+    def test_capture_rejects_a_same_owner_claim_without_its_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(coordination, "CLAIMS_DIR", Path(directory) / "claims"),
+            ):
+                coordination.claim_window(WINDOW, "owner-a", 60)
+                with (
+                    patch.object(kwin, "screen_locked", return_value=False),
+                    patch.object(kwin, "resolve_window", return_value=WINDOW),
+                    patch.object(kwin, "capture_window") as capture,
+                ):
+                    with self.assertRaisesRegex(ValueError, "requires its claim_token"):
+                        server.capture_result({"window": "target"}, "owner-a")
+
+                capture.assert_not_called()
+
     @patch.object(kwin, "screen_locked", return_value=False)
     @patch.object(kwin, "pointer_position", side_effect=[{"x": 4, "y": 5}, {"x": 4, "y": 5}])
     @patch.object(kwin, "current_desktop", side_effect=[2, 2])
@@ -65,6 +113,7 @@ class BrokerCaptureTests(TestCase):
             self.assertEqual(destination.read_bytes(), PNG)
             self.assertEqual(base64.b64decode(result["content"][1]["data"]), PNG)
             self.assertNotIn("structuredContent", result)
+            self.assertLessEqual(len(result["content"][0]["text"].encode()), server.MAX_CAPTURE_METADATA_BYTES)
             self.assertEqual(
                 json.loads(result["content"][0]["text"]),
                 {
@@ -74,8 +123,50 @@ class BrokerCaptureTests(TestCase):
                     "observed_physical_state_unchanged": True,
                     "physical_state_before": {"focus": "{other}", "desktop": 2, "pointer": {"x": 4, "y": 5}},
                     "physical_state_after": {"focus": "{other}", "desktop": 2, "pointer": {"x": 4, "y": 5}},
+                    "window_claim_enforced": True,
                 },
             )
+
+    @patch.object(kwin, "pointer_position", return_value={"x": 10**100, "y": 0})
+    @patch.object(kwin, "current_desktop", return_value=2)
+    @patch.object(kwin, "active_window_id", return_value="{other}")
+    @patch.object(kwin, "resolve_window", return_value=WINDOW)
+    @patch.object(kwin, "screen_locked", return_value=False)
+    def test_capture_rejects_unbounded_physical_state_before_compositor_action(self, *_mocks) -> None:
+        with patch.object(kwin, "capture_window") as capture:
+            with self.assertRaisesRegex(RuntimeError, "pointer position is invalid"):
+                server.capture_result({"window": "target"})
+
+        capture.assert_not_called()
+
+    @patch.object(kwin, "pointer_position", return_value={"x": 4, "y": 5})
+    @patch.object(kwin, "current_desktop", return_value=2)
+    @patch.object(kwin, "active_window_id", return_value="{other}")
+    @patch.object(kwin, "resolve_window", return_value=WINDOW)
+    @patch.object(kwin, "screen_locked", return_value=False)
+    def test_capture_preserves_empty_save_path_as_inline_output(self, *_mocks) -> None:
+        with patch.object(kwin, "capture_window", side_effect=lambda _window, path: path.write_bytes(PNG)):
+            result = server.capture_result({"window": "target", "save_path": ""})
+
+        self.assertIsNone(json.loads(result["content"][0]["text"])["saved_to"])
+
+    @patch.object(kwin, "pointer_position", return_value={"x": 4, "y": 5})
+    @patch.object(kwin, "current_desktop", return_value=2)
+    @patch.object(kwin, "active_window_id", return_value="{other}")
+    @patch.object(kwin, "resolve_window", return_value=WINDOW)
+    @patch.object(kwin, "screen_locked", return_value=False)
+    def test_capture_checks_metadata_bound_before_replacing_destination(self, *_mocks) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "capture.png"
+            destination.write_bytes(b"old-image")
+            with (
+                patch.object(kwin, "capture_window", side_effect=lambda _window, path: path.write_bytes(PNG)),
+                patch.object(server, "MAX_CAPTURE_METADATA_BYTES", 1),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "metadata exceeds"):
+                    server.capture_result({"window": "target", "save_path": str(destination)})
+
+            self.assertEqual(destination.read_bytes(), b"old-image")
 
     @patch.object(kwin, "resolve_window")
     @patch.object(kwin, "screen_locked", return_value=True)
@@ -109,6 +200,7 @@ class BrokerCaptureTests(TestCase):
             with (
                 patch.object(kwin, "capture_window", side_effect=write_capture),
                 patch.object(server, "MAX_CAPTURE_BYTES", len(PNG) - 1),
+                patch.object(Path, "read_bytes", side_effect=AssertionError("unbounded read")),
             ):
                 with self.assertRaisesRegex(RuntimeError, "safety limit"):
                     server.capture_result({"window": "target", "save_path": str(destination)})
