@@ -31,11 +31,11 @@ class McpSmokeTests(TestCase):
             check=True,
         )
         responses = {response["id"]: response for response in map(json.loads, proc.stdout.splitlines())}
-        self.assertEqual(responses[1]["result"]["serverInfo"], {"name": "plasma-same-session-computer-use", "version": "0.1.0"})
+        self.assertEqual(responses[1]["result"]["serverInfo"], {"name": "plasma-same-session-computer-use", "version": "0.2.0"})
         self.assertEqual(responses[1]["result"]["protocolVersion"], "2025-11-25")
         self.assertEqual(responses[3]["result"], {})
         tools = responses[2]["result"]["tools"]
-        self.assertEqual(len(tools), 7)
+        self.assertEqual(len(tools), 10)
         self.assertEqual(len(tools), len({tool["name"] for tool in tools}))
         self.assertEqual(
             {tool["name"] for tool in tools},
@@ -43,13 +43,16 @@ class McpSmokeTests(TestCase):
                 "plasma_session_status",
                 "list_plasma_windows",
                 "capture_plasma_window",
+                "claim_session_window",
+                "release_session_window",
+                "list_window_claims",
                 "begin_plasma_focus_lease",
                 "validate_plasma_focus_lease",
                 "end_plasma_focus_lease",
                 "recover_plasma_focus_lease",
             },
         )
-        self.assertIn("cannot gate", responses[1]["result"]["instructions"])
+        self.assertIn("serialize", responses[1]["result"]["instructions"])
         for tool in tools:
             self.assertEqual(tool["inputSchema"]["type"], "object")
             self.assertLessEqual(set(tool["inputSchema"].get("required", [])), set(tool["inputSchema"].get("properties", {})))

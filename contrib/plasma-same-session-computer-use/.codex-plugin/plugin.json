@@ -1,7 +1,7 @@
 {
   "name": "plasma-same-session-computer-use",
-  "version": "0.1.0",
-  "description": "Exact KWin window capture and recoverable focus/restoration leases for Plasma Wayland.",
+  "version": "0.2.0",
+  "description": "Parallel exact KWin capture with per-window ownership and recoverable global-seat leases for Plasma Wayland.",
   "author": {
     "name": "Gabe",
     "url": "https://github.com/Gabriel-Kahen"
@@ -13,15 +13,15 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Plasma Same Session Computer Use",
-    "shortDescription": "Background capture and focus restoration for Plasma.",
-    "longDescription": "Extends Computer Use on Plasma Wayland with stable KWin window IDs, exact compositor-side window capture, and acknowledged focus/restoration leases. The lease journals desktop and focus state but does not authorize or gate a separate global-input tool.",
+    "shortDescription": "Parallel capture and agent-safe coordination for Plasma.",
+    "longDescription": "Extends Computer Use on Plasma Wayland with stable KWin window IDs, parallel compositor-side capture, cross-process expiring per-window claims, and owner-bound focus/restoration leases. The broker serializes its one global-seat lane but cannot gate a separate global-input tool.",
     "developerName": "Gabe",
     "category": "Productivity",
     "capabilities": ["Interactive", "Write", "Local Desktop"],
     "defaultPrompt": [
-      "Use my existing Plasma application in the background.",
-      "Capture an exact KWin window without changing my desktop.",
-      "Operate this Plasma window with a recoverable focus lease."
+      "Use multiple agents on different existing Plasma windows in parallel.",
+      "Claim and capture exact KWin windows without changing my desktop.",
+      "Coordinate shared-seat fallback input with recoverable owner-bound leases."
     ]
   },
   "mcpServers": "./.mcp.json"

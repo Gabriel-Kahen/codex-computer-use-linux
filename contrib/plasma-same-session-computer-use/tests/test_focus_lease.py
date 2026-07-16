@@ -16,6 +16,7 @@ sys.path.insert(0, str(MODULE_ROOT))
 from plasma_same_session import coordination
 from plasma_same_session import focus_lease
 from plasma_same_session import kwin
+from plasma_same_session import server
 
 
 WINDOW = {
@@ -143,6 +144,54 @@ class FocusLeaseTests(TestCase):
         self.assertEqual(result["pointer_before"], {"x": 5, "y": 7})
         self.assertEqual(stat.S_IMODE(self.lease_file.parent.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(self.lease_file.stat().st_mode), 0o600)
+
+    def test_begin_publishes_prepared_journal_under_lease_registry_and_claim_locks(self) -> None:
+        active_locks: list[Path] = []
+        prepared_order: list[Path] = []
+        publishing_prepared = False
+        real_guard = kwin.file_guard
+        real_save = focus_lease.save
+
+        @contextmanager
+        def tracked_guard(path: Path):
+            with real_guard(path):
+                active_locks.append(path)
+                try:
+                    if path == focus_lease.JOURNAL_LOCK and publishing_prepared:
+                        prepared_order.extend(active_locks)
+                    yield
+                finally:
+                    active_locks.pop()
+
+        def tracked_save(state: dict) -> None:
+            nonlocal publishing_prepared
+            publishing_prepared = state.get("phase") == "prepared"
+            try:
+                real_save(state)
+            finally:
+                publishing_prepared = False
+
+        with (
+            patch.object(kwin, "file_guard", tracked_guard),
+            patch.object(focus_lease, "save", side_effect=tracked_save),
+            patch.object(kwin, "resolve_window", return_value=WINDOW),
+            patch.object(kwin, "window_info", return_value={"uuid": "original"}),
+            patch.object(kwin, "active_window_id", side_effect=["{original}", "{target}"]),
+            patch.object(kwin, "current_desktop", return_value=1),
+            patch.object(kwin, "pointer_position", return_value={"x": 5, "y": 7}),
+            patch.object(kwin, "activate"),
+        ):
+            server.call_tool(
+                "begin_plasma_focus_lease",
+                {"window": "Editor", "acknowledge_interference": True},
+                thread_id="owner-a",
+            )
+
+        self.assertEqual(prepared_order[0], focus_lease.LEASE_LOCK)
+        self.assertEqual(prepared_order[1], coordination._session_claims_dir(SESSION) / "registry.lock")
+        self.assertEqual(prepared_order[2].suffix, ".lock")
+        self.assertEqual(prepared_order[3], focus_lease.JOURNAL_LOCK)
+        self.assertEqual(len(prepared_order), 4)
 
     def test_prepared_journal_publish_failure_rolls_back_existing_claim(self) -> None:
         claim = coordination.claim_window(WINDOW, "owner-a", 30)
@@ -768,6 +817,24 @@ class FocusLeaseTests(TestCase):
         self.assertIn("changed before restoration finalization", result["errors"][0])
         self.assertTrue(self.lease_file.exists())
 
+    def test_nonowner_cannot_end_or_recover_a_live_focus_lease(self) -> None:
+        lease_token = "A" * 24
+        state = {
+            "version": 1,
+            "token": lease_token,
+            "expires_at": 2**62,
+            "session_identity": SESSION,
+            "owner": {"thread_id": "owner-a", "process": coordination.process_identity()},
+        }
+        focus_lease.save(state)
+
+        with self.assertRaisesRegex(RuntimeError, "owned by another agent"):
+            server.call_tool("end_plasma_focus_lease", {"lease_token": lease_token}, thread_id="owner-b")
+        with self.assertRaisesRegex(RuntimeError, "owned by another agent"):
+            server.call_tool("recover_plasma_focus_lease", {}, thread_id="owner-b")
+
+        self.assertTrue(self.lease_file.exists())
+
     def test_unexpired_v1_journal_without_process_identity_remains_live(self) -> None:
         state = {
             "version": 1,
@@ -795,6 +862,38 @@ class FocusLeaseTests(TestCase):
 
         restore.assert_not_called()
         self.assertEqual(focus_lease.load(), state)
+
+    def test_nonowner_can_recover_an_expired_focus_lease(self) -> None:
+        state = {
+            "version": 1,
+            "token": "A" * 24,
+            "expires_at": 0,
+            "session_identity": SESSION,
+            "owner": {"thread_id": "owner-a", "process": coordination.process_identity()},
+        }
+        focus_lease.save(state)
+        expected = {"restored": True, "recovery_complete": True}
+
+        with patch.object(focus_lease, "restore", return_value=expected) as restore:
+            result = server.call_tool("recover_plasma_focus_lease", {}, thread_id="owner-b")
+
+        restore.assert_called_once_with(state)
+        self.assertEqual(result["structuredContent"], expected)
+
+    def test_nonowner_can_recover_after_the_owner_process_exits(self) -> None:
+        state = {
+            "version": 1,
+            "token": "A" * 24,
+            "expires_at": 2**62,
+            "session_identity": SESSION,
+            "owner": {"thread_id": "owner-a", "process": {"pid": 2**30, "start_time": "missing"}},
+        }
+        focus_lease.save(state)
+
+        with patch.object(focus_lease, "restore", return_value={"restored": True, "recovery_complete": True}) as restore:
+            server.call_tool("recover_plasma_focus_lease", {}, thread_id="owner-b")
+
+        restore.assert_called_once_with(state)
 
     def test_stale_restore_cannot_act_on_or_delete_a_newer_focus_journal(self) -> None:
         claim = coordination.claim_window(WINDOW, "owner-a", 60)

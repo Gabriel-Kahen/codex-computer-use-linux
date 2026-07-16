@@ -598,13 +598,3 @@ def validate(state: dict[str, Any], owner_id: str | None = None) -> dict[str, An
             "but the separate input plugin cannot consume this token, so this boundary remains caller-enforced."
         ),
     })
-
-
-# Keep the extraction-stage server compatible until broker routing migrates.
-_load_lease = load
-_save_lease = save
-_require_lease = require
-_require_unlocked = require_unlocked
-_restore = restore
-begin_lease = begin
-validate_focus_lease = validate
