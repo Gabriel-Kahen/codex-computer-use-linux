@@ -10,6 +10,10 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 import {LeaseProtocol} from './lease_protocol.js';
 import {
+    beginClaimedLeaseAsync,
+    renewLeaseAsync,
+} from './lease_dbus.js';
+import {
     activateLeaseTransaction,
     assertInputSafe,
     injectKeyTransaction,
@@ -19,12 +23,15 @@ import {
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.BackgroundComputerUse';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/BackgroundComputerUse';
+const PROTOCOL_VERSION = 2;
 const XML = `<node>
   <interface name="org.gnome.Shell.Extensions.BackgroundComputerUse">
     <method name="Status"><arg type="s" direction="out"/></method>
     <method name="ListWindows"><arg type="s" direction="out"/></method>
     <method name="BeginLease"><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="BeginClaimedLease"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="ActivateLease"><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="RenewLease"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="RestoreLease"><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="RecoverLease"><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="InjectPointer"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
@@ -171,12 +178,15 @@ export default class BackgroundComputerUseExtension extends Extension {
 
     Status() {
         return json({
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: ['claimed_focus_leases'],
             shell_version: Config.PACKAGE_VERSION,
             locked: Main.sessionMode.isLocked,
             overview_visible: Main.overview.visible,
             modal_count: Main.modalCount,
             grab_active: global.display.is_grabbed(),
             lease_phase: this._protocol.lease?.phase ?? null,
+            claimed_lease_recoverable: this._protocol.lease?.recoveryDeadlineUsec != null,
             shell_instance: this._shellInstance,
         });
     }
@@ -190,6 +200,20 @@ export default class BackgroundComputerUseExtension extends Extension {
     }
 
     _beginLease(id, owner) {
+        return this._beginLeaseWithRecovery(id, owner, null);
+    }
+
+    BeginClaimedLeaseAsync([id, recoverySeconds], invocation) {
+        beginClaimedLeaseAsync([id, recoverySeconds], invocation, {
+            beginLease: (target, owner, recoveryDeadlineUsec) =>
+                this._beginLeaseWithRecovery(target, owner, recoveryDeadlineUsec),
+            encodeReply: value => new GLib.Variant('(s)', [json(value)]),
+            errorName: `${BUS_NAME}.Error`,
+            monotonicTimeUsec: () => GLib.get_monotonic_time(),
+        });
+    }
+
+    _beginLeaseWithRecovery(id, owner, recoveryDeadlineUsec) {
         this._assertInputSafe();
         const window = this._find(id);
         const capability = `${GLib.uuid_string_random()}${GLib.uuid_string_random()}`;
@@ -199,6 +223,7 @@ export default class BackgroundComputerUseExtension extends Extension {
             target: id,
             targetMinimized: Boolean(window.minimized),
             original: this._state(),
+            recoveryDeadlineUsec,
         });
         this._leaseExpiryId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 30, () => {
             this._leaseExpiryId = null;
@@ -216,6 +241,16 @@ export default class BackgroundComputerUseExtension extends Extension {
 
     ActivateLeaseAsync([capability], invocation) {
         this._reply(invocation, () => this._activateLease(capability, invocation.get_sender()));
+    }
+
+    RenewLeaseAsync([capability, recoverySeconds], invocation) {
+        renewLeaseAsync([capability, recoverySeconds], invocation, {
+            encodeReply: value => new GLib.Variant('(s)', [json(value)]),
+            errorName: `${BUS_NAME}.Error`,
+            monotonicTimeUsec: () => GLib.get_monotonic_time(),
+            renewLease: (token, owner, deadline) =>
+                this._protocol.renew(token, owner, deadline),
+        });
     }
 
     _activateLease(capability, sender) {
@@ -249,7 +284,8 @@ export default class BackgroundComputerUseExtension extends Extension {
             const ownerPresent = currentOwner && sender !== currentOwner
                 ? this._nameHasOwner(currentOwner)
                 : false;
-            return this._restoreLease(this._protocol.recover(capability, sender, ownerPresent));
+            return this._restoreLease(this._protocol.recover(
+                capability, sender, ownerPresent, GLib.get_monotonic_time()));
         });
     }
 

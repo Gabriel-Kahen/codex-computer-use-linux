@@ -6,6 +6,10 @@ import {
     validateKeyRequest,
     validatePointerRequest,
 } from '../gnome-shell/background-computer-use@openai.com/lease_protocol.js';
+import {
+    beginClaimedLeaseAsync,
+    renewLeaseAsync,
+} from '../gnome-shell/background-computer-use@openai.com/lease_dbus.js';
 
 const CAPABILITY = 'c'.repeat(64);
 const OTHER_CAPABILITY = 'x'.repeat(64);
@@ -24,6 +28,124 @@ function pendingProtocol() {
     });
     return protocol;
 }
+
+function dbusInvocation(sender = OWNER) {
+    return {
+        error: null,
+        result: null,
+        get_sender: () => sender,
+        return_dbus_error(name, message) {
+            this.error = {name, message};
+        },
+        return_value(value) {
+            this.result = value;
+        },
+    };
+}
+
+const REPLY_ADAPTERS = {
+    encodeReply: value => ({encoded: value}),
+    errorName: 'org.example.Error',
+    monotonicTimeUsec: () => 2_000_000,
+};
+
+test('BeginClaimedLeaseAsync parses recovery bounds and propagates the D-Bus sender', () => {
+    const invocation = dbusInvocation();
+    const calls = [];
+    beginClaimedLeaseAsync(['11', '1.25'], invocation, {
+        ...REPLY_ADAPTERS,
+        beginLease(...args) {
+            calls.push(args);
+            return {capability: CAPABILITY};
+        },
+    });
+
+    assert.deepEqual(calls, [['11', OWNER, 3_250_000]]);
+    assert.deepEqual(invocation.result, {encoded: {capability: CAPABILITY}});
+    assert.equal(invocation.error, null);
+});
+
+test('BeginClaimedLeaseAsync rejects invalid and overflowing recovery deadlines by D-Bus reply', () => {
+    const invalid = ['', '0', '-1', '300.000001', 'Infinity', 'not-a-number'];
+    for (const recoverySeconds of invalid) {
+        const invocation = dbusInvocation();
+        let called = false;
+        beginClaimedLeaseAsync(['11', recoverySeconds], invocation, {
+            ...REPLY_ADAPTERS,
+            beginLease() {
+                called = true;
+            },
+        });
+        assert.equal(called, false);
+        assert.equal(invocation.result, null);
+        assert.match(invocation.error.message, /greater than 0 and at most 300/);
+    }
+
+    const invocation = dbusInvocation();
+    beginClaimedLeaseAsync(['11', '1'], invocation, {
+        ...REPLY_ADAPTERS,
+        beginLease() {},
+        monotonicTimeUsec: () => Number.MAX_SAFE_INTEGER,
+    });
+    assert.match(invocation.error.message, /outside the supported range/);
+});
+
+test('BeginClaimedLeaseAsync converts callback failures to D-Bus error replies', () => {
+    const invocation = dbusInvocation();
+    beginClaimedLeaseAsync(['11', '5'], invocation, {
+        ...REPLY_ADAPTERS,
+        beginLease() {
+            throw new Error('lease preparation failed');
+        },
+    });
+
+    assert.deepEqual(invocation.error, {
+        name: REPLY_ADAPTERS.errorName,
+        message: 'lease preparation failed',
+    });
+    assert.equal(invocation.result, null);
+});
+
+test('RenewLeaseAsync propagates capability, sender, and the monotonic deadline', () => {
+    const invocation = dbusInvocation(OTHER_OWNER);
+    const calls = [];
+    renewLeaseAsync([CAPABILITY, '0.000001'], invocation, {
+        ...REPLY_ADAPTERS,
+        renewLease(...args) {
+            calls.push(args);
+            return {recoveryDeadlineUsec: args[2]};
+        },
+    });
+
+    assert.deepEqual(calls, [[CAPABILITY, OTHER_OWNER, 2_000_001]]);
+    assert.deepEqual(invocation.result, {
+        encoded: {renewed: true, recovery_deadline_usec: 2_000_001},
+    });
+    assert.equal(invocation.error, null);
+});
+
+test('RenewLeaseAsync reports parse and protocol authorization failures', () => {
+    const invalidInvocation = dbusInvocation();
+    renewLeaseAsync([CAPABILITY, '301'], invalidInvocation, {
+        ...REPLY_ADAPTERS,
+        renewLease() {
+            assert.fail('renew must not run for invalid recovery bounds');
+        },
+    });
+    assert.match(invalidInvocation.error.message, /greater than 0 and at most 300/);
+
+    const deniedInvocation = dbusInvocation(OTHER_OWNER);
+    renewLeaseAsync([CAPABILITY, '5'], deniedInvocation, {
+        ...REPLY_ADAPTERS,
+        renewLease() {
+            throw new Error('another D-Bus caller owns the lease');
+        },
+    });
+    assert.deepEqual(deniedInvocation.error, {
+        name: REPLY_ADAPTERS.errorName,
+        message: 'another D-Bus caller owns the lease',
+    });
+});
 
 test('capability and unique caller jointly authorize a lease', () => {
     const protocol = pendingProtocol();
@@ -46,6 +168,34 @@ test('recovery cannot steal a live caller but can bind after it vanishes', () =>
     assert.throws(() => protocol.recover(CAPABILITY, OTHER_OWNER, true), /still connected/);
     assert.equal(protocol.recover(CAPABILITY, OTHER_OWNER, false).owner, OTHER_OWNER);
     assert.throws(() => protocol.require(CAPABILITY, OWNER), /another D-Bus caller/);
+});
+
+test('claimed lease recovery waits for expiry even when capability is known', () => {
+    const protocol = new LeaseProtocol();
+    protocol.begin({
+        capability: CAPABILITY,
+        owner: OWNER,
+        target: '11',
+        targetMinimized: false,
+        original: {workspace: 2},
+        recoveryDeadlineUsec: 2_000_000,
+    });
+    protocol.activate(CAPABILITY, OWNER);
+
+    assert.throws(
+        () => protocol.recover(CAPABILITY, OTHER_OWNER, true, 1_999_999),
+        /still connected/,
+    );
+    assert.equal(protocol.recover(CAPABILITY, OTHER_OWNER, true, 2_000_000).owner, OTHER_OWNER);
+});
+
+test('only the current D-Bus owner can renew claimed recovery fencing', () => {
+    const protocol = pendingProtocol();
+    assert.throws(
+        () => protocol.renew(CAPABILITY, OTHER_OWNER, 3_000_000),
+        /another D-Bus caller/,
+    );
+    assert.equal(protocol.renew(CAPABILITY, OWNER, 3_000_000).recoveryDeadlineUsec, 3_000_000);
 });
 
 test('failed restore retains state while successful restore clears it', () => {
