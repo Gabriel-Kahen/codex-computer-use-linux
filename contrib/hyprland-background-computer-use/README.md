@@ -7,6 +7,8 @@ This project lets an automation agent inspect and operate the applications that 
 ## Capabilities
 
 - Enumerate live Hyprland windows and their workspaces.
+- Claim windows for individual Codex tasks with expiring, cross-process fencing tokens.
+- Run independent agents against different native Wayland windows concurrently.
 - Capture an exact window on an inactive workspace without focusing or moving it.
 - Send address-targeted keyboard shortcuts.
 - Click, scroll, and drag inside background native Wayland windows without moving the physical cursor.
@@ -21,6 +23,7 @@ This project lets an automation agent inspect and operate the applications that 
 | Operation | Backend | Normal physical interference |
 |---|---|---|
 | Window discovery | `hyprctl clients -j` | None |
+| Claim/list/release | Private atomic broker state | None |
 | Background capture | `grim -T <stableId>` | None |
 | Semantic UI actions | AT-SPI | None |
 | Targeted shortcuts | Hyprland address dispatcher | None |
@@ -28,11 +31,29 @@ This project lets an automation agent inspect and operate the applications that 
 | XWayland pointer actions | XTEST internal pointer with restoration | None observed |
 | Compatibility fallback | Temporary headless output | Brief input contention is possible |
 
+The broker identifies each caller from the host-only `tools/call.params._meta.threadId`; tool arguments cannot override that identity. A window claim has a 60-second default lease (configurable from 5 to 300 seconds), an opaque `claim_token`, and an absolute `expires_at`. Reclaiming from the same task renews the lease without rotating its live token. Another task cannot capture or mutate the claimed window through this broker, even if it omits the token. Supplying the token adds explicit fencing, and a stale or wrong-window token is rejected.
+
+Claim state is atomically replaced, mode `0600`, and scoped to the real user's Wayland display and Hyprland instance. Cross-process file locks make same-window claim and mutation races deterministic. Different native Wayland windows use separate locks and can progress concurrently. Same-window operations remain serialized. XWayland, global-seat, and coordinate-fallback operations issued through this broker use one global lane because those paths share compositor or XTEST state. The separate Computer Use process does not consume these locks or claim tokens; its AT-SPI and global-input calls rely on the skill's coordination policy rather than mechanical broker fencing.
+
 The native extension sends a complete event transaction directly to the selected Wayland surface, then restores pointer focus before the next compositor event. It never moves Hyprland's physical pointer. XWayland actions snapshot and restore XWayland's separate internal pointer.
 
 The fallback reuses the same application process. It does not create another profile or login. The target may be fullscreened on the temporary output, and all recorded compositor state is restored afterward.
 
 Window discovery is paginated and bounds compositor-provided text only when returning it over MCP, preserving full internal titles for reliable matching. PNG captures must pass bounded structural and pixel-stream validation before base64 encoding, and captures larger than 5 MiB are rejected so responses remain below Codex's stdio transport limit. Image results omit `structuredContent` so Codex receives the actual screenshot content blocks.
+
+## Parallel-agent workflow
+
+For a prompt that can be split across windows, the coordinating agent should enumerate the current windows and give each worker a distinct target. Every worker then:
+
+1. Calls `claim_session_window` before its first capture or action.
+2. Passes the returned `claim_token` to `capture_session_window`, targeted pointer/shortcut tools, and `begin_coordinate_lease`.
+3. Lets claimed broker operations renew automatically, and calls `claim_session_window` before `expires_at` during longer external semantic work. A renewal from the same task keeps the token stable.
+4. Recaptures immediately before coordinate selection and after each mutation.
+5. Ends any coordinate lease and calls `release_session_window` in cleanup, including after failures.
+
+`list_window_claims` reports bounded pages of current owners and expiry times without exposing fencing tokens. Active claims are capped at 128 records per session, while each response also has a serialized-byte cap and a continuation cursor. Expired claims are removed lazily and may be acquired by another task. Never copy a claim token to a different task: ownership is checked against the host-provided task identity as well as the token.
+
+Claims preserve legacy unclaimed flows when no active claim conflicts. They become enforceable as soon as a claim exists or a caller supplies a token. This lets older single-agent clients continue to operate while parallel-aware agents get strict exclusion.
 
 ## Repository layout
 
@@ -72,7 +93,7 @@ codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
 codex plugin add same-session-computer-use@codex-computer-use-linux
 ```
 
-Start a new Codex task after installation. The bundled Computer Use plugin owns AT-SPI semantic actions and focus-dependent global input. This plugin adds exact Hyprland window capture, address-targeted shortcuts, native Wayland pointer targeting, XWayland pointer targeting, and the transactional headless-output lease.
+Start a new Codex task after installation. The bundled Computer Use plugin owns AT-SPI semantic actions and focus-dependent global input. This plugin adds task-owned window claims, exact Hyprland window capture, address-targeted shortcuts, native Wayland pointer targeting, XWayland pointer targeting, and the transactional headless-output lease. Workers must respect the Hyprland claim before invoking semantic actions through the companion plugin; those external AT-SPI calls do not pass through this broker.
 
 Check that Codex sees both plugins:
 
@@ -125,6 +146,6 @@ The included Codex plugin manifest registers this broker. Its skill coordinates 
 
 ## Safety boundary
 
-Hyprland still has one physical compositor seat. Normal window-local actions bypass that seat, but the compatibility fallback temporarily focuses the leased application and may contend with physical input. It therefore requires explicit acknowledgement, records state before acting, and supports crash recovery.
+Hyprland still has one physical compositor seat. Normal window-local actions bypass that seat, but the compatibility fallback temporarily focuses the leased application and may contend with physical input. It therefore requires explicit acknowledgement and records the owning task, expiring ownership, claim, display, and Hyprland instance before acting. A foreign task cannot recover live work, but may restore an orphan after both owner and claim expiry. While a fallback is active, other XWayland/global-seat work is rejected; unrelated native Wayland windows can continue through their per-window lanes.
 
 The extension refuses input while the session is locked, a physical button is held, pointer constraints are active, or drag-and-drop is in progress. It is not intended to bypass authentication surfaces, anti-cheat systems, or application security controls.
