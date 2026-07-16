@@ -1197,7 +1197,7 @@ fn record_items_truncates_function_call_output_content() {
 #[test]
 fn record_items_truncates_custom_tool_call_output_content() {
     let mut history = ContextManager::new();
-    let policy = TruncationPolicy::Tokens(1_000);
+    let policy = TruncationPolicy::Tokens(100_000);
     let line = "custom output that is very long\n";
     let long_output = line.repeat(2_500);
     let item = ResponseItem::CustomToolCallOutput {
@@ -1211,6 +1211,7 @@ fn record_items_truncates_custom_tool_call_output_content() {
     history.record_items([&item], policy);
 
     assert_eq!(history.items.len(), 1);
+    assert!(estimate_item_token_count(&history.items[0]) <= 10_000);
     match &history.items[0] {
         ResponseItem::CustomToolCallOutput { output, .. } => {
             let output = output.text_content().unwrap_or_default();
@@ -1254,6 +1255,122 @@ fn record_items_respects_custom_token_limit() {
             .text_content()
             .is_some_and(|content| content.contains("tokens truncated"))
     );
+}
+
+#[test]
+fn record_items_hard_caps_complete_function_output_with_multiple_images() {
+    let image_urls = (0..7)
+        .map(|index| format!("data:image/png;base64,IMAGE-{index}"))
+        .collect::<Vec<_>>();
+    let mut content = vec![
+        FunctionCallOutputContentItem::InputText {
+            text: "Wall time: 1.2500 seconds\nOutput:".to_string(),
+        },
+        FunctionCallOutputContentItem::InputText {
+            text: format!("leading caption {}", "a".repeat(40_000)),
+        },
+    ];
+    content.extend(
+        image_urls
+            .iter()
+            .map(|image_url| FunctionCallOutputContentItem::InputImage {
+                image_url: image_url.clone(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            }),
+    );
+    content.push(FunctionCallOutputContentItem::InputText {
+        text: format!("trailing caption {}", "z".repeat(40_000)),
+    });
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: format!("call-hard-cap-{}", "c".repeat(4_000)),
+        output: FunctionCallOutputPayload::from_content_items(content),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let history = ContextManager::new();
+    let first = history.process_item(&item, TruncationPolicy::Tokens(100_000));
+    let second = history.process_item(&item, TruncationPolicy::Tokens(100_000));
+
+    assert_eq!(first, second);
+    assert!(estimate_item_token_count(&first) <= 10_000);
+    let ResponseItem::FunctionCallOutput { output, .. } = first else {
+        panic!("expected function output");
+    };
+    let FunctionCallOutputBody::ContentItems(items) = output.body else {
+        panic!("expected content items");
+    };
+    let retained_image_urls = items
+        .iter()
+        .filter_map(|item| match item {
+            FunctionCallOutputContentItem::InputImage { image_url, .. } => Some(image_url.clone()),
+            FunctionCallOutputContentItem::InputText { .. }
+            | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let omitted_marker = items.iter().find_map(|item| match item {
+        FunctionCallOutputContentItem::InputText { text }
+            if text.contains("image or encrypted") =>
+        {
+            Some(text)
+        }
+        FunctionCallOutputContentItem::InputText { .. }
+        | FunctionCallOutputContentItem::InputImage { .. }
+        | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
+    });
+
+    assert_eq!(retained_image_urls, image_urls[..4]);
+    assert!(omitted_marker.is_some_and(|marker| marker.contains("omitted 3")));
+}
+
+#[test]
+fn record_items_hard_cap_accounts_for_original_detail_images() {
+    let image = ImageBuffer::from_pixel(2304, 864, Rgba([12u8, 34, 56, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, ImageFormat::Png)
+        .expect("encode png");
+    let image_url = format!(
+        "data:image/png;base64,{}",
+        BASE64_STANDARD.encode(bytes.get_ref())
+    );
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "call-original-hard-cap".to_string(),
+        output: FunctionCallOutputPayload::from_content_items(
+            std::iter::once(FunctionCallOutputContentItem::InputText {
+                text: "Wall time: 1.2500 seconds\nOutput:".to_string(),
+            })
+            .chain((0..6).map(|_| FunctionCallOutputContentItem::InputImage {
+                image_url: image_url.clone(),
+                detail: Some(ImageDetail::Original),
+            }))
+            .collect(),
+        ),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let stored = ContextManager::new().process_item(&item, TruncationPolicy::Tokens(100_000));
+    assert!(estimate_item_token_count(&stored) <= 10_000);
+    let ResponseItem::FunctionCallOutput { output, .. } = &stored else {
+        panic!("expected function output");
+    };
+    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
+        panic!("expected content items");
+    };
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, FunctionCallOutputContentItem::InputImage { .. }))
+            .count(),
+        5
+    );
+    assert!(items.iter().any(|item| {
+        matches!(
+            item,
+            FunctionCallOutputContentItem::InputText { text }
+                if text.contains("omitted 1 image or encrypted")
+        )
+    }));
 }
 
 fn assert_truncated_message_matches(message: &str, line: &str, expected_removed: usize) {
