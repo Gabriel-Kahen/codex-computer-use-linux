@@ -94,7 +94,7 @@ codex plugin add computer-use-linux@codex-computer-use-linux
 codex plugin add same-session-computer-use@codex-computer-use-linux
 ```
 
-Start a new Codex task after installation. The repository-owned Computer Use plugin owns AT-SPI semantic actions and focus-dependent global input. This plugin adds task-owned window claims, exact Hyprland window capture, address-targeted shortcuts, native Wayland pointer targeting, XWayland pointer targeting, and the transactional headless-output lease. Workers must respect the Hyprland claim before invoking semantic actions through the companion plugin; those external AT-SPI calls do not pass through this broker.
+Start a new Codex task after installation. The repository-owned `computer-use-linux@codex-computer-use-linux` plugin owns AT-SPI semantic actions and focus-dependent global input. This plugin adds task-owned window claims, exact Hyprland window capture, address-targeted shortcuts, native Wayland pointer targeting, XWayland pointer targeting, and the transactional headless-output lease. Workers must respect the Hyprland claim before invoking semantic actions through the companion plugin; those external AT-SPI calls do not pass through this broker.
 
 Check that Codex sees both plugins:
 
@@ -125,7 +125,7 @@ codex plugin marketplace remove codex-computer-use-linux
 rm -rf "$PLUGIN_CACHE"
 ```
 
-The core Computer Use plugin is shared infrastructure. Keep it installed if you use it elsewhere; otherwise remove it separately with `codex plugin remove computer-use-linux@codex-computer-use-linux`.
+The repository-owned Computer Use plugin is shared infrastructure. Keep it installed if you use it elsewhere; otherwise remove it separately with `codex plugin remove computer-use-linux@codex-computer-use-linux`.
 
 ## Build the native extension
 
@@ -143,7 +143,7 @@ The generated shared object is intentionally excluded from Git. Build it on the 
 ./bin/same-session-computer-use-mcp
 ```
 
-The included Codex plugin manifest registers this broker. Its skill coordinates these Hyprland-specific tools with the separate core Computer Use plugin's accessibility-first controls.
+The included Codex plugin manifest registers this broker. Its skill coordinates these Hyprland-specific tools with the separate repository-owned Computer Use plugin's accessibility-first controls.
 
 ## Safety boundary
 
