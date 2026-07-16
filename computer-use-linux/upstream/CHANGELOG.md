@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-16
+
+### Changed
+- **Breaking:** `get_app_state` no longer embeds screenshot bytes in
+  `structuredContent.screenshot.data_url`. Screenshot metadata remains in
+  `structuredContent.screenshot`, while the image is returned once as MCP image
+  content. MCP clients that read `data_url` from the structured response must
+  consume the image content block instead.
+
 ## [0.4.1] - 2026-07-15
 
 ### Fixed
@@ -342,7 +351,8 @@ pages; also bumps the MCP server's advertised version string to match.
 - Validated against GNOME 50.1 on Wayland (Ubuntu 25.10).
 - KDE / Sway / Hyprland untested — see README support matrix.
 
-[Unreleased]: https://github.com/agent-sh/computer-use-linux/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Gabriel-Kahen/codex-computer-use-linux/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Gabriel-Kahen/codex-computer-use-linux/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/agent-sh/computer-use-linux/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/agent-sh/computer-use-linux/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/agent-sh/computer-use-linux/compare/v0.3.0...v0.3.1

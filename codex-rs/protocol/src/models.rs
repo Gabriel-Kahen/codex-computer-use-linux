@@ -6,6 +6,8 @@ use std::path::Path;
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::data_url_from_bytes;
 use codex_utils_image::load_for_prompt_bytes;
+use codex_utils_string::approx_token_count;
+use codex_utils_string::truncate_middle_with_token_budget;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -1981,8 +1983,7 @@ fn merge_structured_content_with_mcp_content(
     items: Vec<FunctionCallOutputContentItem>,
     structured_content: &serde_json::Value,
 ) -> Vec<FunctionCallOutputContentItem> {
-    let structured_text = serde_json::to_string(structured_content)
-        .unwrap_or_else(|error| format!("failed to serialize structured MCP content: {error}"));
+    let structured_text = bounded_structured_content_text(structured_content);
     let mut found_equivalent_text = false;
     let mut merged = Vec::with_capacity(items.len() + 1);
 
@@ -2019,6 +2020,26 @@ fn merge_structured_content_with_mcp_content(
         );
     }
     merged
+}
+
+const STRUCTURED_CONTENT_TEXT_MAX_TOKENS: usize = 10_000;
+// `truncate_middle_with_token_budget` adds its marker outside the supplied preview budget. Reserve
+// enough room for the fixed marker plus a 20-digit `u64` token count so the final item, including
+// the marker, remains below the absolute model-context ceiling.
+const STRUCTURED_CONTENT_TRUNCATION_MARKER_RESERVE_TOKENS: usize = 32;
+
+fn bounded_structured_content_text(structured_content: &serde_json::Value) -> String {
+    let structured_text = serde_json::to_string(structured_content)
+        .unwrap_or_else(|error| format!("failed to serialize structured MCP content: {error}"));
+    if approx_token_count(&structured_text) <= STRUCTURED_CONTENT_TEXT_MAX_TOKENS {
+        return structured_text;
+    }
+
+    let preview_budget = STRUCTURED_CONTENT_TEXT_MAX_TOKENS
+        .saturating_sub(STRUCTURED_CONTENT_TRUNCATION_MARKER_RESERVE_TOKENS);
+    let (truncated, _) = truncate_middle_with_token_budget(&structured_text, preview_budget);
+    debug_assert!(approx_token_count(&truncated) <= STRUCTURED_CONTENT_TEXT_MAX_TOKENS);
+    truncated
 }
 
 fn convert_mcp_content_to_items(
@@ -2967,6 +2988,33 @@ mod tests {
                 success: Some(true),
             }
         );
+    }
+
+    #[test]
+    fn caps_structured_content_inserted_alongside_an_image() {
+        let call_tool_result = CallToolResult {
+            content: vec![
+                serde_json::json!({"type":"image","data":"BASE64","mimeType":"image/png"}),
+            ],
+            structured_content: Some(serde_json::json!({
+                "prefix": "start",
+                "large": "x".repeat(50_000),
+                "suffix": "end",
+            })),
+            is_error: Some(false),
+            meta: None,
+        };
+
+        let payload = call_tool_result.into_function_call_output_payload();
+        let structured_text = match &payload.content_items().expect("content items")[0] {
+            FunctionCallOutputContentItem::InputText { text } => text,
+            item => panic!("expected structured content text, got {item:?}"),
+        };
+
+        assert!(structured_text.starts_with(r#"{"large":"xxxxxxxx"#));
+        assert!(structured_text.contains("tokens truncated"));
+        assert!(structured_text.ends_with(r#"suffix":"end"}"#));
+        assert!(approx_token_count(structured_text) <= STRUCTURED_CONTENT_TEXT_MAX_TOKENS);
     }
 
     #[test]
