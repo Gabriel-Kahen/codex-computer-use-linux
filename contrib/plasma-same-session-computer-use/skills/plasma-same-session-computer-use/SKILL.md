@@ -5,7 +5,7 @@ description: Operate one or more applications in the user's existing KDE Plasma 
 
 # Plasma same-session computer use
 
-Use this companion with `computer-use-linux@codex-computer-use-linux`. It adds KWin window identity, cross-process ownership, parallel exact compositor capture, and state recovery; the core plugin owns AT-SPI and global input.
+Use this companion with `computer-use-linux@codex-computer-use-linux`. It adds KWin window identity, cross-process ownership, parallel exact compositor capture, and state recovery; the repository-owned plugin owns AT-SPI and global input.
 
 1. Call `plasma_session_status`. Do not claim a capability whose boolean is false.
 2. Call `list_plasma_windows` and keep each stable KWin UUID. Re-resolve after a window closes or restarts. For parallel work, assign at most one worker to each window.

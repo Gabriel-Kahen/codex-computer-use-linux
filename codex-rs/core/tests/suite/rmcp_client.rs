@@ -1511,6 +1511,131 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial(mcp_test_value)]
+async fn stdio_mixed_image_output_reaches_responses_once_in_order() -> anyhow::Result<()> {
+    // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let call_id = "img-structured-1";
+    let server_name = "rmcp";
+    let namespace = format!("mcp__{server_name}");
+    let leading_caption = "before the image";
+    let trailing_caption = "after the image";
+    let tool_arguments = serde_json::to_string(&json!({
+        "scenario": "structured_text_image_text",
+        "caption": leading_caption,
+        "trailing_caption": trailing_caption,
+        "data_url": OPENAI_PNG,
+    }))?;
+
+    mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call_with_namespace(
+                call_id,
+                &namespace,
+                "image_scenario",
+                &tool_arguments,
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let final_mock = mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_assistant_message("msg-1", "done"),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
+    let fixture = test_codex()
+        .with_model("gpt-5.2")
+        .with_config(move |config| {
+            insert_mcp_server(
+                config,
+                server_name,
+                stdio_transport(rmcp_test_server_bin, /*env*/ None, Vec::new()),
+                TestMcpServerOptions {
+                    environment_id: remote_aware_environment_id(),
+                    ..Default::default()
+                },
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    wait_for_mcp_server(&fixture.codex, server_name).await?;
+
+    fixture
+        .codex
+        .submit(read_only_user_turn(
+            &fixture,
+            "call the rmcp image_scenario tool",
+        ))
+        .await?;
+    wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let output_item = final_mock.single_request().function_call_output(call_id);
+    let output = output_item["output"]
+        .as_array()
+        .expect("mixed MCP output should be content items");
+    let metadata = json!({
+        "coordinate_height": 600,
+        "coordinate_width": 800,
+        "scale": 1.0,
+    });
+    let metadata_text = serde_json::to_string(&metadata)?;
+
+    assert_eq!(output.len(), 5);
+    assert_wall_time_header(
+        output[0]["text"]
+            .as_str()
+            .expect("first mixed MCP output item should be wall-time text"),
+    );
+    assert_eq!(
+        output[1],
+        json!({"type": "input_text", "text": metadata_text})
+    );
+    assert_eq!(
+        output[2],
+        json!({"type": "input_text", "text": leading_caption})
+    );
+    assert_eq!(
+        output[3],
+        json!({"type": "input_image", "image_url": OPENAI_PNG, "detail": "high"})
+    );
+    assert_eq!(
+        output[4],
+        json!({"type": "input_text", "text": trailing_caption})
+    );
+    assert_eq!(
+        output
+            .iter()
+            .filter(|item| item.get("text") == Some(&json!(metadata_text)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        output
+            .iter()
+            .filter(|item| item["type"] == "input_image")
+            .count(),
+        1
+    );
+
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial(mcp_test_value)]
 async fn stdio_image_responses_resize_large_image() -> anyhow::Result<()> {
     // TODO(anp): Remove after packaging a Windows stdio test server for Wine exec.
     skip_if_wine_exec!(
