@@ -1,7 +1,7 @@
 import os
 import subprocess
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -139,6 +139,9 @@ class SafetyProbeTests(TestCase):
 
         with (
             patch.object(server, "hypr_windows", return_value=[{"address": "0x1"}]),
+            patch.object(server, "session_binding", return_value={}),
+            patch.object(server.coordination, "window_guard", return_value=nullcontext()),
+            patch.object(server, "require_window_mutation_access", return_value=None),
             patch.object(server, "ensure_native_input_safe", side_effect=safe),
             patch.object(server, "run", side_effect=run),
         ):
