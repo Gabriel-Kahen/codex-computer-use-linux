@@ -1,0 +1,42 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Local environment overrides
+.env
+.env.local
+.env.publish
+.npmrc
+.secrets/
+
+# Screenshot scratch
+/tmp-screenshots/
+dist/
+
+# node deps (zod schema check is CI-only, deps installed on demand)
+node_modules/
+
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+
+# npm wrapper postinstall artifacts from local smoke tests
+/npm/bin/computer-use-linux-linux-*
+/npm/bin/computer-use-linux-darwin-*
+/npm/bin/computer-use-linux-win32-*
+/npm/bin/computer-use-linux-cosmic
+/.agent-shell/
+
+
+# Agent docs
+.agent-docs

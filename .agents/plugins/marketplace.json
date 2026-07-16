@@ -5,6 +5,18 @@
   },
   "plugins": [
     {
+      "name": "computer-use-linux",
+      "source": {
+        "source": "local",
+        "path": "./computer-use-linux"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
       "name": "same-session-computer-use",
       "source": {
         "source": "local",

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+manifest="$root/upstream/Cargo.toml"
+cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+target_dir="${CODEX_COMPUTER_USE_LINUX_TARGET_DIR:-$cache_home/codex-computer-use-linux/target}"
+backend="$target_dir/release/computer-use-linux"
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "cargo is required to build the repository-owned Linux Computer Use backend" >&2
+    exit 1
+fi
+
+CUL_GNOME_EXTENSION_UUID="codex-window-control@openai.com" \
+CUL_DBUS_SERVICE="com.openai.Codex.WindowControl" \
+CUL_DBUS_OBJECT_PATH="/com/openai/Codex/WindowControl" \
+CARGO_TARGET_DIR="$target_dir" cargo build \
+    --locked \
+    --release \
+    --manifest-path "$manifest" \
+    --quiet
+
+if [ "${1:-}" = "--build-only" ]; then
+    printf '%s\n' "$backend"
+    exit 0
+fi
+
+forward_codex_alias() {
+    local codex_name="$1"
+    local generic_name="$2"
+    if [[ -n "${!codex_name+x}" && -z "${!generic_name+x}" ]]; then
+        export "$generic_name=${!codex_name}"
+    fi
+}
+
+forward_codex_alias CODEX_COMPUTER_USE_DISABLE_ABS_POINTER CU_DISABLE_ABS_POINTER
+forward_codex_alias CODEX_COMPUTER_USE_FORCE_YDOTOOL_POINTER COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER
+forward_codex_alias CODEX_COMPUTER_USE_FORCE_PORTAL_POINTER COMPUTER_USE_LINUX_FORCE_PORTAL_POINTER
+forward_codex_alias CODEX_COMPUTER_USE_FORCE_YDOTOOL_KEYBOARD COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD
+forward_codex_alias CODEX_COMPUTER_USE_FORCE_PORTAL_KEYBOARD COMPUTER_USE_LINUX_FORCE_PORTAL_KEYBOARD
+forward_codex_alias CODEX_COMPUTER_USE_COSMIC_HELPER COMPUTER_USE_LINUX_COSMIC_HELPER
+
+exec "$backend" "$@"

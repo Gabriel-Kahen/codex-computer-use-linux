@@ -1,0 +1,35 @@
+{
+  "name": "computer-use-linux",
+  "version": "0.4.1-codex.1+codex.20260716154455",
+  "description": "Inspect and control Linux desktop applications from Codex.",
+  "author": {
+    "name": "Avi Fenesh and contributors"
+  },
+  "homepage": "https://github.com/Gabriel-Kahen/codex-computer-use-linux/tree/main/computer-use-linux",
+  "repository": "https://github.com/Gabriel-Kahen/codex-computer-use-linux",
+  "license": "MIT",
+  "keywords": [
+    "computer-use",
+    "desktop-control",
+    "linux",
+    "wayland",
+    "accessibility"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Linux Computer Use",
+    "shortDescription": "Native Linux desktop inspection and control.",
+    "longDescription": "Provides screenshots, AT-SPI accessibility state, window discovery, text editing, and guarded pointer and keyboard input through a native Rust MCP backend maintained in this repository.",
+    "developerName": "Avi Fenesh and contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write",
+      "Local Desktop"
+    ],
+    "defaultPrompt": [
+      "Check whether Linux Computer Use is ready.",
+      "List the desktop applications I can control."
+    ]
+  }
+}

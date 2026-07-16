@@ -59,6 +59,50 @@ install:
     rustup show active-toolchain
     cargo fetch
 
+# Build the repository-owned Linux Computer Use backend outside the
+# cross-platform codex-rs workspace.
+[no-cd]
+[unix]
+computer-use-build:
+    {{ justfile_directory() }}/computer-use-linux/bin/codex-computer-use --build-only
+
+[no-cd]
+[unix]
+computer-use-run *args:
+    {{ justfile_directory() }}/computer-use-linux/bin/codex-computer-use "$@"
+
+[no-cd]
+[unix]
+computer-use-install:
+    {{ justfile_directory() }}/computer-use-linux/bin/codex-computer-use --build-only
+    codex plugin marketplace add {{ justfile_directory() }}
+    codex plugin add computer-use-linux@codex-computer-use-linux
+
+[no-cd]
+[unix]
+computer-use-test:
+    CARGO_TARGET_DIR="${CODEX_COMPUTER_USE_LINUX_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/codex-computer-use-linux/target}" cargo nextest run --locked --no-fail-fast --manifest-path {{ justfile_directory() }}/computer-use-linux/upstream/Cargo.toml
+
+[no-cd]
+[unix]
+computer-use-validate:
+    {{ justfile_directory() }}/computer-use-linux/scripts/validate_plugin.py
+
+[no-cd]
+[unix]
+computer-use-upstream-status:
+    {{ justfile_directory() }}/computer-use-linux/scripts/sync_upstream.py status
+
+[no-cd]
+[unix]
+computer-use-upstream-prepare:
+    {{ justfile_directory() }}/computer-use-linux/scripts/sync_upstream.py prepare
+
+[no-cd]
+[unix]
+computer-use-chrome-test:
+    CARGO_TARGET_DIR="${CODEX_COMPUTER_USE_LINUX_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/codex-computer-use-linux/target}/chrome-host" cargo test --locked --manifest-path {{ justfile_directory() }}/computer-use-linux/codex-integration/chrome-host/Cargo.toml
+
 [windows]
 install:
     #!powershell.exe -File

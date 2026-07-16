@@ -972,7 +972,7 @@ def status() -> dict[str, Any]:
             **checks,
             "gnome_shell_extension": ready,
             "claimed_focus_lease_protocol": claimed_leases_ready,
-            "background_semantic_actions": "provided by a separate AT-SPI process; broker claims are policy coordination there, not a mechanical fence",
+            "background_semantic_actions": "provided by the separate computer-use-linux@codex-computer-use-linux AT-SPI plugin; broker claims are policy coordination there, not a mechanical fence",
         },
         "active_lease": load_lease() is not None,
         "active_window_claims": claim_count,
