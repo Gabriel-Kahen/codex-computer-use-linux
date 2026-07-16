@@ -39,8 +39,6 @@ MAX_WINDOW_TEXT_CHARS = 512
 # These two paths are retained as the migration source and global migration lock.
 LEASE_FILE = STATE_DIR / "coordinate-lease.json"
 LOCK_FILE = STATE_DIR / "coordinate-lease.lock"
-POINTER_LOCK_FILE = STATE_DIR / "pointer-transaction.lock"
-POINTER_LOCK = threading.Lock()
 _SESSION_ATTACHED = False
 _SESSION_ENV_LOCK = threading.Lock()
 _LEASE_GUARD_LOCAL = threading.local()
@@ -119,9 +117,10 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "address": {"type": "string", "description": "Exact Hyprland window address from list_session_windows."},
+                "address": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Exact Hyprland window address from list_session_windows."},
                 "key": {"type": "string", "description": "Hyprland key name, such as x, SPACE, RETURN, or XF86AudioPlay."},
                 "modifiers": {"type": "string", "description": "Space-separated modifiers, such as CTRL SHIFT; empty for none.", "default": ""},
+                "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."},
             },
             "required": ["address", "key"],
         },
@@ -133,11 +132,12 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "window": {"type": "string"},
+                "window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS},
                 "x": {"type": "number"},
                 "y": {"type": "number"},
                 "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
                 "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1},
+                "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."},
             },
             "required": ["window", "x", "y"],
         },
@@ -148,7 +148,7 @@ TOOLS = [
         "description": "Scroll at an exact coordinate inside a real Wayland or XWayland window without moving the physical cursor, changing focus, or switching workspace.",
         "inputSchema": {
             "type": "object",
-            "properties": {"window": {"type": "string"}, "x": {"type": "number"}, "y": {"type": "number"}, "steps": {"type": "integer", "minimum": -20, "maximum": 20}},
+            "properties": {"window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS}, "x": {"type": "number"}, "y": {"type": "number"}, "steps": {"type": "integer", "minimum": -20, "maximum": 20}, "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."}},
             "required": ["window", "x", "y", "steps"],
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
@@ -159,8 +159,9 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "window": {"type": "string"}, "start_x": {"type": "number"}, "start_y": {"type": "number"}, "end_x": {"type": "number"}, "end_y": {"type": "number"},
+                "window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS}, "start_x": {"type": "number"}, "start_y": {"type": "number"}, "end_x": {"type": "number"}, "end_y": {"type": "number"},
                 "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "motion_steps": {"type": "integer", "minimum": 2, "maximum": 32, "default": 8},
+                "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."},
             },
             "required": ["window", "start_x", "start_y", "end_x", "end_y"],
         },
@@ -1010,8 +1011,10 @@ def xdotool_target(window: dict[str, Any], command: list[str]) -> dict[str, Any]
     return {"backend": "xwayland-xtest", "xwindow_id": xid}
 
 
-def _targeted_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
-    window = resolve_window(str(arguments["window"]))
+def _targeted_pointer(
+    arguments: dict[str, Any], action: str, *, window: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    window = window or resolve_window(str(arguments["window"]))
     if window.get("xwayland"):
         ensure_native_input_safe()
     before = physical_snapshot()
@@ -1063,13 +1066,34 @@ def _targeted_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
     return {"action": action, "window": bounded_window(window), "result": result, "observed_physical_state_unchanged": unchanged, "physical_state_before": before, "physical_state_after": after, "cursor_moved_by_backend": False, "keyboard_focus_changed_by_backend": False, "workspace_changed_by_backend": False}
 
 
-def targeted_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
-    # Pointer focus and the XWayland-internal pointer are process-global resources.
-    # Serialize transactions so simultaneous calls cannot interleave snapshot,
-    # injection, and restoration.
-    with POINTER_LOCK:
-        with file_guard(POINTER_LOCK_FILE):
-            return _targeted_pointer(arguments, action)
+def targeted_pointer(
+    arguments: dict[str, Any], action: str, owner_thread_id: str | None = None
+) -> dict[str, Any]:
+    window = resolve_window(str(arguments["window"]))
+    binding = session_binding()
+
+    def perform() -> dict[str, Any]:
+        with coordination.window_guard(binding, window):
+            claim = require_window_mutation_access(
+                window, arguments, owner_thread_id, mark_inflight=True
+            )
+            try:
+                result = _targeted_pointer(arguments, action, window=window)
+            except Exception:
+                finish_claimed_window_access(
+                    binding, window, owner_thread_id, claim, renew=False
+                )
+                raise
+            finish_claimed_window_access(
+                binding, window, owner_thread_id, claim, renew=True
+            )
+            return result
+
+    if window.get("xwayland"):
+        with coordination.global_input_guard():
+            require_global_input_available()
+            return perform()
+    return perform()
 
 
 def text_result(value: Any) -> dict[str, Any]:
@@ -1148,6 +1172,9 @@ def status() -> dict[str, Any]:
             "background_semantic_actions": False,
             "targeted_wayland_pointer": native_available,
             "targeted_xwayland_pointer": native_available and checks["xdotool"],
+            "cross_process_window_claims": True,
+            "parallel_native_wayland_windows": True,
+            "broker_global_input_lane_serialized": True,
             "native_input_currently_safe": bool(safety_status and safety_status.get("safe_to_inject") is True),
             "physical_pointer_seat_is_independent": False,
         },
@@ -1159,8 +1186,71 @@ def status() -> dict[str, Any]:
             "background_semantic_actions": "requires the separate Computer Use plugin and an enabled AT-SPI session",
         },
         "exact_window_count": exact_count,
-        "raw_pointer_note": "Hyprland still has one physical pointer seat, but normal coordinate actions bypass it by targeting a Wayland surface or XWayland's internal pointer. The physical cursor, keyboard focus, and workspace are preserved.",
+        "claim_lease_seconds": {"default": 60, "minimum": 5, "maximum": 300},
+        "raw_pointer_note": "Hyprland still has one physical pointer seat. Different native Wayland windows have independent broker lanes; this broker serializes its XWayland and fallback input, but separate same-user processes do not share that lock. The physical cursor, keyboard focus, and workspace are preserved by normal targeted actions.",
     }
+
+
+def send_window_shortcut(
+    arguments: dict[str, Any], owner_thread_id: str | None = None
+) -> dict[str, Any]:
+    address = str(arguments["address"])
+    window = next((window for window in combine_windows() if window.get("address") == address), None)
+    if not address.startswith("0x") or window is None:
+        raise ValueError("address must be a live Hyprland window address from list_session_windows")
+    key = str(arguments["key"])
+    modifiers = str(arguments.get("modifiers") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_+\-]+", key):
+        raise ValueError(
+            "key must be a Hyprland key name containing only letters, digits, underscore, plus, or hyphen"
+        )
+    if not re.fullmatch(r"[A-Za-z ]*", modifiers):
+        raise ValueError("modifiers may contain only modifier names and spaces")
+    binding = session_binding()
+
+    def perform() -> dict[str, Any]:
+        with coordination.window_guard(binding, window):
+            claim = require_window_mutation_access(
+                window, arguments, owner_thread_id, mark_inflight=True
+            )
+            try:
+                ensure_native_input_safe()
+                proc = run(
+                    [
+                        "hyprctl",
+                        "dispatch",
+                        f"hl.dsp.send_shortcut({{ mods = '{modifiers}', key = '{key}', window = 'address:{address}' }})",
+                    ]
+                )
+                if proc.returncode or "ok" not in proc.stdout.lower():
+                    raise RuntimeError(
+                        proc.stderr.strip()
+                        or proc.stdout.strip()
+                        or "targeted shortcut failed"
+                    )
+                result = {
+                    "sent": True,
+                    "address": address,
+                    "key": key,
+                    "modifiers": modifiers,
+                    "focus_changed": False,
+                    "pointer_moved": False,
+                }
+            except Exception:
+                finish_claimed_window_access(
+                    binding, window, owner_thread_id, claim, renew=False
+                )
+                raise
+            finish_claimed_window_access(
+                binding, window, owner_thread_id, claim, renew=True
+            )
+            return result
+
+    if window.get("xwayland"):
+        with coordination.global_input_guard():
+            require_global_input_available()
+            return perform()
+    return perform()
 
 
 def require_owner(owner_thread_id: str | None, tool_name: str) -> str:
@@ -1302,23 +1392,13 @@ def call_tool(
             )
             return result
     if name == "send_window_shortcut":
-        address = str(arguments["address"])
-        if not address.startswith("0x") or not any(w.get("address") == address for w in hypr_windows()):
-            raise ValueError("address must be a live Hyprland window address from list_session_windows")
-        key = str(arguments["key"])
-        modifiers = str(arguments.get("modifiers") or "")
-        if not re.fullmatch(r"[A-Za-z0-9_+\-]+", key):
-            raise ValueError("key must be a Hyprland key name containing only letters, digits, underscore, plus, or hyphen")
-        if not re.fullmatch(r"[A-Za-z ]*", modifiers):
-            raise ValueError("modifiers may contain only modifier names and spaces")
-        ensure_native_input_safe()
-        proc = run(["hyprctl", "dispatch", f"hl.dsp.send_shortcut({{ mods = '{modifiers}', key = '{key}', window = 'address:{address}' }})"])
-        if proc.returncode or "ok" not in proc.stdout.lower():
-            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "targeted shortcut failed")
-        return text_result({"sent": True, "address": address, "key": key, "modifiers": modifiers, "focus_changed": False, "pointer_moved": False})
-    if name == "targeted_pointer_click": return text_result(targeted_pointer(arguments, "click"))
-    if name == "targeted_pointer_scroll": return text_result(targeted_pointer(arguments, "scroll"))
-    if name == "targeted_pointer_drag": return text_result(targeted_pointer(arguments, "drag"))
+        return text_result(send_window_shortcut(arguments, owner_thread_id))
+    if name == "targeted_pointer_click":
+        return text_result(targeted_pointer(arguments, "click", owner_thread_id))
+    if name == "targeted_pointer_scroll":
+        return text_result(targeted_pointer(arguments, "scroll", owner_thread_id))
+    if name == "targeted_pointer_drag":
+        return text_result(targeted_pointer(arguments, "drag", owner_thread_id))
     if name == "begin_coordinate_lease":
         window = resolve_window(str(arguments["window"]))
         binding = session_binding()
@@ -1467,7 +1547,7 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
         if method == "initialize":
             requested = (message.get("params") or {}).get("protocolVersion")
             negotiated = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
-            result = {"protocolVersion": negotiated, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate the user's real logged-in Hyprland session. Claim target windows for exact capture and coordinate-fallback ownership, renew longer work, and release them during cleanup. Targeted shortcuts and pointer tools retain single-agent behavior; semantic AT-SPI actions require the separate Computer Use plugin."}
+            result = {"protocolVersion": negotiated, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate the user's real logged-in Hyprland session. Claim each target window before capture or mutation, renew longer work, and release it during cleanup. Different native Wayland windows can progress concurrently; semantic AT-SPI actions require the separate Computer Use plugin."}
         elif method == "tools/list": result = {"tools": TOOLS}
         elif method == "tools/call":
             params = message.get("params") or {}
