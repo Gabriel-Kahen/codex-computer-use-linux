@@ -1898,12 +1898,34 @@ impl CallToolResult {
     }
 
     pub fn as_function_call_output_payload(&self) -> FunctionCallOutputPayload {
-        let content_items = convert_mcp_content_to_items(&self.content);
+        let mut content_items = convert_mcp_content_to_items(&self.content);
+        // `structuredContent` cannot represent model-visible images or encrypted content. Keep
+        // those MCP content blocks rather than silently discarding them in favor of structured
+        // JSON. When an image is present, retain the structured payload as model-visible text
+        // exactly once so metadata such as dimensions and coordinate transforms remains usable.
         if content_items.as_ref().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| matches!(item, FunctionCallOutputContentItem::EncryptedContent { .. }))
+            items.iter().any(|item| {
+                matches!(
+                    item,
+                    FunctionCallOutputContentItem::InputImage { .. }
+                        | FunctionCallOutputContentItem::EncryptedContent { .. }
+                )
+            })
         }) {
+            if let Some(structured_content) = self
+                .structured_content
+                .as_ref()
+                .filter(|structured_content| !structured_content.is_null())
+                && content_items.as_ref().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        matches!(item, FunctionCallOutputContentItem::InputImage { .. })
+                    })
+                })
+            {
+                content_items = content_items.map(|items| {
+                    merge_structured_content_with_mcp_content(items, structured_content)
+                });
+            }
             return FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::ContentItems(content_items.unwrap_or_default()),
                 success: Some(self.success()),
@@ -1953,6 +1975,50 @@ impl CallToolResult {
     pub fn into_function_call_output_payload(self) -> FunctionCallOutputPayload {
         self.as_function_call_output_payload()
     }
+}
+
+fn merge_structured_content_with_mcp_content(
+    items: Vec<FunctionCallOutputContentItem>,
+    structured_content: &serde_json::Value,
+) -> Vec<FunctionCallOutputContentItem> {
+    let structured_text = serde_json::to_string(structured_content)
+        .unwrap_or_else(|error| format!("failed to serialize structured MCP content: {error}"));
+    let mut found_equivalent_text = false;
+    let mut merged = Vec::with_capacity(items.len() + 1);
+
+    for item in items {
+        let is_equivalent_text = match &item {
+            FunctionCallOutputContentItem::InputText { text } => {
+                serde_json::from_str::<serde_json::Value>(text)
+                    .ok()
+                    .as_ref()
+                    == Some(structured_content)
+            }
+            FunctionCallOutputContentItem::InputImage { .. }
+            | FunctionCallOutputContentItem::EncryptedContent { .. } => false,
+        };
+        if is_equivalent_text {
+            if found_equivalent_text {
+                continue;
+            }
+            found_equivalent_text = true;
+            merged.push(FunctionCallOutputContentItem::InputText {
+                text: structured_text.clone(),
+            });
+        } else {
+            merged.push(item);
+        }
+    }
+
+    if !found_equivalent_text {
+        merged.insert(
+            0,
+            FunctionCallOutputContentItem::InputText {
+                text: structured_text,
+            },
+        );
+    }
+    merged
 }
 
 fn convert_mcp_content_to_items(
@@ -2811,6 +2877,114 @@ mod tests {
         assert!(output.is_array(), "expected array output");
 
         Ok(())
+    }
+
+    #[test]
+    fn prefers_mcp_image_content_over_structured_content() {
+        let call_tool_result = CallToolResult {
+            content: vec![
+                serde_json::json!({"type":"text","text":"{\n  \"caption\": \"caption\"\n}"}),
+                serde_json::json!({"type":"text","text":"{\"caption\":\"caption\"}"}),
+                serde_json::json!({"type":"image","data":"BASE64","mimeType":"image/png"}),
+            ],
+            structured_content: Some(serde_json::json!({"caption": "caption"})),
+            is_error: Some(false),
+            meta: None,
+        };
+
+        assert_eq!(
+            call_tool_result.into_function_call_output_payload(),
+            FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: r#"{"caption":"caption"}"#.into(),
+                    },
+                    FunctionCallOutputContentItem::InputImage {
+                        image_url: "data:image/png;base64,BASE64".into(),
+                        detail: Some(DEFAULT_IMAGE_DETAIL),
+                    },
+                ]),
+                success: Some(true),
+            }
+        );
+    }
+
+    #[test]
+    fn inserts_structured_content_before_mcp_image_without_text_fallback() {
+        let call_tool_result = CallToolResult {
+            content: vec![
+                serde_json::json!({"type":"image","data":"BASE64","mimeType":"image/png"}),
+            ],
+            structured_content: Some(serde_json::json!({"width": 800, "height": 600})),
+            is_error: Some(false),
+            meta: None,
+        };
+
+        assert_eq!(
+            call_tool_result.into_function_call_output_payload(),
+            FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: r#"{"height":600,"width":800}"#.into(),
+                    },
+                    FunctionCallOutputContentItem::InputImage {
+                        image_url: "data:image/png;base64,BASE64".into(),
+                        detail: Some(DEFAULT_IMAGE_DETAIL),
+                    },
+                ]),
+                success: Some(true),
+            }
+        );
+    }
+
+    #[test]
+    fn preserves_independent_mcp_caption_with_structured_image_metadata() {
+        let call_tool_result = CallToolResult {
+            content: vec![
+                serde_json::json!({"type":"text","text":"current desktop"}),
+                serde_json::json!({"type":"image","data":"BASE64","mimeType":"image/png"}),
+            ],
+            structured_content: Some(serde_json::json!({"width": 800, "height": 600})),
+            is_error: Some(false),
+            meta: None,
+        };
+
+        assert_eq!(
+            call_tool_result.into_function_call_output_payload(),
+            FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: r#"{"height":600,"width":800}"#.into(),
+                    },
+                    FunctionCallOutputContentItem::InputText {
+                        text: "current desktop".into(),
+                    },
+                    FunctionCallOutputContentItem::InputImage {
+                        image_url: "data:image/png;base64,BASE64".into(),
+                        detail: Some(DEFAULT_IMAGE_DETAIL),
+                    },
+                ]),
+                success: Some(true),
+            }
+        );
+    }
+
+    #[test]
+    fn prefers_structured_content_over_text_only_mcp_content() {
+        let call_tool_result = CallToolResult {
+            content: vec![serde_json::json!({"type":"text","text":"human-readable summary"})],
+            structured_content: Some(serde_json::json!({"result": 42})),
+            is_error: Some(false),
+            meta: None,
+        };
+
+        assert_eq!(
+            call_tool_result.into_function_call_output_payload(),
+            FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text(r#"{"result":42}"#.into()),
+                success: Some(true),
+            }
+        );
     }
 
     #[test]
