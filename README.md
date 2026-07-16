@@ -20,7 +20,7 @@ The Hyprland integration in [`contrib/hyprland-background-computer-use/`](./cont
 
 The GNOME integration in [`contrib/gnome-same-session-computer-use/`](./contrib/gnome-same-session-computer-use/) discovers and captures windows through a GNOME Shell extension. Because GNOME exposes a global input seat, coordinate and keyboard operations require an explicitly acknowledged, journaled focus lease rather than claiming non-interfering background targeting.
 
-The Plasma integration in [`contrib/plasma-same-session-computer-use/`](./contrib/plasma-same-session-computer-use/) adds stable KWin window discovery, exact compositor-side capture, and recoverable focus/restoration leases. It does not claim targeted background input because Plasma exposes one shared input seat.
+The Plasma integration in [`contrib/plasma-same-session-computer-use/`](./contrib/plasma-same-session-computer-use/) adds stable KWin window discovery, cross-process per-window agent claims, parallel exact compositor-side capture, and owner-bound recoverable focus/restoration leases. It serializes its global-seat fallback and does not claim targeted background input because Plasma exposes one shared input seat.
 
 The X11 integration in [`contrib/x11-background-computer-use/`](./contrib/x11-background-computer-use/) supports EWMH window discovery, XComposite capture, and an acknowledged interference lease for desktops running a real Xorg session.
 
