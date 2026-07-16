@@ -3,6 +3,9 @@ import os
 import subprocess
 from pathlib import Path
 from unittest import TestCase
+from unittest.mock import patch
+
+from same_session_computer_use import server
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +20,7 @@ class RepositorySmokeTests(TestCase):
 
         self.assertTrue(launcher.is_file())
         self.assertTrue(os.access(launcher, os.X_OK))
+        self.assertEqual(manifest["version"], server.SERVER_INFO["version"])
 
     def test_mcp_initialize_tools_and_ping(self) -> None:
         requests = [
@@ -35,12 +39,12 @@ class RepositorySmokeTests(TestCase):
         responses = {response["id"]: response for response in map(json.loads, proc.stdout.splitlines())}
 
         self.assertEqual(responses[1]["result"]["protocolVersion"], "2025-11-25")
-        self.assertEqual(responses[1]["result"]["serverInfo"]["version"], "0.1.1")
+        self.assertEqual(responses[1]["result"]["serverInfo"]["version"], "0.2.0")
         self.assertIn("separate Computer Use plugin", responses[1]["result"]["instructions"])
         self.assertEqual(responses[3]["result"], {})
         tools = responses[2]["result"]["tools"]
         names = [tool["name"] for tool in tools]
-        self.assertEqual(len(names), 11)
+        self.assertEqual(len(names), 14)
         self.assertEqual(len(names), len(set(names)))
         for tool in tools:
             schema = tool["inputSchema"]
@@ -54,3 +58,53 @@ class RepositorySmokeTests(TestCase):
         self.assertTrue(annotations["send_window_shortcut"]["openWorldHint"])
         self.assertTrue(annotations["begin_coordinate_lease"]["destructiveHint"])
         self.assertFalse(annotations["begin_coordinate_lease"]["openWorldHint"])
+        schemas = {tool["name"]: tool["inputSchema"] for tool in tools}
+        for name in (
+            "capture_session_window",
+            "begin_coordinate_lease",
+        ):
+            self.assertIn("claim_token", schemas[name]["properties"])
+        lease_seconds = schemas["claim_session_window"]["properties"]["lease_seconds"]
+        self.assertEqual(
+            (lease_seconds["default"], lease_seconds["minimum"], lease_seconds["maximum"]),
+            (60, 5, 300),
+        )
+        self.assertEqual(
+            schemas["release_session_window"]["required"], ["claim_token"]
+        )
+
+    def test_tools_call_uses_only_the_host_metadata_owner(self) -> None:
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "claim_session_window",
+                "arguments": {"window": "0x1", "_meta": {"threadId": "spoofed"}},
+                "_meta": {"threadId": "trusted-owner"},
+            },
+        }
+        with patch.object(server, "call_tool", return_value={"ok": True}) as call:
+            response = server.dispatch(request)
+
+        self.assertEqual(response["result"], {"ok": True})
+        call.assert_called_once_with(
+            "claim_session_window",
+            {"window": "0x1", "_meta": {"threadId": "spoofed"}},
+            "trusted-owner",
+        )
+
+    def test_claim_tool_rejects_argument_metadata_spoofing(self) -> None:
+        response = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "claim_session_window",
+                    "arguments": {"window": "0x1", "_meta": {"threadId": "spoofed"}},
+                },
+            }
+        )
+
+        self.assertIn("requires host-provided _meta.threadId", response["error"]["message"])
