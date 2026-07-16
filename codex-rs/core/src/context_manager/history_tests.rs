@@ -1197,7 +1197,7 @@ fn record_items_truncates_function_call_output_content() {
 #[test]
 fn record_items_truncates_custom_tool_call_output_content() {
     let mut history = ContextManager::new();
-    let policy = TruncationPolicy::Tokens(1_000);
+    let policy = TruncationPolicy::Tokens(100_000);
     let line = "custom output that is very long\n";
     let long_output = line.repeat(2_500);
     let item = ResponseItem::CustomToolCallOutput {
@@ -1211,6 +1211,7 @@ fn record_items_truncates_custom_tool_call_output_content() {
     history.record_items([&item], policy);
 
     assert_eq!(history.items.len(), 1);
+    assert!(estimate_item_token_count(&history.items[0]) <= 10_000);
     match &history.items[0] {
         ResponseItem::CustomToolCallOutput { output, .. } => {
             let output = output.text_content().unwrap_or_default();
@@ -1254,6 +1255,125 @@ fn record_items_respects_custom_token_limit() {
             .text_content()
             .is_some_and(|content| content.contains("tokens truncated"))
     );
+}
+
+#[test]
+fn record_items_hard_caps_mixed_text_and_images_by_detail() {
+    let default_urls = (0..7)
+        .map(|index| format!("data:image/png;base64,IMAGE-{index}"))
+        .collect::<Vec<_>>();
+    let image = ImageBuffer::from_pixel(2304, 864, Rgba([12u8, 34, 56, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, ImageFormat::Png)
+        .expect("encode png");
+    let original_url = format!(
+        "data:image/png;base64,{}",
+        BASE64_STANDARD.encode(bytes.get_ref())
+    );
+    for (image_urls, detail, retained) in [
+        (default_urls, DEFAULT_IMAGE_DETAIL, 5),
+        (vec![original_url; 6], ImageDetail::Original, 5),
+    ] {
+        let content = std::iter::once(FunctionCallOutputContentItem::InputText {
+            text: format!(
+                "leading {} trailing {}",
+                "a".repeat(40_000),
+                "z".repeat(40_000)
+            ),
+        })
+        .chain(
+            image_urls
+                .iter()
+                .map(|image_url| FunctionCallOutputContentItem::InputImage {
+                    image_url: image_url.clone(),
+                    detail: Some(detail),
+                }),
+        )
+        .collect();
+        let item = ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-hard-cap".to_string(),
+            output: FunctionCallOutputPayload::from_content_items(content),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let stored = ContextManager::new().process_item(&item, TruncationPolicy::Tokens(100_000));
+        assert!(estimate_item_token_count(&stored) <= 10_000);
+        let ResponseItem::FunctionCallOutput { output, .. } = stored else {
+            panic!("expected function output");
+        };
+        let FunctionCallOutputBody::ContentItems(items) = output.body else {
+            panic!("expected content items");
+        };
+        assert_eq!(
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    FunctionCallOutputContentItem::InputImage { image_url, .. } => Some(image_url),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            image_urls[..retained].iter().collect::<Vec<_>>()
+        );
+        assert!(items.iter().any(|item| matches!(
+            item,
+            FunctionCallOutputContentItem::InputText { text }
+                if text.contains(&format!("omitted {}", image_urls.len() - retained))
+        )));
+    }
+}
+
+#[test]
+fn for_prompt_removes_pairs_with_oversized_output_envelopes() {
+    let pair = |call_id: String, turn_id: Option<String>| {
+        let metadata = Some(InternalChatMessageMetadataPassthrough { turn_id });
+        [
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "tool".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: call_id.clone(),
+                internal_chat_message_metadata_passthrough: metadata.clone(),
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id,
+                output: FunctionCallOutputPayload::from_text("ok".to_string()),
+                internal_chat_message_metadata_passthrough: metadata,
+            },
+        ]
+    };
+    let normal_pair = pair("normal".to_string(), None);
+    let oversized_call_id_pair = pair("c".repeat(40_001), None);
+    let oversized_turn_id_pair = pair("oversized-turn".to_string(), Some("t".repeat(40_001)));
+    let oversized_custom_id = "u".repeat(40_001);
+    let oversized_custom_call = ResponseItem::CustomToolCall {
+        id: None,
+        status: None,
+        call_id: oversized_custom_id.clone(),
+        name: "custom".to_string(),
+        namespace: None,
+        input: String::new(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let oversized_custom_output = custom_tool_call_output(&oversized_custom_id, "ok");
+    let mut history = ContextManager::new();
+    history.record_items(
+        normal_pair
+            .iter()
+            .chain(&oversized_call_id_pair)
+            .chain(std::iter::once(&oversized_call_id_pair[0]))
+            .chain(&oversized_turn_id_pair)
+            .chain([
+                &oversized_custom_call,
+                &oversized_custom_call,
+                &oversized_custom_output,
+            ]),
+        TruncationPolicy::Tokens(100_000),
+    );
+
+    assert_eq!(history.for_prompt(&default_input_modalities()), normal_pair);
 }
 
 fn assert_truncated_message_matches(message: &str, line: &str, expected_removed: usize) {

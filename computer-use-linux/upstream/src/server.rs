@@ -277,6 +277,7 @@ impl ComputerUseLinux {
     #[tool(
         name = "get_app_state",
         description = "Start an app use session if needed, then get a size-bounded screenshot and accessibility state for a Linux app. Screenshot results include coordinate_width, coordinate_height, scale, format, and quality when the returned image is downscaled or compressed; callers can request jpeg/quality for compression before resizing.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<GetAppStateOutput>(),
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -287,7 +288,7 @@ impl ComputerUseLinux {
     async fn get_app_state(
         &self,
         Parameters(params): Parameters<GetAppStateParams>,
-    ) -> Json<GetAppStateOutput> {
+    ) -> Result<CallToolResult, ErrorData> {
         let verbose = params.verbose.unwrap_or(false);
         let diagnostics = doctor_report();
         let (window_context, window_error, window_permissions_hint) =
@@ -398,13 +399,13 @@ impl ComputerUseLinux {
         {
             message.push_str(" Pass verbose=true for full diagnostics.");
         }
-        Json(GetAppStateOutput {
+        let output = GetAppStateOutput {
             app_name_or_bundle_identifier: params.app_name_or_bundle_identifier,
             window_context,
             window_error,
             window_permissions_hint,
             backend: "linux-atspi".to_string(),
-            screenshot,
+            screenshot: screenshot.as_ref().map(ScreenshotMetadata::from),
             screenshot_error,
             accessibility_tree,
             accessibility_tree_raw_count,
@@ -412,7 +413,8 @@ impl ComputerUseLinux {
             readiness,
             diagnostics: include_full.then_some(diagnostics),
             message,
-        })
+        };
+        app_state_tool_result(output, screenshot.as_ref())
     }
 
     #[tool(
@@ -1351,6 +1353,23 @@ impl ComputerUseLinux {
     }
 }
 
+fn app_state_tool_result(
+    output: GetAppStateOutput,
+    screenshot: Option<&ScreenshotCapture>,
+) -> Result<CallToolResult, ErrorData> {
+    let value = serde_json::to_value(output).map_err(|error| {
+        ErrorData::internal_error(format!("failed to serialize app state: {error}"), None)
+    })?;
+    let mut result = CallToolResult::structured(value);
+    if let Some(screenshot) = screenshot {
+        result.content.push(Content::image(
+            data_url_payload(&screenshot.data_url),
+            screenshot.mime_type.clone(),
+        ));
+    }
+    Ok(result)
+}
+
 #[tool_handler(
     router = self.mcp_tool_router(),
     name = "computer-use-linux",
@@ -1358,7 +1377,7 @@ impl ComputerUseLinux {
     // The rmcp tool_handler macro only accepts a string literal here, so this
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
-    version = "0.4.1",
+    version = "0.5.0",
     instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
@@ -1654,7 +1673,7 @@ struct GetAppStateOutput {
     window_error: Option<String>,
     window_permissions_hint: Option<String>,
     backend: String,
-    screenshot: Option<ScreenshotCapture>,
+    screenshot: Option<ScreenshotMetadata>,
     screenshot_error: Option<String>,
     accessibility_tree: Vec<AccessibilityNode>,
     accessibility_tree_raw_count: usize,
@@ -1665,6 +1684,43 @@ struct GetAppStateOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<DoctorReport>,
     message: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ScreenshotMetadata {
+    mime_type: String,
+    source: String,
+    width: u32,
+    height: u32,
+    coordinate_width: u32,
+    coordinate_height: u32,
+    scale: f32,
+    resized: bool,
+    bytes: usize,
+    original_bytes: usize,
+    max_bytes: usize,
+    format: ScreenshotOutputFormat,
+    quality: Option<u8>,
+}
+
+impl From<&ScreenshotCapture> for ScreenshotMetadata {
+    fn from(capture: &ScreenshotCapture) -> Self {
+        Self {
+            mime_type: capture.mime_type.clone(),
+            source: capture.source.clone(),
+            width: capture.width,
+            height: capture.height,
+            coordinate_width: capture.coordinate_width,
+            coordinate_height: capture.coordinate_height,
+            scale: capture.scale,
+            resized: capture.resized,
+            bytes: capture.bytes,
+            original_bytes: capture.original_bytes,
+            max_bytes: capture.max_bytes,
+            format: capture.format,
+            quality: capture.quality,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -3912,6 +3968,76 @@ mod tests {
             unsupported.is_empty(),
             "unsupported unsigned integer formats: {unsupported:?}"
         );
+    }
+
+    #[test]
+    fn get_app_state_schema_describes_metadata_without_embedded_image_data() {
+        let tool = ComputerUseLinux::default()
+            .mcp_tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "get_app_state")
+            .unwrap();
+        let schema = serde_json::to_string(&tool.output_schema).unwrap();
+
+        assert!(tool.output_schema.is_some());
+        assert!(schema.contains("coordinate_width"));
+        assert!(!schema.contains("data_url"));
+    }
+
+    #[test]
+    fn app_state_result_carries_image_bytes_once_and_metadata_as_structured_content() {
+        let capture = ScreenshotCapture {
+            mime_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,AAAA".to_string(),
+            source: "test".to_string(),
+            width: 2,
+            height: 1,
+            coordinate_width: 4,
+            coordinate_height: 2,
+            scale: 0.5,
+            resized: true,
+            bytes: 3,
+            original_bytes: 6,
+            max_bytes: 1024,
+            format: ScreenshotOutputFormat::Png,
+            quality: None,
+        };
+        let diagnostics = doctor_report();
+        let output = GetAppStateOutput {
+            app_name_or_bundle_identifier: Some("example.app".to_string()),
+            window_context: None,
+            window_error: None,
+            window_permissions_hint: None,
+            backend: "linux-atspi".to_string(),
+            screenshot: Some(ScreenshotMetadata::from(&capture)),
+            screenshot_error: None,
+            accessibility_tree: Vec::new(),
+            accessibility_tree_raw_count: 0,
+            accessibility_error: None,
+            readiness: diagnostics.readiness,
+            diagnostics: None,
+            message: "ready".to_string(),
+        };
+
+        let result = app_state_tool_result(output, Some(&capture)).unwrap();
+        let structured = result.structured_content.as_ref().unwrap();
+        let text: serde_json::Value = serde_json::from_str(
+            result.content[0]
+                .raw
+                .as_text()
+                .expect("first content block should be text")
+                .text
+                .as_str(),
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&result).unwrap();
+
+        assert_eq!(&text, structured);
+        assert_eq!(structured["screenshot"]["coordinate_width"], 4);
+        assert!(structured["screenshot"].get("data_url").is_none());
+        assert_eq!(serialized.matches("AAAA").count(), 1);
+        assert_eq!(result.content.len(), 2);
     }
 
     fn collect_unsigned_integer_formats(

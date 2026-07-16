@@ -325,6 +325,7 @@ impl TestToolServer {
     ///   - `mcpimg.image_scenario({"scenario":"invalid_image_bytes_then_image"})`
     ///   - `mcpimg.image_scenario({"scenario":"multiple_valid_images"})`
     ///   - `mcpimg.image_scenario({"scenario":"image_then_text","caption":"Here is the image:"})`
+    ///   - `mcpimg.image_scenario({"scenario":"structured_text_image_text"})`
     ///   - `mcpimg.image_scenario({"scenario":"text_only","caption":"Here is the image:"})`
     /// - You should see an extra history cell: `tool result (image output)`.
     fn image_scenario_tool() -> Tool {
@@ -342,10 +343,12 @@ impl TestToolServer {
                         "invalid_image_bytes_then_image",
                         "multiple_valid_images",
                         "image_then_text",
+                        "structured_text_image_text",
                         "text_only"
                     ]
                 },
                 "caption": { "type": "string" },
+                "trailing_caption": { "type": "string" },
                 "data_url": {
                     "type": "string",
                     "description": "Optional data URL like data:image/png;base64,AAAA...; if omitted, uses a built-in tiny PNG."
@@ -457,6 +460,7 @@ enum ImageScenario {
     InvalidImageBytesThenImage,
     MultipleValidImages,
     ImageThenText,
+    StructuredTextImageText,
     TextOnly,
 }
 
@@ -465,6 +469,8 @@ struct ImageScenarioArgs {
     scenario: ImageScenario,
     #[serde(default)]
     caption: Option<String>,
+    #[serde(default)]
+    trailing_caption: Option<String>,
     #[serde(default)]
     data_url: Option<String>,
 }
@@ -740,6 +746,11 @@ impl TestToolServer {
         let caption = args
             .caption
             .unwrap_or_else(|| "Here is the image:".to_string());
+        let trailing_caption = args
+            .trailing_caption
+            .unwrap_or_else(|| "Image captured.".to_string());
+        let has_structured_content =
+            matches!(&args.scenario, ImageScenario::StructuredTextImageText);
 
         let mut content = Vec::new();
         match args.scenario {
@@ -790,12 +801,25 @@ impl TestToolServer {
                 content.push(rmcp::model::Content::image(valid_data_b64, mime_type));
                 content.push(rmcp::model::Content::text(caption));
             }
+            ImageScenario::StructuredTextImageText => {
+                content.push(rmcp::model::Content::text(caption));
+                content.push(rmcp::model::Content::image(valid_data_b64, mime_type));
+                content.push(rmcp::model::Content::text(trailing_caption));
+            }
             ImageScenario::TextOnly => {
                 content.push(rmcp::model::Content::text(caption));
             }
         }
 
-        Ok(CallToolResult::success(content))
+        let mut result = CallToolResult::success(content);
+        if has_structured_content {
+            result.structured_content = Some(json!({
+                "coordinate_height": 600,
+                "coordinate_width": 800,
+                "scale": 1.0,
+            }));
+        }
+        Ok(result)
     }
 
     async fn sync_result(args: SyncArgs) -> Result<CallToolResult, McpError> {
