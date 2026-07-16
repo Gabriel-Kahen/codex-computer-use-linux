@@ -14,6 +14,8 @@ MAX_LEASE_TOKEN_CHARS = 96
 LEASE_TOKEN_PATTERN = r"[A-Za-z0-9_-]{24,64}"
 MAX_DIAGNOSTIC_CHARS = 512
 MAX_DIAGNOSTIC_BYTES = 2 * 1024
+MAX_DIAGNOSTICS_BYTES = 1024
+MAX_FOCUS_RESULT_BYTES = 4 * 1024
 
 
 def _diagnostic(prefix: str, value: Any) -> str:
@@ -22,6 +24,32 @@ def _diagnostic(prefix: str, value: Any) -> str:
         MAX_DIAGNOSTIC_CHARS,
         MAX_DIAGNOSTIC_BYTES,
     )
+
+
+def _bounded_result(value: dict[str, Any]) -> dict[str, Any]:
+    errors = []
+    for error in value.get("errors") or []:
+        diagnostic = coordination._truncate_json_text(
+            error,
+            MAX_DIAGNOSTIC_CHARS,
+            MAX_DIAGNOSTICS_BYTES - 4,
+        )
+        if coordination.serialized_size([*errors, diagnostic]) > MAX_DIAGNOSTICS_BYTES:
+            break
+        errors.append(diagnostic)
+    value["errors"] = errors
+    if coordination.serialized_size(value) > MAX_FOCUS_RESULT_BYTES:
+        raise RuntimeError("focus lease result exceeds its serialized size limit")
+    return value
+
+
+def _optional_window_id(value: Any, name: str) -> str | None:
+    if value is None or value == "":
+        return None
+    try:
+        return coordination.require_window_id(value)
+    except ValueError as exc:
+        raise RuntimeError(f"focus lease {name} is invalid") from exc
 
 
 def require_lease_token(value: Any) -> str:
@@ -192,20 +220,26 @@ def _finish_restore(
     observed_pointer: dict[str, int] | None,
 ) -> dict[str, Any]:
     original = state.get("original") or {}
-    active_id = str(original.get("active_window") or "")
-    target_desktop = original.get("target_desktop")
+    active_id = _optional_window_id(original.get("active_window"), "original active window") or ""
+    desktop = coordination.optional_desktop(original.get("desktop"), "focus lease desktop")
+    target_desktop = coordination.optional_desktop(original.get("target_desktop"), "focus lease target desktop")
+    pointer = coordination.optional_pointer(original.get("pointer"))
+    observed_pointer = coordination.optional_pointer(observed_pointer)
     claim = state.get("window_claim") or {}
     claim_released = None
+    claim_cleanup = None
     claim_release_error = None
     recovery_complete = not errors
     if recovery_complete and claim.get("implicit") is True:
         try:
-            claim_released = coordination.discard_bound_claim(
+            cleanup = coordination.discard_bound_claim(
                 coordination.require_claim_token(claim.get("claim_token")),
                 coordination.require_window_id(claim.get("window_id")),
                 coordination.require_thread_id((state.get("owner") or {}).get("thread_id")),
             )
-            if not claim_released:
+            claim_cleanup = cleanup.value
+            claim_released = cleanup is coordination.ClaimCleanupResult.RELEASED
+            if cleanup is coordination.ClaimCleanupResult.BLOCKED:
                 claim_release_error = "implicit window claim could not be verified and released"
                 errors.append(claim_release_error)
                 recovery_complete = False
@@ -224,7 +258,7 @@ def _finish_restore(
                 recovery_complete = False
         else:
             LEASE_FILE.unlink(missing_ok=True)
-    return {
+    return _bounded_result({
         "restored": recovery_complete and not missing_windows,
         "recovery_complete": recovery_complete,
         "errors": errors,
@@ -232,22 +266,23 @@ def _finish_restore(
         "verified": verified,
         "journal_retained": not recovery_complete,
         "focus_restored_to": active_id if verified.get("focus") else None,
-        "desktop_restored_to": original.get("desktop") if verified.get("desktop") else None,
+        "desktop_restored_to": desktop if verified.get("desktop") else None,
         "target_desktop_restored_to": target_desktop if verified.get("target_desktop") else None,
         "requested_focus_restore": active_id or None,
-        "requested_desktop_restore": original.get("desktop"),
+        "requested_desktop_restore": desktop,
         "requested_target_desktop_restore": target_desktop,
-        "pointer_restore_required": original.get("pointer") is not None and not verified.get("pointer", False),
-        "pointer_restore_coordinate": original.get("pointer"),
+        "pointer_restore_required": pointer is not None and not verified.get("pointer", False),
+        "pointer_restore_coordinate": pointer,
         "observed_pointer": observed_pointer,
         "pointer_restored_by_this_backend": False,
         "window_claim_released": claim_released,
+        "window_claim_cleanup": claim_cleanup,
         "window_claim_release_error": claim_release_error,
-    }
+    })
 
 
 def _stale_restore_result(message: str) -> dict[str, Any]:
-    return {
+    return _bounded_result({
         "restored": False,
         "recovery_complete": False,
         "errors": [message],
@@ -265,8 +300,9 @@ def _stale_restore_result(message: str) -> dict[str, Any]:
         "observed_pointer": None,
         "pointer_restored_by_this_backend": False,
         "window_claim_released": None,
+        "window_claim_cleanup": None,
         "window_claim_release_error": None,
-    }
+    })
 
 
 def restore(state: dict[str, Any]) -> dict[str, Any]:
@@ -279,6 +315,16 @@ def restore(state: dict[str, Any]) -> dict[str, Any]:
             return _stale_restore_result("focus lease journal could not be verified; stale restoration was refused")
     original = state.get("original") or {}
     target = state.get("target") or {}
+    if not isinstance(original, dict) or not isinstance(target, dict):
+        raise RuntimeError("focus lease restoration metadata is invalid")
+    active_id = _optional_window_id(original.get("active_window"), "original active window") or ""
+    desktop = coordination.optional_desktop(original.get("desktop"), "focus lease desktop")
+    target_desktop = coordination.optional_desktop(original.get("target_desktop"), "focus lease target desktop")
+    target_minimized = original.get("target_minimized")
+    if target_minimized is not None and type(target_minimized) is not bool:
+        raise RuntimeError("focus lease target minimized state is invalid")
+    original_pointer = coordination.optional_pointer(original.get("pointer"))
+    target_id = _optional_window_id(target.get("id"), "target window") or ""
     errors: list[str] = []
     missing_windows: list[str] = []
     verified: dict[str, bool] = {}
@@ -313,26 +359,24 @@ def restore(state: dict[str, Any]) -> dict[str, Any]:
         return _finish_restore(state, errors, missing_windows, verified, None)
     if not _recorded_session_is_current(recorded_session, errors, "immediately before restoration mutations"):
         return _finish_restore(state, errors, missing_windows, verified, None)
-    target_id = str(target.get("id") or "")
-    target_desktop = original.get("target_desktop")
     if not target_id:
         errors.append("restoration journal has no target window id")
     elif target_id not in live_ids and not errors:
         missing_windows.append(f"target:{target_id}")
     elif target_id in live_ids and target_desktop is not None:
         try:
-            kwin.set_window_desktop(target_id, int(target_desktop))
+            kwin.set_window_desktop(target_id, target_desktop)
             observed_desktop = kwin.window_desktop(target_id)
-            verified["target_desktop"] = observed_desktop == int(target_desktop)
+            verified["target_desktop"] = observed_desktop == target_desktop
             if not verified["target_desktop"]:
                 errors.append(_diagnostic("target desktop verification: ", f"expected {target_desktop}, observed {observed_desktop}"))
         except Exception as exc:
             errors.append(_diagnostic("target desktop restore: ", exc))
-        if original.get("target_minimized") is not None:
+        if target_minimized is not None:
             try:
-                kwin.set_window_minimized(target_id, bool(original["target_minimized"]))
+                kwin.set_window_minimized(target_id, target_minimized)
                 observed_minimized = kwin.window_boolean(target_id, "minimized")
-                verified["target_minimized"] = observed_minimized is bool(original["target_minimized"])
+                verified["target_minimized"] = observed_minimized is target_minimized
                 if not verified["target_minimized"]:
                     errors.append(_diagnostic(
                         "target minimized-state verification: ",
@@ -340,12 +384,11 @@ def restore(state: dict[str, Any]) -> dict[str, Any]:
                     ))
             except Exception as exc:
                 errors.append(_diagnostic("target minimized-state restore: ", exc))
-    if original.get("desktop") is not None:
+    if desktop is not None:
         try:
-            kwin.set_desktop(int(original["desktop"]))
+            kwin.set_desktop(desktop)
         except Exception as exc:
             errors.append(_diagnostic("desktop restore: ", exc))
-    active_id = str(original.get("active_window") or "")
     if not active_id:
         errors.append("restoration journal has no original active window id")
     elif active_id not in live_ids and not errors:
@@ -355,10 +398,10 @@ def restore(state: dict[str, Any]) -> dict[str, Any]:
             kwin.activate(active_id)
         except Exception as exc:
             errors.append(_diagnostic("focus restore: ", exc))
-    if original.get("desktop") is not None:
+    if desktop is not None:
         try:
             observed_desktop = kwin.current_desktop()
-            verified["desktop"] = observed_desktop == int(original["desktop"])
+            verified["desktop"] = observed_desktop == desktop
             if not verified["desktop"]:
                 errors.append(_diagnostic(
                     "desktop verification: ",
@@ -374,7 +417,6 @@ def restore(state: dict[str, Any]) -> dict[str, Any]:
                 errors.append(_diagnostic("focus verification: ", f"expected {active_id}, observed {observed_active}"))
         except Exception as exc:
             errors.append(_diagnostic("focus verification: ", exc))
-    original_pointer = original.get("pointer")
     observed_pointer = None
     if original_pointer is not None:
         try:
@@ -413,13 +455,13 @@ def begin(arguments: dict[str, Any], owner_id: str | None = None) -> dict[str, A
         raise RuntimeError("focus lease refused because the target desktop could not be queried")
     if target.get("minimized") is None:
         raise RuntimeError("focus lease refused because KWin minimized state could not be read through qdbus")
-    pointer = kwin.pointer_position()
+    pointer = coordination.optional_pointer(kwin.pointer_position())
     if pointer is None:
         raise RuntimeError("focus lease refused because the physical pointer position could not be journaled")
-    original_active = kwin.active_window_id()
+    original_active = _optional_window_id(kwin.active_window_id(), "original active window")
     if original_active is None or not kwin.window_info(original_active):
         raise RuntimeError("focus lease refused because the original active window could not be positively identified")
-    original_desktop = kwin.current_desktop()
+    original_desktop = coordination.optional_desktop(kwin.current_desktop(), "focus lease desktop")
     if coordination.current_session_identity() != session:
         raise RuntimeError("KWin session identity changed while snapshotting the focus lease")
     token = secrets.token_urlsafe(18)
@@ -480,7 +522,7 @@ def begin(arguments: dict[str, Any], owner_id: str | None = None) -> dict[str, A
         restored = restore(state)
         suffix = "" if restored["recovery_complete"] else f"; restoration also failed: {restored['errors']}"
         raise RuntimeError(f"focus lease activation failed: {exc}{suffix}") from exc
-    return {
+    return _bounded_result({
         "lease_token": token,
         "expires_at": state["expires_at"],
         "window": target_for_model,
@@ -496,7 +538,7 @@ def begin(arguments: dict[str, Any], owner_id: str | None = None) -> dict[str, A
         "external_input_gated_by_broker": False,
         "token_scope": "this thread's broker-owned global-seat and restoration journal only",
         "deadline_scope": "advisory revalidation and recovery only; it does not disable external input",
-    }
+    })
 
 
 def validate(state: dict[str, Any], owner_id: str | None = None) -> dict[str, Any]:
@@ -505,7 +547,7 @@ def validate(state: dict[str, Any], owner_id: str | None = None) -> dict[str, An
         owner_id or (state.get("owner") or {}).get("thread_id") or coordination.legacy_owner_id()
     )
     errors: list[str] = []
-    target_id = str((state.get("target") or {}).get("id") or "")
+    target_id = _optional_window_id((state.get("target") or {}).get("id"), "target window") or ""
     claim = state.get("window_claim") or {}
     claim_active = True
     if claim:
@@ -524,7 +566,7 @@ def validate(state: dict[str, Any], owner_id: str | None = None) -> dict[str, An
         errors.append(_diagnostic("window enumeration: ", exc))
         live_ids = set()
     locked = kwin.screen_locked()
-    active_id = kwin.active_window_id()
+    active_id = _optional_window_id(kwin.active_window_id(), "observed active window")
     expired = time.time() >= int(state.get("expires_at") or 0)
     target_live = target_id in live_ids
     target_active = bool(target_id) and active_id == target_id
@@ -537,9 +579,10 @@ def validate(state: dict[str, Any], owner_id: str | None = None) -> dict[str, An
         and claim_active
         and not errors
     )
-    return {
+    phase = state.get("phase") if state.get("phase") in {"prepared", "active"} else "unknown"
+    return _bounded_result({
         "advisory_ready": advisory_ready,
-        "phase": state.get("phase"),
+        "phase": phase,
         "expired": expired,
         "session_locked": locked,
         "target_live": target_live,
@@ -554,7 +597,7 @@ def validate(state: dict[str, Any], owner_id: str | None = None) -> dict[str, An
             "Begin that one action only when advisory_ready is true. The broker serializes its focus leases, "
             "but the separate input plugin cannot consume this token, so this boundary remains caller-enforced."
         ),
-    }
+    })
 
 
 # Keep the extraction-stage server compatible until broker routing migrates.
