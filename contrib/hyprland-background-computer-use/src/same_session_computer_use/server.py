@@ -10,9 +10,11 @@ import tempfile
 import threading
 import time
 import zlib
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from . import coordination
 from .native_plugin import STATE_DIR
 from .native_plugin import ensure_native_input_safe
 from .native_plugin import ensure_target_pointer_plugin
@@ -31,11 +33,14 @@ MAX_ERROR_ITEMS = 8
 MAX_WINDOW_RESULT_BYTES = 32 * 1024
 MAX_WINDOWS_PER_PAGE = 20
 MAX_WINDOW_TEXT_CHARS = 512
+# These two paths are retained as the migration source and global migration lock.
 LEASE_FILE = STATE_DIR / "coordinate-lease.json"
 LOCK_FILE = STATE_DIR / "coordinate-lease.lock"
 POINTER_LOCK_FILE = STATE_DIR / "pointer-transaction.lock"
 POINTER_LOCK = threading.Lock()
 _SESSION_ATTACHED = False
+_SESSION_ENV_LOCK = threading.Lock()
+_LEASE_GUARD_LOCAL = threading.local()
 
 TOOLS = [
     {
@@ -187,7 +192,7 @@ def find_xwayland_display(instance: str, wayland_display: str, proc_root: Path =
     return max(candidates)[1] if candidates else None
 
 
-def ensure_session_environment() -> None:
+def _attach_session_environment() -> None:
     global _SESSION_ATTACHED
     if _SESSION_ATTACHED:
         return
@@ -220,6 +225,23 @@ def ensure_session_environment() -> None:
         if len(sockets) == 1 and sockets[0].name[1:].isdigit():
             os.environ["DISPLAY"] = f":{sockets[0].name[1:]}"
     _SESSION_ATTACHED = True
+
+
+def ensure_session_environment() -> None:
+    if _SESSION_ATTACHED:
+        return
+    with _SESSION_ENV_LOCK:
+        _attach_session_environment()
+
+
+def session_binding() -> dict[str, Any]:
+    ensure_session_environment()
+    return {
+        "uid": os.getuid(),
+        "xdg_runtime_dir": os.environ.get("XDG_RUNTIME_DIR"),
+        "wayland_display": os.environ.get("WAYLAND_DISPLAY"),
+        "hyprland_instance": os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"),
+    }
 
 
 def hypr_windows() -> list[dict[str, Any]]:
@@ -307,20 +329,130 @@ def hypr_dispatch(expression: str) -> None:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"Hyprland dispatch failed: {expression}")
 
 
+def lease_file(binding: dict[str, Any] | None = None) -> Path:
+    key = coordination.binding_key(binding or session_binding())
+    return LEASE_FILE.parent / "coordinate-leases" / key / "lease.json"
+
+
+def lease_lock_file(binding: dict[str, Any] | None = None) -> Path:
+    key = coordination.binding_key(binding or session_binding())
+    return LOCK_FILE.parent / "coordinate-leases" / key / "lease.lock"
+
+
+def _read_lease(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    path.parent.chmod(0o700)
+    try:
+        path.chmod(0o600)
+        state = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"coordinate lease state is unreadable: {exc}") from exc
+    if not isinstance(state, dict):
+        raise RuntimeError("coordinate lease state has an unsupported format")
+    return state
+
+
+def legacy_lease_matches_current_session(state: dict[str, Any]) -> bool:
+    """Identify an unbound 0.1.x journal from live compositor artifacts."""
+    output = str(state.get("output") or "")
+    if output and any(
+        str(monitor.get("name") or "") == output
+        for monitor in hypr_json(["monitors"])
+    ):
+        return True
+    target = state.get("target") or {}
+    target_pid = target.get("pid")
+    if type(target_pid) is not int or target_pid <= 0:
+        return False
+    target_capture_id = str(target.get("capture_id") or "")
+    target_address = str(target.get("address") or "")
+    return any(
+        window.get("pid") == target_pid
+        and (
+            (
+                bool(target_capture_id)
+                and str(window.get("capture_id") or "") == target_capture_id
+            )
+            or (
+                bool(target_address)
+                and str(window.get("address") or "") == target_address
+            )
+        )
+        for window in combine_windows()
+    )
+
+
+def _load_lease_unlocked() -> dict[str, Any] | None:
+    current_binding = session_binding()
+    active_path = lease_file(current_binding)
+    state = _read_lease(active_path)
+    if state is None and LEASE_FILE != active_path:
+        legacy = _read_lease(LEASE_FILE)
+        legacy_binding = legacy.get("session") if legacy is not None else None
+        unbound_matches = bool(
+            legacy is not None
+            and legacy_binding is None
+            and legacy_lease_matches_current_session(legacy)
+        )
+        if legacy is not None and (
+            legacy_binding == current_binding or unbound_matches
+        ):
+            active_path.parent.mkdir(parents=True, exist_ok=True)
+            active_path.parent.chmod(0o700)
+            if legacy_binding is None:
+                legacy["session"] = current_binding
+                coordination.atomic_write_json(active_path, legacy)
+                LEASE_FILE.unlink(missing_ok=True)
+                state = legacy
+            else:
+                try:
+                    LEASE_FILE.replace(active_path)
+                except FileNotFoundError:
+                    state = _read_lease(active_path)
+                else:
+                    active_path.chmod(0o600)
+                    state = legacy
+    if state is None:
+        return None
+    stored_binding = state.get("session")
+    if stored_binding is not None and stored_binding != current_binding:
+        raise RuntimeError("coordinate lease belongs to a different display or Hyprland instance")
+    return state
+
+
 def load_lease() -> dict[str, Any] | None:
-    if not LEASE_FILE.exists(): return None
-    return json.loads(LEASE_FILE.read_text())
+    if getattr(_LEASE_GUARD_LOCAL, "depth", 0):
+        return _load_lease_unlocked()
+    with lease_guard():
+        return _load_lease_unlocked()
 
 
 def save_lease(state: dict[str, Any]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    temp = LEASE_FILE.with_suffix(".tmp")
-    temp.write_text(json.dumps(state, indent=2))
-    temp.replace(LEASE_FILE)
+    coordination.atomic_write_json(lease_file(), state)
 
 
+@contextmanager
 def lease_guard():
-    return file_guard(LOCK_FILE)
+    # Serialize migration from the 0.1.x global file, then isolate live state by
+    # Wayland display and Hyprland instance so another login cannot wedge this one.
+    depth = getattr(_LEASE_GUARD_LOCAL, "depth", 0)
+    if depth:
+        _LEASE_GUARD_LOCAL.depth = depth + 1
+        try:
+            yield
+        finally:
+            _LEASE_GUARD_LOCAL.depth = depth
+        return
+    with file_guard(LOCK_FILE):
+        with file_guard(lease_lock_file()):
+            _LEASE_GUARD_LOCAL.depth = 1
+            try:
+                yield
+            finally:
+                _LEASE_GUARD_LOCAL.depth = 0
 
 
 def wait_for_monitor(name: str, *, present: bool, timeout: float = 5.0) -> dict[str, Any] | None:
@@ -362,7 +494,8 @@ def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
     token = secrets.token_urlsafe(18)
     output = f"CODEX-CU-{token[:8]}"
     state = {
-        "version": 2,
+        "version": 3,
+        "session": session_binding(),
         "token": token,
         "phase": "creating",
         "output": output,
@@ -424,6 +557,9 @@ def require_lease(token: str) -> dict[str, Any]:
 
 
 def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
+    binding = state.get("session")
+    if binding is not None and binding != session_binding():
+        raise RuntimeError("refusing to restore a coordinate lease on a different Hyprland instance")
     errors: list[str] = []
     address = str((state.get("target") or {}).get("address") or "")
     original = state.get("original") or {}
@@ -459,7 +595,10 @@ def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
     if cursor.get("x") is not None and cursor.get("y") is not None:
         try: hypr_dispatch(f"hl.dsp.cursor.move({{ x = {int(cursor['x'])}, y = {int(cursor['y'])} }})")
         except Exception as exc: errors.append(f"pointer restore: {exc}")
-    if not errors: LEASE_FILE.unlink(missing_ok=True)
+    if not errors:
+        (lease_file(binding) if binding is not None else LEASE_FILE).unlink(
+            missing_ok=True
+        )
     return {
         "restored": not errors,
         "errors": [bounded_error(error) for error in errors[:MAX_ERROR_ITEMS]],
