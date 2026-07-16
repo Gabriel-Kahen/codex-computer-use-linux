@@ -147,7 +147,7 @@ TOOLS = [
     tool("list_window_claims", "List active, session-bound window claims after pruning expired agent ownership.", {}, read_only=True, idempotent=True),
     tool("capture_session_window", "Capture the compositor's exact unobscured pixmap for one mapped X11 window without focusing it, changing desktops, or moving the pointer.", {**WINDOW, **CLAIM_TOKEN, "save_path": {"type": ["string", "null"]}}, ["window"], idempotent=True),
     tool("send_window_shortcut", "Best-effort no-focus XSendEvent shortcut delivery. Many modern clients reject synthetic events; use an acknowledged input lease when reliable delivery is required.", {**WINDOW, **CLAIM_TOKEN, "key": {"type": "string", "minLength": 1, "maxLength": MAX_SHORTCUT_KEY_CHARS}, "modifiers": {"type": "string", "maxLength": MAX_SHORTCUT_MODIFIERS_CHARS, "default": ""}}, ["window", "key"]),
-    tool("begin_input_lease", "Begin an explicit journaled focus/pointer lease for reliable XTEST input, snapshotting the active desktop, focus, pointer, and target minimized state for restoration.", {**WINDOW, "acknowledge_interference": {"type": "boolean"}}, ["window", "acknowledge_interference"]),
+    tool("begin_input_lease", "Begin an explicit journaled focus/pointer lease bound to an existing or implicit window claim, snapshotting the active desktop, focus, pointer, and target minimized state for restoration.", {**WINDOW, **CLAIM_TOKEN, "acknowledge_interference": {"type": "boolean"}}, ["window", "acknowledge_interference"]),
     tool("lease_key", "Send a reliable key or shortcut while the acknowledged target input lease is active.", {**TOKEN, "key": {"type": "string", "minLength": 1, "maxLength": MAX_SHORTCUT_KEY_CHARS}, "modifiers": {"type": "string", "maxLength": MAX_SHORTCUT_MODIFIERS_CHARS, "default": ""}}, ["lease_token", "key"]),
     tool("lease_pointer_click", "Click a target-window-local coordinate during an acknowledged input lease, then restore the pointer position.", {**TOKEN, "x": {"type": "integer"}, "y": {"type": "integer"}, "button": {"type": "string", "enum": ["left", "middle", "right"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
     tool("lease_pointer_scroll", "Scroll a target-window-local coordinate during an acknowledged input lease, then restore the pointer position.", {**TOKEN, "x": {"type": "integer"}, "y": {"type": "integer"}, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
@@ -590,7 +590,10 @@ def lease_guard():
 
 
 def load_lease() -> dict[str, Any] | None:
-    return json.loads(LEASE_FILE.read_text()) if LEASE_FILE.exists() else None
+    try:
+        return json.loads(LEASE_FILE.read_text())
+    except FileNotFoundError:
+        return None
 
 
 def save_lease(state: dict[str, Any]) -> None:
@@ -619,22 +622,61 @@ def require_lease(token: str) -> dict[str, Any]:
     return state
 
 
+def _recovery_allowed(state: dict[str, Any], owner_thread_id: str) -> None:
+    lease_owner = state.get("owner_thread_id")
+    if not lease_owner or lease_owner == owner_thread_id:
+        return
+    owner_deadline = max(
+        float(state.get("owner_expires_at") or 0),
+        float(state.get("owner_inflight_until") or 0),
+    )
+    if owner_deadline > time.time():
+        raise RuntimeError("the unfinished input lease still belongs to another live computer-use agent")
+    session_fingerprint = state.get("session_fingerprint")
+    target_identity = state.get("target_identity")
+    if (
+        isinstance(session_fingerprint, dict)
+        and isinstance(target_identity, dict)
+        and _claim_store(session_fingerprint).is_live(
+            lease_owner,
+            target_identity,
+            state.get("window_claim_token"),
+        )
+    ):
+        raise RuntimeError("the unfinished input lease still has a live window claim owned by another agent")
+
+
+def _lease_window_guard(state: dict[str, Any] | None = None):
+    state = state if state is not None else load_lease() or {}
+    session_fingerprint = state.get("session_fingerprint")
+    target_identity = state.get("target_identity")
+    if isinstance(session_fingerprint, dict) and isinstance(target_identity, dict):
+        return _claim_store(session_fingerprint).window_guard(target_identity)
+    return contextlib.nullcontext()
+
+
 def _checked_xdotool(*args: str, timeout: float = 10.0) -> None:
     proc = run(["xdotool", *args], timeout=timeout)
     if proc.returncode:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"xdotool {' '.join(args)} failed")
 
 
-def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
+def begin_lease(
+    arguments: dict[str, Any],
+    owner_thread_id: str | None = None,
+    resolved_target: tuple[dict[str, Any], dict[str, Any]] | None = None,
+    session_fingerprint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if arguments.get("acknowledge_interference") is not True:
         raise ValueError("acknowledge_interference must be true")
     if load_lease():
         raise RuntimeError("an input lease is already active; end or recover it first")
-    session_fingerprint = ensure_session()
+    owner_thread_id = owner_thread_id or _request_owner(None)
+    target_was_pre_resolved = resolved_target is not None
+    session_fingerprint = session_fingerprint or ensure_session()
     _ensure_input_safe()
-    target = resolve_window(str(arguments["window"]))
-    target_identity = _window_identity(target["xid"])
-    if not target_identity or target_identity["pid"] != target["pid"]:
+    target, target_identity = resolved_target or _resolve_target(str(arguments["window"]))
+    if target_was_pre_resolved and _identity_matches(target_identity) is not IdentityMatch.MATCH:
         raise RuntimeError("the target X11 window identity changed before the lease could begin")
     pointer = _pointer()
     if pointer is None:
@@ -646,28 +688,97 @@ def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
     desktop = _desktop()
     if desktop is None:
         raise RuntimeError("cannot snapshot the current desktop, so an input lease cannot be restored safely")
+    store = _claim_store(session_fingerprint)
+    claim_token = _claim_token(arguments)
+    claim = store.assert_access(
+        owner_thread_id,
+        target_identity,
+        claim_token,
+        mark_inflight=True,
+    )
+    implicit_claim = claim is None
+    if claim is None:
+        claim = store.claim(owner_thread_id, target, target_identity)
+        try:
+            claim = store.assert_access(
+                owner_thread_id,
+                target_identity,
+                claim["claim_token"],
+                mark_inflight=True,
+            )
+        except Exception:
+            store.release_while_guarded(
+                owner_thread_id,
+                claim["claim_token"],
+                target_identity,
+            )
+            raise
+    claim_token = claim["claim_token"]
     token = secrets.token_urlsafe(18)
     state = {
-        "version": 2,
+        "version": 3,
         "token": token,
         "phase": "prepared",
+        "owner_thread_id": owner_thread_id,
+        "owner_expires_at": time.time() + DEFAULT_LEASE_SECONDS,
+        "owner_inflight_until": time.time() + MAX_INFLIGHT_SECONDS,
         "session_fingerprint": session_fingerprint,
         "target": target,
         "target_identity": target_identity,
+        "window_claim_token": claim_token,
+        "implicit_window_claim": implicit_claim,
         "original": {"active_xid": active_xid, "active_identity": active_identity, "desktop": desktop, "pointer": pointer, "target_minimized": target["minimized"]},
         "pressed_button": None,
     }
-    save_lease(state)
+    claim_inflight = True
+    try:
+        save_lease(state)
+    except Exception:
+        store.finish_access(
+            owner_thread_id,
+            target_identity,
+            claim_token,
+            renew=False,
+        )
+        if implicit_claim:
+            store.release_while_guarded(
+                owner_thread_id,
+                claim_token,
+                target_identity,
+            )
+        raise
     try:
         _validate_lease_binding(state)
         _checked_xdotool("windowactivate", "--sync", target["xid"])
+        store.finish_access(
+            owner_thread_id,
+            target_identity,
+            claim_token,
+            renew=True,
+        )
+        claim_inflight = False
+        state.pop("owner_inflight_until", None)
+        state["owner_expires_at"] = time.time() + DEFAULT_LEASE_SECONDS
         state["phase"] = "active"
         save_lease(state)
     except Exception:
+        if claim_inflight:
+            store.finish_access(
+                owner_thread_id,
+                target_identity,
+                claim_token,
+                renew=False,
+            )
+        state.pop("owner_inflight_until", None)
+        try:
+            save_lease(state)
+        except Exception:
+            pass
         restore_lease(state)
         raise
     return {
         "lease_token": token,
+        "claim_token": claim_token,
         "window": target,
         "interference_boundary": "XTEST shares the real keyboard focus and pointer until end_input_lease; every pointer action restores its starting position",
         "journal": str(LEASE_FILE),
@@ -833,6 +944,15 @@ def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
         proc = run(["xdotool", "mousemove", "--sync", str(pointer["x"]), str(pointer["y"])])
         if proc.returncode:
             errors.append(proc.stderr.strip() or "failed to restore pointer")
+    if not errors and state.get("implicit_window_claim"):
+        try:
+            _claim_store(state["session_fingerprint"]).release_while_guarded(
+                state["owner_thread_id"],
+                state["window_claim_token"],
+                state["target_identity"],
+            )
+        except Exception as exc:
+            errors.append(f"implicit window claim release: {exc}")
     if not errors:
         LEASE_FILE.unlink(missing_ok=True)
     bounded_errors = _bounded_error_list(errors)
@@ -884,7 +1004,7 @@ def status() -> dict[str, Any]:
         "window_claim_error": claim_error,
         "unfinished_lease": LEASE_FILE.exists(),
         "semantic_action_companion": "Use the separate Computer Use plugin over AT-SPI, correlated by PID/title/WM_CLASS from list_session_windows.",
-        "input_boundary": "Distinct claimed windows can be captured and receive targeted XSendEvent shortcuts concurrently. X11 still has one shared focus and pointer, so reliable XTEST actions use one serialized global-input lane and briefly interfere with the real session.",
+        "input_boundary": "Distinct claimed windows can be captured and receive targeted XSendEvent shortcuts concurrently. Reliable XTEST input is also claim-bound, but X11 has one shared focus and pointer, so it uses one serialized global-input lane and briefly interferes with the real session.",
     }
 
 
@@ -1053,8 +1173,20 @@ def call_tool(
                         renew=succeeded,
                     )
     if name == "begin_input_lease":
+        window, identity, session_fingerprint = _resolve_bound_target(str(arguments["window"]))
+        target = (window, identity)
+        store = _claim_store(session_fingerprint)
         with lease_guard():
-            return text_result(begin_lease(arguments))
+            with store.window_guard(target[1]):
+                _validate_session_fingerprint(session_fingerprint)
+                return text_result(
+                    begin_lease(
+                        arguments,
+                        owner_thread_id,
+                        target,
+                        session_fingerprint,
+                    )
+                )
     if name == "lease_key":
         with lease_guard():
             return text_result(lease_key(arguments))
@@ -1066,8 +1198,24 @@ def call_tool(
             return text_result(restore_lease(require_lease_token(str(arguments["lease_token"]))))
     if name == "recover_input_lease":
         with lease_guard():
-            state = load_lease()
-            return text_result({"restored": True, "message": "no unfinished input lease"} if not state else restore_lease(state))
+            selected_state = load_lease()
+            if not selected_state:
+                return text_result({"restored": True, "message": "no unfinished input lease"})
+            with _lease_window_guard(selected_state):
+                state = load_lease()
+                if not state:
+                    return text_result({"restored": True, "message": "no unfinished input lease"})
+                if (
+                    state.get("session_fingerprint")
+                    != selected_state.get("session_fingerprint")
+                    or _stable_window_identity(state.get("target_identity"))
+                    != _stable_window_identity(selected_state.get("target_identity"))
+                ):
+                    raise RuntimeError(
+                        "the input lease changed while its stable window guard was being acquired"
+                    )
+                _recovery_allowed(state, owner_thread_id)
+                return text_result(restore_lease(state))
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -1080,7 +1228,7 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
         if method == "initialize":
             requested = (message.get("params") or {}).get("protocolVersion")
             negotiated = requested if isinstance(requested, str) and requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
-            result = {"protocolVersion": negotiated, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate only same-UID windows in the current local EWMH Xorg login. Claim windows for concurrent exact capture or targeted XSendEvent shortcuts. Prefer AT-SPI through the separate Computer Use plugin; reliable XTEST input still uses the serialized acknowledged global-seat lease."}
+            result = {"protocolVersion": negotiated, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate only same-UID windows in the current local EWMH Xorg login. Claim a window for each agent's observe-act-verify cycle; distinct windows can run concurrently. Prefer AT-SPI through the separate Computer Use plugin; exact capture and targeted XSendEvent are per-window, while claim-bound reliable XTEST input uses one serialized acknowledged global-seat lease."}
         elif method == "tools/list":
             result = {"tools": TOOLS}
         elif method == "tools/call":
