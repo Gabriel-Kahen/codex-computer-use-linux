@@ -330,3 +330,12 @@ def list_claims(_owner_id: str, offset: int, limit: int) -> dict[str, Any]:
         raise RuntimeError("window claim list metadata exceeds its serialized size limit")
     return value
 
+
+from .claim_transactions import authorize_window
+from .claim_transactions import ClaimCleanupResult
+from .claim_transactions import claim_window
+from .claim_transactions import discard_bound_claim
+from .claim_transactions import ensure_focus_claim
+from .claim_transactions import focus_claim_transaction
+from .claim_transactions import release_window_claim
+from .claim_transactions import window_action
