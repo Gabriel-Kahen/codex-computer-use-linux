@@ -1,4 +1,8 @@
-use crate::action_batch::{ActionBatchParams, BatchAction, BatchClick};
+use crate::action_batch::{
+    execute_action_batch, ActionBatchOutput, ActionBatchParams, ActionOutput, BatchAction,
+    BatchActionRun, BatchClick, NON_EDITABLE_TEXT_LANDING_WARNING,
+    NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING,
+};
 use crate::atspi_tree::{
     focused_element_summary, list_accessible_apps, perform_action as invoke_accessibility_action,
     set_element_value, snapshot_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
@@ -813,51 +817,31 @@ impl ComputerUseLinux {
             return Json(ActionBatchOutput::validation_error(error));
         }
 
-        let window_id = params.window_id;
-        let mut results = Vec::with_capacity(params.actions.len());
-        for (index, action) in params.actions.into_iter().enumerate() {
-            let result = match action {
-                BatchAction::Click(click) => {
-                    let Json(result) = self
-                        .click(Parameters(click.into_click_params(window_id)))
-                        .await;
-                    result
+        Json(
+            execute_action_batch(params, |action, window_id| async move {
+                match action {
+                    BatchAction::Click(click) => {
+                        let Json(result) = self
+                            .click(Parameters(click.into_click_params(window_id)))
+                            .await;
+                        BatchActionRun::Completed(result)
+                    }
+                    BatchAction::TypeText { text } => {
+                        let Json(result) = self
+                            .type_text(Parameters(TypeTextParams::for_window(window_id, text)))
+                            .await;
+                        BatchActionRun::text(result)
+                    }
+                    BatchAction::PressKey { key } => {
+                        let Json(result) = self
+                            .press_key(Parameters(PressKeyParams::for_window(window_id, key)))
+                            .await;
+                        BatchActionRun::Completed(result)
+                    }
                 }
-                BatchAction::TypeText { text } => {
-                    let Json(result) = self
-                        .type_text(Parameters(TypeTextParams::for_window(window_id, text)))
-                        .await;
-                    result
-                }
-                BatchAction::PressKey { key } => {
-                    let Json(result) = self
-                        .press_key(Parameters(PressKeyParams::for_window(window_id, key)))
-                        .await;
-                    result
-                }
-            };
-            let ok = result.ok;
-            results.push(result);
-            if !ok {
-                return Json(ActionBatchOutput {
-                    ok: false,
-                    completed: index,
-                    failed_at: Some(index),
-                    results,
-                    error: Some(format!(
-                        "Action {index} failed; later actions were not attempted."
-                    )),
-                });
-            }
-        }
-
-        Json(ActionBatchOutput {
-            ok: true,
-            completed: results.len(),
-            failed_at: None,
-            results,
-            error: None,
-        })
+            })
+            .await,
+        )
     }
 
     #[tool(
@@ -2115,43 +2099,6 @@ impl TypeTextParams {
     }
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-struct ActionOutput {
-    ok: bool,
-    implemented: bool,
-    action: String,
-    message: String,
-    // See ActivateWindowOutput: kept in the response, omitted from the schema
-    // because `serde_json::Value` produces a non-object schema strict MCP
-    // clients reject.
-    #[schemars(skip)]
-    received: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-struct ActionBatchOutput {
-    ok: bool,
-    /// Number of actions that completed successfully.
-    completed: usize,
-    /// Zero-based index of the failed action, if execution began.
-    failed_at: Option<usize>,
-    /// Results for attempted actions, including the failed action.
-    results: Vec<ActionOutput>,
-    error: Option<String>,
-}
-
-impl ActionBatchOutput {
-    fn validation_error(error: String) -> Self {
-        Self {
-            ok: false,
-            completed: 0,
-            failed_at: None,
-            results: Vec::new(),
-            error: Some(error),
-        }
-    }
-}
-
 impl ComputerUseLinux {
     fn validate_action_batch(&self, params: &ActionBatchParams) -> Result<(), String> {
         params.validate()?;
@@ -2487,8 +2434,9 @@ impl ComputerUseLinux {
         match timeout(Duration::from_millis(1500), focused_element_summary(pid)).await {
             Ok(Ok(Some(element))) => Some(describe_focused_element(&element, expects_editable)),
             Ok(Ok(None)) => Some(
-                "WARNING: AT-SPI reports no focused element in the target app — the input may have landed nowhere. If this is an Electron app, launch it with --force-renderer-accessibility to expose its UI tree."
-                    .to_string(),
+                format!(
+                    "WARNING: AT-SPI reports no focused element in the target app — {NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING}. If this is an Electron app, launch it with --force-renderer-accessibility to expose its UI tree."
+                ),
             ),
             Ok(Err(error)) => Some(format!(
                 "Focused-element feedback unavailable ({}).",
@@ -3498,7 +3446,7 @@ fn describe_focused_element(element: &FocusedElementSummary, expects_editable: b
         format!("Focused element: {}{name} (editable).", element.role)
     } else if expects_editable {
         format!(
-            "WARNING: focused element is {}{name}, which is not editable — the typed text likely went nowhere. Click the intended input first or use set_value.",
+            "WARNING: focused element is {}{name}, which is not editable — {NON_EDITABLE_TEXT_LANDING_WARNING}. Click the intended input first or use set_value.",
             element.role
         )
     } else {
