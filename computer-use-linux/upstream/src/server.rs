@@ -1,3 +1,8 @@
+use crate::action_batch::{
+    execute_action_batch, ActionBatchOutput, ActionBatchParams, ActionOutput, BatchAction,
+    BatchActionRun, BatchClick, NON_EDITABLE_TEXT_LANDING_WARNING,
+    NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING,
+};
 use crate::atspi_tree::{
     focused_element_summary, list_accessible_apps, perform_action as invoke_accessibility_action,
     set_element_value, snapshot_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
@@ -62,6 +67,7 @@ pub struct ComputerUseLinux {
     abs_pointer: Arc<Mutex<Option<crate::abs_pointer::AbsPointer>>>,
     portal_keyboard_init_lock: Arc<tokio::sync::Mutex<()>>,
     kde_clipboard_lock: Arc<tokio::sync::Mutex<()>>,
+    action_batch_lock: Arc<tokio::sync::Mutex<()>>,
     /// Cached logical desktop size (union of monitors) from the most recent
     /// full-frame capture; used for off-screen window/coordinate warnings.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
@@ -793,6 +799,52 @@ impl ComputerUseLinux {
     }
 
     #[tool(
+        name = "run_action_batch",
+        description = "Run a validated, ordered, fail-fast batch of common input actions against one exact window_id. Supports up to eight press_key/type_text actions and, optionally, one leading click. The complete batch is validated before any input is sent, and exact target focus is re-verified before every action.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn run_action_batch(
+        &self,
+        Parameters(params): Parameters<ActionBatchParams>,
+    ) -> Json<ActionBatchOutput> {
+        let _batch_guard = self.action_batch_lock.lock().await;
+        if let Err(error) = self.validate_action_batch(&params) {
+            return Json(ActionBatchOutput::validation_error(error));
+        }
+
+        Json(
+            execute_action_batch(params, |action, window_id| async move {
+                match action {
+                    BatchAction::Click(click) => {
+                        let Json(result) = self
+                            .click(Parameters(click.into_click_params(window_id)))
+                            .await;
+                        BatchActionRun::Completed(result)
+                    }
+                    BatchAction::TypeText { text } => {
+                        let Json(result) = self
+                            .type_text(Parameters(TypeTextParams::for_window(window_id, text)))
+                            .await;
+                        BatchActionRun::text(result)
+                    }
+                    BatchAction::PressKey { key } => {
+                        let Json(result) = self
+                            .press_key(Parameters(PressKeyParams::for_window(window_id, key)))
+                            .await;
+                        BatchActionRun::Completed(result)
+                    }
+                }
+            })
+            .await,
+        )
+    }
+
+    #[tool(
         name = "perform_action",
         description = "Invoke an accessibility action exposed by an element selected by index, identifier, or semantic selector. Defaults to the primary action unless action is provided.",
         annotations(
@@ -1378,7 +1430,7 @@ fn app_state_tool_result(
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.5.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id when avoiding model round trips matters; batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -1797,6 +1849,28 @@ impl ClickParams {
     }
 }
 
+impl BatchClick {
+    fn into_click_params(self, window_id: u64) -> ClickParams {
+        ClickParams {
+            element_index: self.element_index,
+            role: self.role,
+            name: self.name,
+            text: self.text,
+            states: self.states,
+            x: self.x,
+            y: self.y,
+            button: self.button,
+            click_count: self.click_count,
+            window_id: Some(window_id),
+            pid: None,
+            app_id: None,
+            wm_class: None,
+            window_title: None,
+            relative: self.relative,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ActionParams {
     #[serde(default)]
@@ -1964,6 +2038,21 @@ struct TypeTextParams {
 }
 
 impl PressKeyParams {
+    fn for_window(window_id: u64, key: String) -> Self {
+        Self {
+            key,
+            window_id: Some(window_id),
+            pid: None,
+            tty: None,
+            terminal_pid: None,
+            terminal_command: None,
+            terminal_cwd: None,
+            app_id: None,
+            wm_class: None,
+            title: None,
+        }
+    }
+
     fn window_target(&self) -> WindowTarget {
         WindowTarget {
             window_id: self.window_id,
@@ -1980,6 +2069,21 @@ impl PressKeyParams {
 }
 
 impl TypeTextParams {
+    fn for_window(window_id: u64, text: String) -> Self {
+        Self {
+            text,
+            window_id: Some(window_id),
+            pid: None,
+            tty: None,
+            terminal_pid: None,
+            terminal_command: None,
+            terminal_cwd: None,
+            app_id: None,
+            wm_class: None,
+            title: None,
+        }
+    }
+
     fn window_target(&self) -> WindowTarget {
         WindowTarget {
             window_id: self.window_id,
@@ -1995,20 +2099,27 @@ impl TypeTextParams {
     }
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-struct ActionOutput {
-    ok: bool,
-    implemented: bool,
-    action: String,
-    message: String,
-    // See ActivateWindowOutput: kept in the response, omitted from the schema
-    // because `serde_json::Value` produces a non-object schema strict MCP
-    // clients reject.
-    #[schemars(skip)]
-    received: Option<serde_json::Value>,
-}
-
 impl ComputerUseLinux {
+    fn validate_action_batch(&self, params: &ActionBatchParams) -> Result<(), String> {
+        params.validate()?;
+        for (index, action) in params.actions.iter().enumerate() {
+            match action {
+                BatchAction::Click(click) => {
+                    let click = click.clone().into_click_params(params.window_id);
+                    self.resolve_click_target(&click)
+                        .map_err(|error| format!("actions[{index}] is invalid: {error}"))?;
+                }
+                BatchAction::PressKey { key } if key_sequence(key).is_none() => {
+                    return Err(format!(
+                        "actions[{index}] has an unsupported key. Use names like Enter, Escape, Tab, ArrowLeft, Ctrl+L, or a single US keyboard letter/digit."
+                    ));
+                }
+                BatchAction::TypeText { .. } | BatchAction::PressKey { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
     fn is_wayland_session(&self) -> bool {
         crate::diagnostics::hydrate_session_bus_env();
         let session_type = env::var("XDG_SESSION_TYPE").ok();
@@ -2323,8 +2434,9 @@ impl ComputerUseLinux {
         match timeout(Duration::from_millis(1500), focused_element_summary(pid)).await {
             Ok(Ok(Some(element))) => Some(describe_focused_element(&element, expects_editable)),
             Ok(Ok(None)) => Some(
-                "WARNING: AT-SPI reports no focused element in the target app — the input may have landed nowhere. If this is an Electron app, launch it with --force-renderer-accessibility to expose its UI tree."
-                    .to_string(),
+                format!(
+                    "WARNING: AT-SPI reports no focused element in the target app — {NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING}. If this is an Electron app, launch it with --force-renderer-accessibility to expose its UI tree."
+                ),
             ),
             Ok(Err(error)) => Some(format!(
                 "Focused-element feedback unavailable ({}).",
@@ -3334,7 +3446,7 @@ fn describe_focused_element(element: &FocusedElementSummary, expects_editable: b
         format!("Focused element: {}{name} (editable).", element.role)
     } else if expects_editable {
         format!(
-            "WARNING: focused element is {}{name}, which is not editable — the typed text likely went nowhere. Click the intended input first or use set_value.",
+            "WARNING: focused element is {}{name}, which is not editable — {NON_EDITABLE_TEXT_LANDING_WARNING}. Click the intended input first or use set_value.",
             element.role
         )
     } else {
@@ -3983,6 +4095,26 @@ mod tests {
         assert!(tool.output_schema.is_some());
         assert!(schema.contains("coordinate_width"));
         assert!(!schema.contains("data_url"));
+    }
+
+    #[test]
+    fn action_batch_preflight_rejects_unsupported_keys_before_execution() {
+        let params = ActionBatchParams {
+            window_id: 42,
+            actions: vec![
+                BatchAction::PressKey {
+                    key: "Tab".to_string(),
+                },
+                BatchAction::PressKey {
+                    key: "DefinitelyNotAKey".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            ComputerUseLinux::default().validate_action_batch(&params),
+            Err("actions[1] has an unsupported key. Use names like Enter, Escape, Tab, ArrowLeft, Ctrl+L, or a single US keyboard letter/digit.".to_string())
+        );
     }
 
     #[test]

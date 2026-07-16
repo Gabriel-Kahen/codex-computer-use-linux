@@ -30,6 +30,7 @@ EXPECTED_TOOLS = {
     "scroll",
     "press_key",
     "type_text",
+    "run_action_batch",
     "perform_action",
     "set_value",
 }
@@ -95,6 +96,7 @@ DESTRUCTIVE_MUTATING_TOOLS = {
     "drag",
     "press_key",
     "type_text",
+    "run_action_batch",
     "perform_action",
     "set_value",
 }
@@ -300,8 +302,29 @@ def main() -> int:
                 raise AssertionError(f"{name} is missing focus target selectors: {sorted(FOCUS_SELECTORS - props)}")
             if name == "click" and not SEMANTIC_SELECTORS <= props:
                 raise AssertionError(f"{name} is missing semantic element selectors: {sorted(SEMANTIC_SELECTORS - props)}")
+            if name == "run_action_batch" and props != {"window_id", "actions"}:
+                raise AssertionError(f"{name} exposes unexpected parameters: {sorted(props)}")
             if name in {"perform_action", "set_value"} and not OBJECT_REF_SELECTORS <= props:
                 raise AssertionError(f"{name} is missing object/semantic element selectors: {sorted(OBJECT_REF_SELECTORS - props)}")
+
+        invalid_batch = client.request(
+            "tools/call",
+            {
+                "name": "run_action_batch",
+                "arguments": {
+                    "window_id": 0,
+                    "actions": [{"type": "press_key", "key": "Enter"}],
+                },
+            },
+        )["result"]
+        invalid_batch_content = invalid_batch.get("content") or []
+        invalid_batch_output = json.loads(invalid_batch_content[0].get("text") or "{}")
+        if (
+            invalid_batch_output.get("ok") is not False
+            or invalid_batch_output.get("completed") != 0
+            or invalid_batch_output.get("results") != []
+        ):
+            raise AssertionError(f"invalid action batch was not rejected before execution: {invalid_batch!r}")
 
         doctor = client.request("tools/call", {"name": "doctor", "arguments": {}})["result"]
         content = doctor.get("content") or []
