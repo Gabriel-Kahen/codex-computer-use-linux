@@ -544,6 +544,10 @@ def begin_lease(
         "version": 3,
         "session": session_binding(),
         "token": token,
+        "owner_thread_id": owner_thread_id,
+        "owner_expires_at": time.time() + coordination.DEFAULT_LEASE_SECONDS,
+        "claim_token": claim.get("claim_token") if claim else None,
+        "claim_expires_at": claim.get("expires_at") if claim else None,
         "phase": "creating",
         "output": output,
         "target": selected,
@@ -596,11 +600,28 @@ def begin_lease(
         raise
 
 
-def require_lease(token: str) -> dict[str, Any]:
+def require_lease(token: str, owner_thread_id: str | None = None) -> dict[str, Any]:
     state = load_lease()
     if not state: raise RuntimeError("no coordinate lease is active")
     if state.get("token") != token: raise ValueError("lease token does not match the active coordinate lease")
+    owner = state.get("owner_thread_id")
+    if owner is not None and owner != owner_thread_id:
+        raise RuntimeError("coordinate lease belongs to another computer-use agent")
     return state
+
+
+def require_recovery_access(state: dict[str, Any], owner_thread_id: str | None) -> None:
+    lease_owner = state.get("owner_thread_id")
+    if lease_owner is None or lease_owner == owner_thread_id:
+        return
+    owner_live = float(state.get("owner_expires_at") or 0) > time.time()
+    claim_token = state.get("claim_token")
+    if claim_token:
+        owner_live = owner_live or coordination.claim_is_live(
+            session_binding(), state.get("target") or {}, lease_owner, str(claim_token)
+        )
+    if owner_live:
+        raise RuntimeError("another computer-use agent still owns the live coordinate lease")
 
 
 def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
@@ -657,8 +678,8 @@ def restore_lease(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def capture_lease(token: str) -> dict[str, Any]:
-    state = require_lease(token)
+def capture_lease(token: str, owner_thread_id: str | None = None) -> dict[str, Any]:
+    state = require_lease(token, owner_thread_id)
     fd, name = tempfile.mkstemp(prefix="same-session-coordinate-", suffix=".png")
     os.close(fd); output = Path(name)
     try:
@@ -1379,15 +1400,124 @@ def call_tool(
     if name == "targeted_pointer_drag":
         return text_result(targeted_pointer(arguments, "drag", owner_thread_id))
     if name == "begin_coordinate_lease":
-        with lease_guard(): return text_result(begin_lease(arguments))
+        window = resolve_window(str(arguments["window"]))
+        binding = session_binding()
+        with coordination.global_input_guard():
+            with coordination.window_guard(binding, window):
+                with lease_guard():
+                    require_global_input_available()
+                    claim = require_window_access(
+                        window, arguments, owner_thread_id, mark_inflight=True
+                    )
+                    try:
+                        result = begin_lease(
+                            arguments,
+                            selected=window,
+                            owner_thread_id=owner_thread_id,
+                            claim=claim,
+                        )
+                    except Exception:
+                        finish_claimed_window_access(
+                            binding, window, owner_thread_id, claim, renew=False
+                        )
+                        raise
+                    renewed = finish_claimed_window_access(
+                        binding, window, owner_thread_id, claim, renew=True
+                    )
+                    state = load_lease()
+                    if state:
+                        state["owner_expires_at"] = (
+                            time.time() + coordination.DEFAULT_LEASE_SECONDS
+                        )
+                        if renewed is not None:
+                            state["claim_token"] = renewed["claim_token"]
+                            state["claim_expires_at"] = renewed["expires_at"]
+                        save_lease(state)
+                    return text_result(result)
     if name == "capture_coordinate_desktop":
-        with lease_guard(): return capture_lease(str(arguments["lease_token"]))
+        state = require_lease(str(arguments["lease_token"]), owner_thread_id)
+        window = state.get("target") or {}
+        with coordination.window_guard(session_binding(), window):
+            with lease_guard():
+                state = require_lease(str(arguments["lease_token"]), owner_thread_id)
+                lease_owner = state.get("owner_thread_id")
+                claim = None
+                if isinstance(lease_owner, str):
+                    claim = coordination.renew_owned_claim(
+                        session_binding(), window, lease_owner, mark_inflight=True
+                    )
+                    if claim:
+                        state["claim_token"] = claim["claim_token"]
+                        state["claim_expires_at"] = claim["expires_at"]
+                state["owner_expires_at"] = time.time() + coordination.DEFAULT_LEASE_SECONDS
+                save_lease(state)
+                try:
+                    result = capture_lease(
+                        str(arguments["lease_token"]), owner_thread_id
+                    )
+                except Exception:
+                    finish_claimed_window_access(
+                        session_binding(),
+                        window,
+                        owner_thread_id,
+                        claim,
+                        renew=False,
+                    )
+                    raise
+                renewed = finish_claimed_window_access(
+                    session_binding(), window, owner_thread_id, claim, renew=True
+                )
+                state = require_lease(
+                    str(arguments["lease_token"]), owner_thread_id
+                )
+                state["owner_expires_at"] = (
+                    time.time() + coordination.DEFAULT_LEASE_SECONDS
+                )
+                if renewed is not None:
+                    state["claim_token"] = renewed["claim_token"]
+                    state["claim_expires_at"] = renewed["expires_at"]
+                save_lease(state)
+                return result
     if name == "end_coordinate_lease":
-        with lease_guard(): return text_result(restore_lease(require_lease(str(arguments["lease_token"]))))
+        with coordination.global_input_guard():
+            with lease_guard():
+                expected = require_lease(
+                    str(arguments["lease_token"]), owner_thread_id
+                )
+                window = expected.get("target") or {}
+            with coordination.window_guard(session_binding(), window):
+                with lease_guard():
+                    state = require_lease(
+                        str(arguments["lease_token"]), owner_thread_id
+                    )
+                    if not same_coordinate_lease(expected, state):
+                        raise RuntimeError(
+                            "coordinate lease changed while waiting for its window; retry"
+                        )
+                    return text_result(restore_lease(state))
     if name == "recover_coordinate_lease":
-        with lease_guard():
-            state = load_lease()
-            return text_result({"restored": True, "message": "no unfinished coordinate lease"} if not state else restore_lease(state))
+        with coordination.global_input_guard():
+            with lease_guard():
+                expected = load_lease()
+                if not expected:
+                    return text_result(
+                        {"restored": True, "message": "no unfinished coordinate lease"}
+                    )
+                require_recovery_access(expected, owner_thread_id)
+                window = expected.get("target") or {}
+            with coordination.window_guard(session_binding(), window):
+                with lease_guard():
+                    state = load_lease()
+                    if not state:
+                        return text_result(
+                            {"restored": True, "message": "no unfinished coordinate lease"}
+                        )
+                    if not same_coordinate_lease(expected, state):
+                        raise RuntimeError(
+                            "coordinate lease changed while waiting for its window; retry"
+                        )
+                    require_recovery_access(state, owner_thread_id)
+                    return text_result(restore_lease(state))
     raise ValueError(f"unknown tool: {name}")
 
 
