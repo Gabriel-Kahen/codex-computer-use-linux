@@ -13,7 +13,7 @@ Operate the real logged-in session. Never substitute a VM, nested desktop, alter
 2. Reuse an existing matching window. Preserve its process, profile, login, open documents, workspace, and fullscreen state.
 3. Call `claim_session_window` for that exact window. Keep its `claim_token` private to this task, pass it to every broker capture/action, and renew before `expires_at` if work continues.
 4. Capture with `capture_session_window` and the claim token. This uses the window's Hyprland stable ID and does not focus, move, or raise it.
-5. Inspect and act with the separate `computer-use@openai-bundled` plugin's accessibility tools. Refresh app state immediately before choosing an element. If those tools are absent, stop and ask the user to install that companion plugin. Treat the Hyprland claim as authoritative even though external AT-SPI calls do not pass through this broker.
+5. Inspect and act with the separate `computer-use-linux@codex-computer-use-linux` plugin's accessibility tools. Refresh app state immediately before choosing an element. If those tools are absent, stop and ask the user to install that companion plugin. Treat the Hyprland claim as authoritative even though external AT-SPI calls do not pass through this broker.
 6. Prefer semantic AT-SPI operations in this order:
    - `perform_action` for buttons, links, menu items, and other actionable controls.
    - `set_value` or editable-text operations for text fields and sliders.

@@ -19,7 +19,7 @@ Generic X11 cannot provide both reliable input and zero interference. Many appli
 - A local Xorg session with an EWMH-compatible window manager.
 - `python3`, `xprop`, `wmctrl`, `xdotool`, `xinput`, logind, and XRes 1.2.
 - For the capture and XRes ownership helper: a C compiler, `pkg-config`, and development packages for X11, XComposite, XRes, and libpng. Exact capture additionally requires an enabled X11 compositing manager and a direct-color visual, as used by normal modern Xorg desktops.
-- The bundled Computer Use plugin for preferred AT-SPI semantic actions.
+- The repository-owned Computer Use plugin for preferred AT-SPI semantic actions.
 
 On Debian/Ubuntu:
 
@@ -44,10 +44,11 @@ Enable your desktop's compositor if `session_status` reports `compositing_manage
 ## Install
 
 ```shell
-codex plugin add computer-use@openai-bundled
 codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
   --sparse .agents/plugins \
+  --sparse computer-use-linux \
   --sparse contrib/x11-background-computer-use
+codex plugin add computer-use-linux@codex-computer-use-linux
 codex plugin add x11-background-computer-use@codex-computer-use-linux
 ```
 

@@ -1,0 +1,98 @@
+name: computer-use-upstream-sync
+
+on:
+  schedule:
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: computer-use-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'Gabriel-Kahen/codex-computer-use-linux'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SYNC_BRANCH: codex/computer-use-upstream-sync
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Prepare three-way upstream merge
+        id: sync
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover \
+            -s computer-use-linux/scripts/tests \
+            -p 'test_*.py' \
+            -v
+          computer-use-linux/scripts/sync_upstream.py prepare
+          if [[ -z "$(git status --porcelain -- computer-use-linux)" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust
+        if: steps.sync.outputs.changed == 'true'
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy,rustfmt
+
+      - name: Install Linux build dependencies
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libdbus-1-dev pkg-config
+
+      - name: Verify merged backend
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          cargo fmt --manifest-path computer-use-linux/upstream/Cargo.toml --all -- --check
+          cargo clippy --locked --manifest-path computer-use-linux/upstream/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path computer-use-linux/upstream/Cargo.toml --all-targets
+          cargo build --locked --manifest-path computer-use-linux/upstream/Cargo.toml --bin computer-use-linux
+          python3 computer-use-linux/upstream/scripts/mcp_safety_check.py \
+            --repo computer-use-linux/upstream \
+            --binary computer-use-linux/upstream/target/debug/computer-use-linux
+
+      - name: Open or update draft review PR
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git switch -C "$SYNC_BRANCH"
+          git add computer-use-linux
+          git commit -m 'chore(computer-use): sync agent-sh upstream'
+
+          if git ls-remote --exit-code --heads origin "refs/heads/$SYNC_BRANCH" >/dev/null; then
+            git fetch origin "$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH"
+            lease="$(git rev-parse "refs/remotes/origin/$SYNC_BRANCH")"
+            git push --force-with-lease="refs/heads/$SYNC_BRANCH:$lease" origin "HEAD:refs/heads/$SYNC_BRANCH"
+          else
+            git push origin "HEAD:refs/heads/$SYNC_BRANCH"
+          fi
+
+          body='This draft was prepared by the repository-owned three-way updater. It merges the latest `agent-sh/computer-use-linux` source with the Codex Linux patch set and passed backend format, Clippy, tests, and MCP schema safety checks. It is never merged automatically. Review Linux behavior and the pinned revision in `computer-use-linux/UPSTREAM.toml`.'
+          pr="$(gh pr list --state open --head "$SYNC_BRANCH" --json number --jq '.[0].number // empty')"
+          if [[ -z "$pr" ]]; then
+            gh pr create \
+              --draft \
+              --base main \
+              --head "$SYNC_BRANCH" \
+              --title 'chore(computer-use): sync agent-sh upstream' \
+              --body "$body"
+          else
+            gh pr edit "$pr" --title 'chore(computer-use): sync agent-sh upstream' --body "$body"
+          fi

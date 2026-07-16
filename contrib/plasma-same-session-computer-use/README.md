@@ -36,7 +36,7 @@ Enforcement applies only to operations routed through this broker: its claim/rel
 - [`kdotool`](https://github.com/jinliu/kdotool) 0.2.3 or newer
 - a C++17 compiler, `pkg-config`, and Qt 6 Core/Gui/DBus development files
 - an enabled AT-SPI session for semantic actions
-- `computer-use@openai-bundled` for AT-SPI and separately invoked global input
+- `computer-use-linux@codex-computer-use-linux` for AT-SPI and separately invoked global input
 
 Install `kdotool` from your distribution when available, or with `cargo install kdotool`. Common build packages are `qt6-base-dev g++ pkg-config` on Debian/Ubuntu, `qt6-qtbase-devel gcc-c++ pkgconf-pkg-config` on Fedora, and `qt6-base base-devel pkgconf` on Arch.
 
@@ -47,10 +47,11 @@ The PNG returned to Codex is capped at 5 MiB so its base64-encoded MCP response 
 ## Install
 
 ```bash
-codex plugin add computer-use@openai-bundled
 codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
   --sparse .agents/plugins \
+  --sparse computer-use-linux \
   --sparse contrib/plasma-same-session-computer-use
+codex plugin add computer-use-linux@codex-computer-use-linux
 codex plugin add plasma-same-session-computer-use@codex-computer-use-linux
 ```
 
@@ -76,7 +77,7 @@ rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/plasma-same-session-computer-use"
 rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/applications/plasma-same-session-capture.desktop"
 ```
 
-No KWin script is installed persistently: `kdotool` loads short-lived scripts over KWin's D-Bus scripting interface. Keep the bundled Computer Use plugin if other integrations use it.
+No KWin script is installed persistently: `kdotool` loads short-lived scripts over KWin's D-Bus scripting interface. Keep the core Computer Use plugin if other integrations use it.
 
 ## Safety
 
