@@ -61,6 +61,10 @@ class RepositorySmokeTests(TestCase):
         schemas = {tool["name"]: tool["inputSchema"] for tool in tools}
         for name in (
             "capture_session_window",
+            "send_window_shortcut",
+            "targeted_pointer_click",
+            "targeted_pointer_scroll",
+            "targeted_pointer_drag",
             "begin_coordinate_lease",
         ):
             self.assertIn("claim_token", schemas[name]["properties"])
