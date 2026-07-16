@@ -1,7 +1,7 @@
 {
   "name": "same-session-computer-use",
-  "version": "0.1.1",
-  "description": "Add exact background capture and window-targeted input for Codex on Hyprland.",
+  "version": "0.2.0",
+  "description": "Add task-owned window claims and exact background capture for Codex on Hyprland.",
   "author": {
     "name": "Gabe",
     "url": "https://github.com/Gabriel-Kahen"
@@ -19,8 +19,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Hyprland Codex Background Computer Use",
-    "shortDescription": "Background control for Hyprland apps.",
-    "longDescription": "Extends the bundled Computer Use plugin on Hyprland with exact background window capture, targeted shortcuts, and window-local click, scroll, and drag controls. It preserves existing application processes, profiles, files, signed-in state, physical pointer, focus, and workspace during normal targeted operations.",
+    "shortDescription": "Claimed background capture for Hyprland apps.",
+    "longDescription": "Extends the bundled Computer Use plugin on Hyprland with task-owned window claims, exact background capture, and task-owned coordinate fallback recovery. Exact capture and coordinate leases honor claims; targeted shortcuts and pointer controls retain their existing single-agent behavior.",
     "developerName": "Gabe",
     "category": "Productivity",
     "capabilities": [

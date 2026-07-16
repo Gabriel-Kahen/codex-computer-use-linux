@@ -162,3 +162,151 @@ class ParallelBackendTests(TestCase):
         self.assertTrue(server.LEASE_FILE.exists())
         self.assertFalse(server.lease_file().exists())
 
+    def test_fencing_token_cannot_be_used_by_another_owner(self) -> None:
+        window = self.window("0x1", "1")
+        claim = coordination.claim_window(BINDING, window, "owner-a")
+
+        with patch.object(server, "resolve_window", return_value=window):
+            with self.assertRaisesRegex(RuntimeError, "another computer-use agent"):
+                server.call_tool(
+                    "capture_session_window",
+                    {"window": "0x1", "claim_token": claim["claim_token"]},
+                    "owner-b",
+                )
+
+    def test_release_tool_keeps_claim_while_coordinate_lease_is_active(self) -> None:
+        window = self.window("0x1", "1")
+        claim = coordination.claim_window(BINDING, window, "owner-a")
+        listed_claims = coordination.list_claims(BINDING)
+        server.save_lease(
+            {
+                "version": 3,
+                "session": BINDING,
+                "token": "lease-token",
+                "owner_thread_id": "owner-a",
+                "target": window,
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "end the active coordinate lease"):
+            server.call_tool(
+                "release_session_window",
+                {"claim_token": claim["claim_token"]},
+                "owner-a",
+            )
+
+        self.assertEqual(coordination.list_claims(BINDING), listed_claims)
+
+    def test_release_tool_succeeds_after_coordinate_lease_cleanup(self) -> None:
+        window = self.window("0x1", "1")
+        claim = coordination.claim_window(BINDING, window, "owner-a")
+
+        result = server.call_tool(
+            "release_session_window",
+            {"claim_token": claim["claim_token"]},
+            "owner-a",
+        )
+
+        self.assertTrue(result["structuredContent"]["released"])
+        self.assertEqual(coordination.list_claims(BINDING), [])
+
+    def test_coordinate_setup_pins_a_minimum_ttl_claim_until_completion(self) -> None:
+        window = self.window("0x1", "1")
+        claim = coordination.claim_window(BINDING, window, "owner-a", 5)
+
+        def begin(*_: object, **__: object) -> dict[str, bool]:
+            active = coordination.list_claims(
+                BINDING, now=float(claim["expires_at"]) + 1
+            )
+            self.assertEqual(len(active), 1)
+            return {"started": True}
+
+        with (
+            patch.object(server, "resolve_window", return_value=window),
+            patch.object(server, "require_global_input_available"),
+            patch.object(server, "begin_lease", side_effect=begin),
+        ):
+            result = server.call_tool(
+                "begin_coordinate_lease",
+                {
+                    "window": "0x1",
+                    "acknowledge_interference": True,
+                    "claim_token": claim["claim_token"],
+                },
+                "owner-a",
+            )
+
+        self.assertTrue(result["structuredContent"]["started"])
+
+    def test_same_owner_reclaim_rebinds_the_active_coordinate_lease(self) -> None:
+        window = self.window("0x1", "1")
+        expired = coordination.claim_window(
+            BINDING, window, "owner-a", 5, now=time.time() - 10
+        )
+        server.save_lease(
+            {
+                "version": 3,
+                "session": BINDING,
+                "token": "lease-token",
+                "owner_thread_id": "owner-a",
+                "owner_expires_at": time.time() - 1,
+                "claim_token": expired["claim_token"],
+                "target": window,
+            }
+        )
+
+        with patch.object(server, "resolve_window", return_value=window):
+            result = server.call_tool(
+                "claim_session_window", {"window": "0x1", "lease_seconds": 5}, "owner-a"
+            )
+
+        replacement = result["structuredContent"]
+        state = server.load_lease()
+        self.assertNotEqual(replacement["claim_token"], expired["claim_token"])
+        self.assertEqual(state["claim_token"], replacement["claim_token"])
+        with self.assertRaisesRegex(RuntimeError, "owns the live coordinate lease"):
+            server.require_recovery_access(state, "owner-b")
+
+    def test_capture_call_tool_renews_claim_after_success(self) -> None:
+        window = self.window("0x1", "1")
+        claim = {"claim_token": "claim-token"}
+        with (
+            patch.object(server, "resolve_window", return_value=window),
+            patch.object(server, "require_window_access", return_value=claim),
+            patch.object(server, "capture_result", return_value={"captured": True}),
+            patch.object(server, "finish_claimed_window_access") as finish,
+        ):
+            result = server.call_tool(
+                "capture_session_window",
+                {"window": "0x1", "claim_token": "claim-token"},
+                "owner-a",
+            )
+
+        self.assertEqual(result, {"captured": True})
+        finish.assert_called_once_with(
+            BINDING, window, "owner-a", claim, renew=True
+        )
+
+    def test_capture_call_tool_does_not_renew_claim_after_failure(self) -> None:
+        window = self.window("0x1", "1")
+        claim = {"claim_token": "claim-token"}
+        with (
+            patch.object(server, "resolve_window", return_value=window),
+            patch.object(server, "require_window_access", return_value=claim),
+            patch.object(
+                server, "capture_result", side_effect=RuntimeError("capture failed")
+            ),
+            patch.object(server, "finish_claimed_window_access") as finish,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                server.call_tool(
+                    "capture_session_window",
+                    {"window": "0x1", "claim_token": "claim-token"},
+                    "owner-a",
+                )
+
+        finish.assert_called_once_with(
+            BINDING, window, "owner-a", claim, renew=False
+        )
+
+
