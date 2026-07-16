@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "X11 Codex Background Computer Use",
     "shortDescription": "Background capture and guarded control for Xorg.",
-    "longDescription": "Extends Computer Use on local EWMH Xorg sessions with expiring per-agent claims for parallel exact XComposite capture and per-window best-effort no-focus shortcuts, plus the existing explicitly acknowledged, journaled global-seat lease for reliable XTEST input. Supports Xfce, Cinnamon, MATE, LXQt/Openbox, and legacy GNOME or KDE Xorg sessions when their window manager exposes EWMH.",
+    "longDescription": "Extends Computer Use on local EWMH Xorg sessions with expiring per-agent window claims for parallel exact XComposite capture, per-window best-effort no-focus shortcuts, and claim-bound reliable XTEST input through one explicitly acknowledged, journaled global-seat lease. Supports Xfce, Cinnamon, MATE, LXQt/Openbox, and legacy GNOME or KDE Xorg sessions when their window manager exposes EWMH.",
     "developerName": "Gabe",
     "category": "Productivity",
     "capabilities": [

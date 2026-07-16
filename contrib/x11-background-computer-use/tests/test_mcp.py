@@ -70,6 +70,7 @@ class McpSmokeTests(TestCase):
                 "release_session_window",
                 "capture_session_window",
                 "send_window_shortcut",
+                "begin_input_lease",
             },
         )
         self.assertEqual(responses[3]["result"], {})
