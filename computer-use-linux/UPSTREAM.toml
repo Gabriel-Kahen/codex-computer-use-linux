@@ -1,0 +1,30 @@
+[primary]
+name = "agent-sh/computer-use-linux"
+repository = "https://github.com/agent-sh/computer-use-linux.git"
+ref = "main"
+rev = "c278cde7f644550ca7a1ade165e393844a321364"
+tree = "7478a875b972c40eda925bd870148cedcf7f6815"
+directory = "upstream"
+
+[secondary]
+name = "ilysenko/codex-desktop-linux"
+repository = "https://github.com/ilysenko/codex-desktop-linux.git"
+ref = "main"
+rev = "8494ee9ff73e233403ecf1fbf683c3e27bf99896"
+path = "computer-use-linux"
+
+[[local_patches]]
+name = "Plasma 5 KWin compatibility"
+source = "ilysenko/codex-desktop-linux@0bc0272689166aa337c36bd2ad236477e523599e"
+
+[[local_patches]]
+name = "Niri window backend"
+source = "ilysenko/codex-desktop-linux@bdd5885953fa69e585a836e5ad8e4c666733eae7"
+
+[[local_patches]]
+name = "ydotool CLI compatibility validation"
+source = "ilysenko/codex-desktop-linux@197d8bad470d5e3bda0b96eabaebc7cb972e20d6"
+
+[[local_patches]]
+name = "GNOME extension screenshot and reload detection"
+source = "ilysenko/codex-desktop-linux@eed9c0c8215655f73cf6313b0efdead81ec700ce"

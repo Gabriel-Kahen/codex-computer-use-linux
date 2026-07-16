@@ -9,7 +9,7 @@ This experimental Codex plugin operates applications already running in the user
 | Window discovery | `Meta.Window` through the Shell extension | None |
 | Stable IDs | `Meta.Window.get_stable_sequence()` | None; IDs expire when Shell/window restarts |
 | Agent coordination | Expiring, per-window claims keyed by Codex thread ID | Broker tools fence claimed windows; different windows proceed concurrently |
-| Semantic actions | Separate bundled Computer Use AT-SPI plugin | Normally none; agents honor claims by policy because AT-SPI runs outside this broker |
+| Semantic actions | Separate repository-owned Computer Use AT-SPI plugin | Normally none; agents honor claims by policy because AT-SPI runs outside this broker |
 | Exact capture | GNOME Shell focused-window screenshot | Requires target to already be focused or leased |
 | Pointer/keyboard | Mutter `Clutter.VirtualInputDevice` | Uses the global seat; pointer is restored after each pointer transaction |
 | Recovery | Shell-owned capability plus atomic, session-scoped state journals | Verifies workspace, focus, pointer, and minimized state before clearing the journal |
@@ -26,7 +26,7 @@ Consent is enforced at the MCP broker/tool boundary. GNOME Shell separately enfo
 - PyGObject (`python3-gobject`) for one persistent, caller-bound D-Bus connection
 - `gdbus`, `gnome-extensions`, and Python 3.10+
 - GNOME Shell's screenshot D-Bus service, or `gnome-screenshot` as a fallback
-- `computer-use@openai-bundled` for AT-SPI semantic controls
+- `computer-use-linux@codex-computer-use-linux` for AT-SPI semantic controls
 
 ## Install
 
@@ -39,10 +39,11 @@ Install and enable the local Shell integration first:
 On Wayland, log out and back in if GNOME does not load the extension immediately. Then install the plugins:
 
 ```sh
-codex plugin add computer-use@openai-bundled
 codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
   --sparse .agents/plugins \
+  --sparse computer-use-linux \
   --sparse contrib/gnome-same-session-computer-use
+codex plugin add computer-use-linux@codex-computer-use-linux
 codex plugin add gnome-same-session-computer-use@codex-computer-use-linux
 ```
 

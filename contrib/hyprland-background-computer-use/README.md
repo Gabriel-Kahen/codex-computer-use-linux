@@ -13,7 +13,7 @@ This project lets an automation agent inspect and operate the applications that 
 - Send address-targeted keyboard shortcuts.
 - Click, scroll, and drag inside background native Wayland windows without moving the physical cursor.
 - Click, scroll, and drag inside background XWayland windows through XWayland's internal XTEST pointer.
-- Work alongside the `computer-use@openai-bundled` plugin for AT-SPI semantic controls, text editing, and global-input fallback.
+- Work alongside the `computer-use-linux@codex-computer-use-linux` plugin for AT-SPI semantic controls, text editing, and global-input fallback.
 - Fall back to a temporary headless output for focus-dependent applications.
 - Fullscreen a fallback-only window over the temporary screen when necessary, then restore its original fullscreen mode, workspace, focus, and cursor.
 - Recover compositor state after an interrupted fallback lease.
@@ -77,23 +77,24 @@ Runtime and build dependencies include:
 - Python 3.10 or newer
 - an enabled AT-SPI session for semantic accessibility actions
 - a Codex CLI release with `codex plugin` support
-- `computer-use@openai-bundled`, which provides the AT-SPI and global-input Computer Use tools that this plugin's skill coordinates with
+- `computer-use-linux@codex-computer-use-linux`, which provides the AT-SPI and global-input Computer Use tools that this plugin's skill coordinates with
 
 The broker builds and loads the native extension on demand. Builds are cached outside the installed plugin under `${XDG_CACHE_HOME:-$HOME/.cache}/same-session-computer-use/` and keyed by the plugin source and running Hyprland version.
 
 ## Install
 
-Install the bundled Computer Use plugin, add this Git repository as a marketplace, and install the Hyprland companion:
+Add this Git repository as a marketplace, then install its Computer Use plugin and the Hyprland companion:
 
 ```bash
-codex plugin add computer-use@openai-bundled
 codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
   --sparse .agents/plugins \
+  --sparse computer-use-linux \
   --sparse contrib/hyprland-background-computer-use
+codex plugin add computer-use-linux@codex-computer-use-linux
 codex plugin add same-session-computer-use@codex-computer-use-linux
 ```
 
-Start a new Codex task after installation. The bundled Computer Use plugin owns AT-SPI semantic actions and focus-dependent global input. This plugin adds task-owned window claims, exact Hyprland window capture, address-targeted shortcuts, native Wayland pointer targeting, XWayland pointer targeting, and the transactional headless-output lease. Workers must respect the Hyprland claim before invoking semantic actions through the companion plugin; those external AT-SPI calls do not pass through this broker.
+Start a new Codex task after installation. The repository-owned Computer Use plugin owns AT-SPI semantic actions and focus-dependent global input. This plugin adds task-owned window claims, exact Hyprland window capture, address-targeted shortcuts, native Wayland pointer targeting, XWayland pointer targeting, and the transactional headless-output lease. Workers must respect the Hyprland claim before invoking semantic actions through the companion plugin; those external AT-SPI calls do not pass through this broker.
 
 Check that Codex sees both plugins:
 
@@ -124,7 +125,7 @@ codex plugin marketplace remove codex-computer-use-linux
 rm -rf "$PLUGIN_CACHE"
 ```
 
-The bundled Computer Use plugin is shared infrastructure. Keep it installed if you use it elsewhere; otherwise remove it separately with `codex plugin remove computer-use@openai-bundled`.
+The core Computer Use plugin is shared infrastructure. Keep it installed if you use it elsewhere; otherwise remove it separately with `codex plugin remove computer-use-linux@codex-computer-use-linux`.
 
 ## Build the native extension
 
@@ -142,7 +143,7 @@ The generated shared object is intentionally excluded from Git. Build it on the 
 ./bin/same-session-computer-use-mcp
 ```
 
-The included Codex plugin manifest registers this broker. Its skill coordinates these Hyprland-specific tools with the separate bundled Computer Use plugin's accessibility-first controls.
+The included Codex plugin manifest registers this broker. Its skill coordinates these Hyprland-specific tools with the separate core Computer Use plugin's accessibility-first controls.
 
 ## Safety boundary
 
