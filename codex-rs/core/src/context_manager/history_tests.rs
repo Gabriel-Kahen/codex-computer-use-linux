@@ -1347,12 +1347,29 @@ fn for_prompt_removes_pairs_with_oversized_output_envelopes() {
     let normal_pair = pair("normal".to_string(), None);
     let oversized_call_id_pair = pair("c".repeat(40_001), None);
     let oversized_turn_id_pair = pair("oversized-turn".to_string(), Some("t".repeat(40_001)));
+    let oversized_custom_id = "u".repeat(40_001);
+    let oversized_custom_call = ResponseItem::CustomToolCall {
+        id: None,
+        status: None,
+        call_id: oversized_custom_id.clone(),
+        name: "custom".to_string(),
+        namespace: None,
+        input: String::new(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let oversized_custom_output = custom_tool_call_output(&oversized_custom_id, "ok");
     let mut history = ContextManager::new();
     history.record_items(
         normal_pair
             .iter()
             .chain(&oversized_call_id_pair)
-            .chain(&oversized_turn_id_pair),
+            .chain(std::iter::once(&oversized_call_id_pair[0]))
+            .chain(&oversized_turn_id_pair)
+            .chain([
+                &oversized_custom_call,
+                &oversized_custom_call,
+                &oversized_custom_output,
+            ]),
         TruncationPolicy::Tokens(100_000),
     );
 
