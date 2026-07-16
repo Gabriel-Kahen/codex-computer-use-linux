@@ -22,7 +22,7 @@ from .native_plugin import file_guard
 from .native_plugin import plugin_build_requirements
 
 
-SERVER_INFO = {"name": "same-session-computer-use", "version": "0.1.1"}
+SERVER_INFO = {"name": "same-session-computer-use", "version": "0.2.0"}
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", PROTOCOL_VERSION})
 # Base64 expansion must stay below the rmcp client's 8 MiB stdio line cap.
@@ -31,13 +31,14 @@ MAX_CAPTURE_PIXELS = 7680 * 4320
 MAX_ERROR_TEXT_CHARS = 2048
 MAX_ERROR_ITEMS = 8
 MAX_WINDOW_RESULT_BYTES = 32 * 1024
+# Keep each duplicated text/structured claim page below the 1k-token review threshold.
+MAX_CLAIM_RESULT_BYTES = 2 * 1024
 MAX_WINDOWS_PER_PAGE = 20
+MAX_CLAIMS_PER_PAGE = 20
 MAX_WINDOW_TEXT_CHARS = 512
 # These two paths are retained as the migration source and global migration lock.
 LEASE_FILE = STATE_DIR / "coordinate-lease.json"
 LOCK_FILE = STATE_DIR / "coordinate-lease.lock"
-POINTER_LOCK_FILE = STATE_DIR / "pointer-transaction.lock"
-POINTER_LOCK = threading.Lock()
 _SESSION_ATTACHED = False
 _SESSION_ENV_LOCK = threading.Lock()
 _LEASE_GUARD_LOCAL = threading.local()
@@ -62,13 +63,49 @@ TOOLS = [
         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     {
+        "name": "claim_session_window",
+        "description": "Exclusively claim one real window for this Codex task. Claims are fenced by the host-provided task identity, expire automatically, and are renewed by calling this tool again from the same task.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS, "description": "Window address, exact-capture identifier, exact class, or title substring."},
+                "lease_seconds": {"type": "integer", "minimum": 5, "maximum": 300, "default": 60},
+            },
+            "required": ["window"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "release_session_window",
+        "description": "Release a live window claim owned by this Codex task. Releasing an already expired or released token is harmless.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH}},
+            "required": ["claim_token"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "list_window_claims",
+        "description": "List unexpired window claims for the active display and Hyprland instance. Fencing tokens are never disclosed by this tool.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cursor": {"type": ["string", "null"], "maxLength": 20},
+                "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_CLAIMS_PER_PAGE},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    },
+    {
         "name": "capture_session_window",
         "description": "Capture one exact real window without focusing it, moving it, changing workspace, or moving the pointer. Identify it by Hyprland address, exact-capture identifier, class, or title.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "window": {"type": "string", "description": "Hyprland address, exact-capture identifier, exact class, or title substring."},
+                "window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS, "description": "Hyprland address, exact-capture identifier, exact class, or title substring."},
                 "save_path": {"type": ["string", "null"], "description": "Optional absolute PNG path to atomically create or replace after capture succeeds."},
+                "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."},
             },
             "required": ["window"],
         },
@@ -80,9 +117,10 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "address": {"type": "string", "description": "Exact Hyprland window address from list_session_windows."},
+                "address": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Exact Hyprland window address from list_session_windows."},
                 "key": {"type": "string", "description": "Hyprland key name, such as x, SPACE, RETURN, or XF86AudioPlay."},
                 "modifiers": {"type": "string", "description": "Space-separated modifiers, such as CTRL SHIFT; empty for none.", "default": ""},
+                "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."},
             },
             "required": ["address", "key"],
         },
@@ -94,11 +132,12 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "window": {"type": "string"},
+                "window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS},
                 "x": {"type": "number"},
                 "y": {"type": "number"},
                 "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
                 "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1},
+                "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."},
             },
             "required": ["window", "x", "y"],
         },
@@ -109,7 +148,7 @@ TOOLS = [
         "description": "Scroll at an exact coordinate inside a real Wayland or XWayland window without moving the physical cursor, changing focus, or switching workspace.",
         "inputSchema": {
             "type": "object",
-            "properties": {"window": {"type": "string"}, "x": {"type": "number"}, "y": {"type": "number"}, "steps": {"type": "integer", "minimum": -20, "maximum": 20}},
+            "properties": {"window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS}, "x": {"type": "number"}, "y": {"type": "number"}, "steps": {"type": "integer", "minimum": -20, "maximum": 20}, "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."}},
             "required": ["window", "x", "y", "steps"],
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
@@ -120,8 +159,9 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "window": {"type": "string"}, "start_x": {"type": "number"}, "start_y": {"type": "number"}, "end_x": {"type": "number"}, "end_y": {"type": "number"},
+                "window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS}, "start_x": {"type": "number"}, "start_y": {"type": "number"}, "end_x": {"type": "number"}, "end_y": {"type": "number"},
                 "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "motion_steps": {"type": "integer", "minimum": 2, "maximum": 32, "default": 8},
+                "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."},
             },
             "required": ["window", "start_x", "start_y", "end_x", "end_y"],
         },
@@ -133,9 +173,10 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "window": {"type": "string", "description": "Window address, capture ID, exact class, or title substring."},
+                "window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS, "description": "Window address, capture ID, exact class, or title substring."},
                 "acknowledge_interference": {"type": "boolean", "description": "Must be true; raw pointer input can briefly contend with the user's physical input."},
                 "fullscreen_if_needed": {"type": "boolean", "description": "Fullscreen the target on the temporary screen when it is not already fullscreen. Defaults to true.", "default": True},
+                "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."},
             },
             "required": ["window", "acknowledge_interference"],
         },
@@ -144,13 +185,13 @@ TOOLS = [
     {
         "name": "capture_coordinate_desktop",
         "description": "Capture the temporary off-screen output for an active coordinate lease.",
-        "inputSchema": {"type": "object", "properties": {"lease_token": {"type": "string"}}, "required": ["lease_token"]},
+        "inputSchema": {"type": "object", "properties": {"lease_token": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["lease_token"]},
         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     {
         "name": "end_coordinate_lease",
         "description": "Restore the leased real window's original fullscreen mode, workspace, physical focus, and pointer, then remove the temporary output.",
-        "inputSchema": {"type": "object", "properties": {"lease_token": {"type": "string"}}, "required": ["lease_token"]},
+        "inputSchema": {"type": "object", "properties": {"lease_token": {"type": "string", "minLength": 1, "maxLength": 128}}, "required": ["lease_token"]},
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     {
@@ -476,12 +517,18 @@ def wait_for_window_fullscreen(address: str, mode: int, timeout: float = 5.0) ->
     raise RuntimeError(f"leased window did not reach fullscreen mode {mode}")
 
 
-def begin_lease(arguments: dict[str, Any]) -> dict[str, Any]:
+def begin_lease(
+    arguments: dict[str, Any],
+    *,
+    selected: dict[str, Any] | None = None,
+    owner_thread_id: str | None = None,
+    claim: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if arguments.get("acknowledge_interference") is not True:
         raise ValueError("acknowledge_interference must be true before using globally shared coordinate input")
     if load_lease():
         raise RuntimeError("a coordinate lease is already active; end or recover it first")
-    selected = resolve_window(str(arguments["window"]))
+    selected = selected or resolve_window(str(arguments["window"]))
     fullscreen_if_needed = arguments.get("fullscreen_if_needed", True)
     if not isinstance(fullscreen_if_needed, bool):
         raise ValueError("fullscreen_if_needed must be a boolean")
@@ -646,6 +693,132 @@ def capture_lease(token: str) -> dict[str, Any]:
         },
     }
     return {"content": [{"type": "text", "text": json.dumps(metadata, indent=2)}, {"type": "image", "data": data, "mimeType": "image/png"}], "isError": False}
+
+
+def claim_token_from(arguments: dict[str, Any]) -> str | None:
+    token = arguments.get("claim_token")
+    if token is None:
+        return None
+    if (
+        not isinstance(token, str)
+        or not token
+        or len(token) > coordination.MAX_CLAIM_TOKEN_LENGTH
+    ):
+        raise ValueError(
+            f"claim_token must contain 1..{coordination.MAX_CLAIM_TOKEN_LENGTH} characters"
+        )
+    return token
+
+
+def _lease_matches_window(state: dict[str, Any], window: dict[str, Any]) -> bool:
+    target = state.get("target") or {}
+    try:
+        return coordination.window_key(target) == coordination.window_key(window)
+    except RuntimeError:
+        return False
+
+
+def coordinate_reservation_owner(window: dict[str, Any]) -> str | None:
+    state = load_lease()
+    if not state or not _lease_matches_window(state, window):
+        return None
+    return str(state.get("owner_thread_id") or "<legacy-coordinate-lease>")
+
+
+def prevent_claim_release_during_lease(claim: dict[str, Any]) -> None:
+    state = load_lease()
+    if state and _lease_matches_window(state, claim.get("window") or {}):
+        raise RuntimeError("end the active coordinate lease before releasing its window claim")
+
+
+def require_global_input_available() -> None:
+    if load_lease():
+        raise RuntimeError("global input is reserved by an active coordinate lease")
+
+
+def require_window_access(
+    window: dict[str, Any],
+    arguments: dict[str, Any],
+    owner_thread_id: str | None,
+    *,
+    mark_inflight: bool = False,
+) -> dict[str, Any] | None:
+    return coordination.require_window_access(
+        session_binding(),
+        window,
+        owner_thread_id,
+        claim_token_from(arguments),
+        mark_inflight=mark_inflight,
+    )
+
+
+def require_window_mutation_access(
+    window: dict[str, Any],
+    arguments: dict[str, Any],
+    owner_thread_id: str | None,
+    *,
+    mark_inflight: bool = False,
+) -> dict[str, Any] | None:
+    state = load_lease()
+    if state and _lease_matches_window(state, window):
+        owner = state.get("owner_thread_id")
+        if owner is not None and owner != owner_thread_id:
+            raise RuntimeError("window is controlled by another agent's coordinate lease")
+        raise RuntimeError(
+            "window is on an active coordinate fallback; use that lease or end it before targeted input"
+        )
+    return require_window_access(
+        window, arguments, owner_thread_id, mark_inflight=mark_inflight
+    )
+
+
+def finish_claimed_window_access(
+    binding: dict[str, Any],
+    window: dict[str, Any],
+    owner_thread_id: str | None,
+    claim: dict[str, Any] | None,
+    *,
+    renew: bool,
+) -> dict[str, Any] | None:
+    if claim is None:
+        return None
+    if owner_thread_id is None:
+        raise RuntimeError("claimed operations require host-provided _meta.threadId")
+    return coordination.finish_window_access(
+        binding,
+        window,
+        owner_thread_id,
+        str(claim["claim_token"]),
+        renew=renew,
+    )
+
+
+def rebind_coordinate_claim(
+    window: dict[str, Any], owner_thread_id: str, claim: dict[str, Any]
+) -> None:
+    with lease_guard():
+        state = load_lease()
+        if not state or not _lease_matches_window(state, window):
+            return
+        if state.get("owner_thread_id") != owner_thread_id:
+            raise RuntimeError("window is reserved by another agent's coordinate lease")
+        state["claim_token"] = claim["claim_token"]
+        state["claim_expires_at"] = claim["expires_at"]
+        state["owner_expires_at"] = time.time() + coordination.DEFAULT_LEASE_SECONDS
+        save_lease(state)
+
+
+def same_coordinate_lease(
+    expected: dict[str, Any], current: dict[str, Any]
+) -> bool:
+    if expected.get("token") != current.get("token"):
+        return False
+    try:
+        return coordination.window_key(
+            expected.get("target") or {}
+        ) == coordination.window_key(current.get("target") or {})
+    except RuntimeError:
+        return False
 
 
 def physical_snapshot() -> dict[str, Any]:
@@ -817,8 +990,10 @@ def xdotool_target(window: dict[str, Any], command: list[str]) -> dict[str, Any]
     return {"backend": "xwayland-xtest", "xwindow_id": xid}
 
 
-def _targeted_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
-    window = resolve_window(str(arguments["window"]))
+def _targeted_pointer(
+    arguments: dict[str, Any], action: str, *, window: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    window = window or resolve_window(str(arguments["window"]))
     if window.get("xwayland"):
         ensure_native_input_safe()
     before = physical_snapshot()
@@ -870,21 +1045,44 @@ def _targeted_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
     return {"action": action, "window": bounded_window(window), "result": result, "observed_physical_state_unchanged": unchanged, "physical_state_before": before, "physical_state_after": after, "cursor_moved_by_backend": False, "keyboard_focus_changed_by_backend": False, "workspace_changed_by_backend": False}
 
 
-def targeted_pointer(arguments: dict[str, Any], action: str) -> dict[str, Any]:
-    # Pointer focus and the XWayland-internal pointer are process-global resources.
-    # Serialize transactions so simultaneous calls cannot interleave snapshot,
-    # injection, and restoration.
-    with POINTER_LOCK:
-        with file_guard(POINTER_LOCK_FILE):
-            return _targeted_pointer(arguments, action)
+def targeted_pointer(
+    arguments: dict[str, Any], action: str, owner_thread_id: str | None = None
+) -> dict[str, Any]:
+    window = resolve_window(str(arguments["window"]))
+    binding = session_binding()
+
+    def perform() -> dict[str, Any]:
+        with coordination.window_guard(binding, window):
+            claim = require_window_mutation_access(
+                window, arguments, owner_thread_id, mark_inflight=True
+            )
+            try:
+                result = _targeted_pointer(arguments, action, window=window)
+            except Exception:
+                finish_claimed_window_access(
+                    binding, window, owner_thread_id, claim, renew=False
+                )
+                raise
+            finish_claimed_window_access(
+                binding, window, owner_thread_id, claim, renew=True
+            )
+            return result
+
+    if window.get("xwayland"):
+        with coordination.global_input_guard():
+            require_global_input_available()
+            return perform()
+    return perform()
 
 
 def text_result(value: Any) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(value, indent=2, ensure_ascii=False)}], "structuredContent": value, "isError": False}
 
 
-def capture_result(arguments: dict[str, Any]) -> dict[str, Any]:
-    selected = resolve_window(str(arguments["window"]))
+def capture_result(
+    arguments: dict[str, Any], *, selected: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    selected = selected or resolve_window(str(arguments["window"]))
     requested_path = arguments.get("save_path")
     if requested_path:
         output = Path(str(requested_path)).expanduser()
@@ -953,6 +1151,9 @@ def status() -> dict[str, Any]:
             "background_semantic_actions": False,
             "targeted_wayland_pointer": native_available,
             "targeted_xwayland_pointer": native_available and checks["xdotool"],
+            "cross_process_window_claims": True,
+            "parallel_native_wayland_windows": True,
+            "broker_global_input_lane_serialized": True,
             "native_input_currently_safe": bool(safety_status and safety_status.get("safe_to_inject") is True),
             "physical_pointer_seat_is_independent": False,
         },
@@ -964,11 +1165,82 @@ def status() -> dict[str, Any]:
             "background_semantic_actions": "requires the separate Computer Use plugin and an enabled AT-SPI session",
         },
         "exact_window_count": exact_count,
-        "raw_pointer_note": "Hyprland still has one physical pointer seat, but normal coordinate actions bypass it by targeting a Wayland surface or XWayland's internal pointer. The physical cursor, keyboard focus, and workspace are preserved.",
+        "claim_lease_seconds": {"default": 60, "minimum": 5, "maximum": 300},
+        "raw_pointer_note": "Hyprland still has one physical pointer seat. Different native Wayland windows have independent broker lanes; this broker serializes its XWayland and fallback input, but separate same-user processes do not share that lock. The physical cursor, keyboard focus, and workspace are preserved by normal targeted actions.",
     }
 
 
-def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def send_window_shortcut(
+    arguments: dict[str, Any], owner_thread_id: str | None = None
+) -> dict[str, Any]:
+    address = str(arguments["address"])
+    window = next((window for window in combine_windows() if window.get("address") == address), None)
+    if not address.startswith("0x") or window is None:
+        raise ValueError("address must be a live Hyprland window address from list_session_windows")
+    key = str(arguments["key"])
+    modifiers = str(arguments.get("modifiers") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_+\-]+", key):
+        raise ValueError(
+            "key must be a Hyprland key name containing only letters, digits, underscore, plus, or hyphen"
+        )
+    if not re.fullmatch(r"[A-Za-z ]*", modifiers):
+        raise ValueError("modifiers may contain only modifier names and spaces")
+    binding = session_binding()
+
+    def perform() -> dict[str, Any]:
+        with coordination.window_guard(binding, window):
+            claim = require_window_mutation_access(
+                window, arguments, owner_thread_id, mark_inflight=True
+            )
+            try:
+                ensure_native_input_safe()
+                proc = run(
+                    [
+                        "hyprctl",
+                        "dispatch",
+                        f"hl.dsp.send_shortcut({{ mods = '{modifiers}', key = '{key}', window = 'address:{address}' }})",
+                    ]
+                )
+                if proc.returncode or "ok" not in proc.stdout.lower():
+                    raise RuntimeError(
+                        proc.stderr.strip()
+                        or proc.stdout.strip()
+                        or "targeted shortcut failed"
+                    )
+                result = {
+                    "sent": True,
+                    "address": address,
+                    "key": key,
+                    "modifiers": modifiers,
+                    "focus_changed": False,
+                    "pointer_moved": False,
+                }
+            except Exception:
+                finish_claimed_window_access(
+                    binding, window, owner_thread_id, claim, renew=False
+                )
+                raise
+            finish_claimed_window_access(
+                binding, window, owner_thread_id, claim, renew=True
+            )
+            return result
+
+    if window.get("xwayland"):
+        with coordination.global_input_guard():
+            require_global_input_available()
+            return perform()
+    return perform()
+
+
+def require_owner(owner_thread_id: str | None, tool_name: str) -> str:
+    if owner_thread_id is None:
+        raise RuntimeError(f"{tool_name} requires host-provided _meta.threadId")
+    return owner_thread_id
+
+
+def call_tool(
+    name: str, arguments: dict[str, Any], owner_thread_id: str | None = None
+) -> dict[str, Any]:
     if name == "session_status": return text_result(status())
     if name == "list_session_windows":
         limit = arguments.get("limit")
@@ -1001,25 +1273,111 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if not page and offset < len(windows):
             raise RuntimeError("a window entry exceeds the bounded listing result size")
         return text_result({"windows": page, "next_cursor": str(end) if end < len(windows) else None})
-    if name == "capture_session_window": return capture_result(arguments)
+    if name == "claim_session_window":
+        owner = require_owner(owner_thread_id, name)
+        lease_seconds = arguments.get("lease_seconds", coordination.DEFAULT_LEASE_SECONDS)
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+            raise ValueError("lease_seconds must be an integer")
+        window = resolve_window(str(arguments["window"]))
+        claim = coordination.claim_window(
+            session_binding(),
+            window,
+            owner,
+            lease_seconds,
+            reservation_owner=lambda: coordinate_reservation_owner(window),
+            after_claim=lambda claim: rebind_coordinate_claim(window, owner, claim),
+        )
+        return text_result(claim)
+    if name == "release_session_window":
+        owner = require_owner(owner_thread_id, name)
+        token = claim_token_from(arguments)
+        if token is None:
+            raise ValueError("claim_token is required")
+        return text_result(
+            coordination.release_claim(
+                session_binding(),
+                token,
+                owner,
+                before_release=prevent_claim_release_during_lease,
+            )
+        )
+    if name == "list_window_claims":
+        limit = arguments.get("limit")
+        if limit is None:
+            limit = MAX_CLAIMS_PER_PAGE
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_CLAIMS_PER_PAGE
+        ):
+            raise ValueError(
+                f"limit must be an integer between 1 and {MAX_CLAIMS_PER_PAGE}"
+            )
+        cursor = arguments.get("cursor")
+        if cursor is None:
+            offset = 0
+        elif (
+            isinstance(cursor, str)
+            and len(cursor) <= 20
+            and cursor.isascii()
+            and cursor.isdigit()
+        ):
+            offset = int(cursor)
+        else:
+            raise ValueError("cursor must be the next_cursor string from a previous result")
+        claims = coordination.list_claims(session_binding())
+        page: list[dict[str, Any]] = []
+        end = offset
+        while end < len(claims) and len(page) < limit:
+            candidate = [*page, claims[end]]
+            candidate_end = end + 1
+            candidate_result = {
+                "claims": candidate,
+                "next_cursor": str(candidate_end)
+                if candidate_end < len(claims)
+                else None,
+            }
+            encoded = json.dumps(
+                candidate_result, ensure_ascii=False, separators=(",", ":")
+            ).encode()
+            if len(encoded) > MAX_CLAIM_RESULT_BYTES:
+                break
+            page = candidate
+            end = candidate_end
+        if not page and offset < len(claims):
+            raise RuntimeError("a window claim exceeds the bounded listing result size")
+        return text_result(
+            {
+                "claims": page,
+                "next_cursor": str(end) if end < len(claims) else None,
+            }
+        )
+    if name == "capture_session_window":
+        window = resolve_window(str(arguments["window"]))
+        binding = session_binding()
+        with coordination.window_guard(binding, window):
+            claim = require_window_access(
+                window, arguments, owner_thread_id, mark_inflight=True
+            )
+            try:
+                result = capture_result(arguments, selected=window)
+            except Exception:
+                finish_claimed_window_access(
+                    binding, window, owner_thread_id, claim, renew=False
+                )
+                raise
+            finish_claimed_window_access(
+                binding, window, owner_thread_id, claim, renew=True
+            )
+            return result
     if name == "send_window_shortcut":
-        address = str(arguments["address"])
-        if not address.startswith("0x") or not any(w.get("address") == address for w in hypr_windows()):
-            raise ValueError("address must be a live Hyprland window address from list_session_windows")
-        key = str(arguments["key"])
-        modifiers = str(arguments.get("modifiers") or "")
-        if not re.fullmatch(r"[A-Za-z0-9_+\-]+", key):
-            raise ValueError("key must be a Hyprland key name containing only letters, digits, underscore, plus, or hyphen")
-        if not re.fullmatch(r"[A-Za-z ]*", modifiers):
-            raise ValueError("modifiers may contain only modifier names and spaces")
-        ensure_native_input_safe()
-        proc = run(["hyprctl", "dispatch", f"hl.dsp.send_shortcut({{ mods = '{modifiers}', key = '{key}', window = 'address:{address}' }})"])
-        if proc.returncode or "ok" not in proc.stdout.lower():
-            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "targeted shortcut failed")
-        return text_result({"sent": True, "address": address, "key": key, "modifiers": modifiers, "focus_changed": False, "pointer_moved": False})
-    if name == "targeted_pointer_click": return text_result(targeted_pointer(arguments, "click"))
-    if name == "targeted_pointer_scroll": return text_result(targeted_pointer(arguments, "scroll"))
-    if name == "targeted_pointer_drag": return text_result(targeted_pointer(arguments, "drag"))
+        return text_result(send_window_shortcut(arguments, owner_thread_id))
+    if name == "targeted_pointer_click":
+        return text_result(targeted_pointer(arguments, "click", owner_thread_id))
+    if name == "targeted_pointer_scroll":
+        return text_result(targeted_pointer(arguments, "scroll", owner_thread_id))
+    if name == "targeted_pointer_drag":
+        return text_result(targeted_pointer(arguments, "drag", owner_thread_id))
     if name == "begin_coordinate_lease":
         with lease_guard(): return text_result(begin_lease(arguments))
     if name == "capture_coordinate_desktop":
@@ -1033,6 +1391,24 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"unknown tool: {name}")
 
 
+def owner_from_params(params: dict[str, Any]) -> str | None:
+    metadata = params.get("_meta")
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        raise ValueError("tools/call params._meta must be an object")
+    owner = metadata.get("threadId")
+    if owner is None:
+        return None
+    if (
+        not isinstance(owner, str)
+        or not owner.strip()
+        or len(owner) > coordination.MAX_OWNER_LENGTH
+    ):
+        raise ValueError("tools/call params._meta.threadId must be a non-empty string")
+    return owner
+
+
 def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
     request_id = message.get("id")
     if request_id is None: return None
@@ -1041,13 +1417,16 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
         if method == "initialize":
             requested = (message.get("params") or {}).get("protocolVersion")
             negotiated = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
-            result = {"protocolVersion": negotiated, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate the user's real logged-in Hyprland session. Capture exact windows here; semantic AT-SPI actions require the separate Computer Use plugin."}
+            result = {"protocolVersion": negotiated, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate the user's real logged-in Hyprland session. Claim each target window before capture or mutation, renew longer work, and release it during cleanup. Different native Wayland windows can progress concurrently; semantic AT-SPI actions require the separate Computer Use plugin."}
         elif method == "tools/list": result = {"tools": TOOLS}
         elif method == "tools/call":
             params = message.get("params") or {}
+            if not isinstance(params, dict): raise ValueError("tool params must be an object")
             args = params.get("arguments") or {}
             if not isinstance(args, dict): raise ValueError("tool arguments must be an object")
-            result = call_tool(str(params.get("name") or ""), args)
+            result = call_tool(
+                str(params.get("name") or ""), args, owner_from_params(params)
+            )
         elif method == "ping": result = {}
         else: return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": bounded_error(f"method not found: {method}")}}
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
