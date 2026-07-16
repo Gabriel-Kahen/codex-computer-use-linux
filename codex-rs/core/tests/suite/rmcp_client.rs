@@ -1521,6 +1521,7 @@ async fn stdio_mixed_image_output_reaches_responses_once_in_order() -> anyhow::R
 
     let server = responses::start_mock_server().await;
     let call_id = "img-structured-1";
+    let oversized_call_id = "x".repeat(40_001);
     let server_name = "rmcp";
     let namespace = format!("mcp__{server_name}");
     let leading_caption = "before the image";
@@ -1538,6 +1539,12 @@ async fn stdio_mixed_image_output_reaches_responses_once_in_order() -> anyhow::R
             responses::ev_response_created("resp-1"),
             responses::ev_function_call_with_namespace(
                 call_id,
+                &namespace,
+                "image_scenario",
+                &tool_arguments,
+            ),
+            responses::ev_function_call_with_namespace(
+                &oversized_call_id,
                 &namespace,
                 "image_scenario",
                 &tool_arguments,
@@ -1582,7 +1589,10 @@ async fn stdio_mixed_image_output_reaches_responses_once_in_order() -> anyhow::R
         .await?;
     wait_for_event(&fixture.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let output_item = final_mock.single_request().function_call_output(call_id);
+    let request = final_mock.single_request();
+    let input = serde_json::to_string(&request.input())?;
+    assert!(!input.contains(&oversized_call_id));
+    let output_item = request.function_call_output(call_id);
     let output = output_item["output"]
         .as_array()
         .expect("mixed MCP output should be content items");

@@ -378,7 +378,29 @@ impl ContextManager {
             ) && estimate_item_token_count(item) > max_tokens
         }) {
             let output = self.items.remove(index);
-            normalize::remove_corresponding_for(&mut self.items, &output);
+            match output {
+                ResponseItem::FunctionCallOutput { call_id, .. } => self.items.retain(|item| {
+                    !matches!(
+                        item,
+                        ResponseItem::FunctionCall { call_id: existing, .. }
+                            | ResponseItem::FunctionCallOutput { call_id: existing, .. }
+                            if existing == &call_id
+                    ) && !matches!(
+                        item,
+                        ResponseItem::LocalShellCall { call_id: Some(existing), .. }
+                            if existing == &call_id
+                    )
+                }),
+                ResponseItem::CustomToolCallOutput { call_id, .. } => self.items.retain(|item| {
+                    !matches!(
+                        item,
+                        ResponseItem::CustomToolCall { call_id: existing, .. }
+                            | ResponseItem::CustomToolCallOutput { call_id: existing, .. }
+                            if existing == &call_id
+                    )
+                }),
+                _ => unreachable!("oversized item changed variants"),
+            }
             removed_pairs = removed_pairs.saturating_add(1);
         }
         if removed_pairs > 0 {
