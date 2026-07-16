@@ -13,6 +13,7 @@ import sys
 
 sys.path.insert(0, str(MODULE_ROOT))
 
+from plasma_same_session import focus_lease
 from plasma_same_session import kwin
 from plasma_same_session import server
 
@@ -36,7 +37,7 @@ class LeaseTests(TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.lease_file = Path(self.directory.name) / "lease.json"
-        self.patch = patch.object(server, "LEASE_FILE", self.lease_file)
+        self.patch = patch.object(focus_lease, "LEASE_FILE", self.lease_file)
         self.patch.start()
         self.lock_patch = patch.object(kwin, "screen_locked", return_value=False)
         self.lock_patch.start()
@@ -64,7 +65,7 @@ class LeaseTests(TestCase):
             self.assertEqual(prepared["target"]["id"], "{target}")
 
         activate.side_effect = assert_prepared_before_activation
-        result = server.begin_lease({"window": "Editor", "acknowledge_interference": True, "max_seconds": 30})
+        result = focus_lease.begin_lease({"window": "Editor", "acknowledge_interference": True, "max_seconds": 30})
 
         activate.assert_called_once_with("{target}")
         journal = json.loads(self.lease_file.read_text())
@@ -82,7 +83,7 @@ class LeaseTests(TestCase):
 
     def test_begin_requires_explicit_acknowledgement(self) -> None:
         with self.assertRaisesRegex(ValueError, "acknowledge_interference"):
-            server.begin_lease({"window": "Editor", "acknowledge_interference": False})
+            focus_lease.begin_lease({"window": "Editor", "acknowledge_interference": False})
 
     @patch.object(kwin, "pointer_position", return_value={"x": 5, "y": 7})
     @patch.object(kwin, "active_window_id", return_value="{original}")
@@ -113,7 +114,7 @@ class LeaseTests(TestCase):
         }
         self.lease_file.write_text(json.dumps(state))
 
-        result = server._restore(state)
+        result = focus_lease._restore(state)
 
         set_window_desktop.assert_called_once_with("{target}", 3)
         set_window_minimized.assert_called_once_with("{target}", False)
@@ -128,14 +129,14 @@ class LeaseTests(TestCase):
     def test_tokens_use_constant_time_comparison_path(self) -> None:
         self.lease_file.write_text(json.dumps({"token": "right"}))
         with self.assertRaisesRegex(ValueError, "does not match"):
-            server._require_lease("wrong")
+            focus_lease._require_lease("wrong")
 
     @patch.object(kwin, "pointer_position", return_value={"x": 5, "y": 7})
     @patch.object(kwin, "resolve_window", return_value={**WINDOW, "desktop": None})
     @patch.object(kwin, "screen_locked", return_value=False)
     def test_begin_refuses_unknown_target_desktop(self, _locked, _resolve, _pointer) -> None:
         with self.assertRaisesRegex(RuntimeError, "target desktop"):
-            server.begin_lease({"window": "Editor", "acknowledge_interference": True})
+            focus_lease.begin_lease({"window": "Editor", "acknowledge_interference": True})
         self.assertFalse(self.lease_file.exists())
 
     @patch.object(kwin, "active_window_id", return_value=None)
@@ -144,10 +145,10 @@ class LeaseTests(TestCase):
     @patch.object(kwin, "screen_locked", return_value=False)
     def test_begin_refuses_missing_original_active_window(self, _locked, _resolve, _pointer, _active) -> None:
         with self.assertRaisesRegex(RuntimeError, "original active window"):
-            server.begin_lease({"window": "Editor", "acknowledge_interference": True})
+            focus_lease.begin_lease({"window": "Editor", "acknowledge_interference": True})
         self.assertFalse(self.lease_file.exists())
 
-    @patch.object(server, "_restore", return_value={"recovery_complete": True, "errors": []})
+    @patch.object(focus_lease, "_restore", return_value={"recovery_complete": True, "errors": []})
     @patch.object(kwin, "activate")
     @patch.object(kwin, "pointer_position", return_value={"x": 5, "y": 7})
     @patch.object(kwin, "current_desktop", return_value=1)
@@ -159,7 +160,7 @@ class LeaseTests(TestCase):
         self, _locked, _resolve, _info, _active, _desktop, _pointer, _activate, restore
     ) -> None:
         with self.assertRaisesRegex(RuntimeError, "did not activate the target"):
-            server.begin_lease({"window": "Editor", "acknowledge_interference": True})
+            focus_lease.begin_lease({"window": "Editor", "acknowledge_interference": True})
         restore.assert_called_once()
 
     def test_begin_rechecks_lock_before_activation_and_retains_prepared_journal(self) -> None:
@@ -173,7 +174,7 @@ class LeaseTests(TestCase):
             patch.object(kwin, "activate") as activate,
         ):
             with self.assertRaisesRegex(RuntimeError, "session is locked"):
-                server.begin_lease({"window": "Editor", "acknowledge_interference": True})
+                focus_lease.begin_lease({"window": "Editor", "acknowledge_interference": True})
 
         activate.assert_not_called()
         self.assertEqual(json.loads(self.lease_file.read_text())["phase"], "prepared")
@@ -184,7 +185,7 @@ class LeaseTests(TestCase):
     def test_validate_rechecks_live_focus_and_is_explicitly_advisory(self, _windows, _locked, _active) -> None:
         state = {"phase": "active", "expires_at": 2**62, "target": WINDOW}
 
-        result = server.validate_focus_lease(state)
+        result = focus_lease.validate_focus_lease(state)
 
         self.assertTrue(result["advisory_ready"])
         self.assertFalse(result["external_input_gated_by_broker"])
@@ -196,7 +197,7 @@ class LeaseTests(TestCase):
     def test_validate_refuses_stale_or_lost_focus(self, _windows, _locked, _active) -> None:
         state = {"phase": "active", "expires_at": 0, "target": WINDOW}
 
-        result = server.validate_focus_lease(state)
+        result = focus_lease.validate_focus_lease(state)
 
         self.assertFalse(result["advisory_ready"])
         self.assertTrue(result["expired"])
@@ -221,7 +222,7 @@ class LeaseTests(TestCase):
         }
         self.lease_file.write_text(json.dumps(state))
 
-        result = server._restore(state)
+        result = focus_lease._restore(state)
 
         self.assertFalse(result["restored"])
         self.assertTrue(result["recovery_complete"])
@@ -235,7 +236,7 @@ class LeaseTests(TestCase):
         state = {"target": {}, "original": {"active_window": "", "desktop": 1}}
         self.lease_file.write_text(json.dumps(state))
 
-        result = server._restore(state)
+        result = focus_lease._restore(state)
 
         self.assertFalse(result["restored"])
         self.assertFalse(result["recovery_complete"])
@@ -248,7 +249,7 @@ class LeaseTests(TestCase):
         state = {"target": WINDOW, "original": {"active_window": "{original}", "desktop": 1}}
         self.lease_file.write_text(json.dumps(state))
 
-        result = server._restore(state)
+        result = focus_lease._restore(state)
 
         self.assertFalse(result["recovery_complete"])
         self.assertTrue(result["journal_retained"])
@@ -279,7 +280,7 @@ class LeaseTests(TestCase):
         }
         self.lease_file.write_text(json.dumps(state))
 
-        result = server._restore(state)
+        result = focus_lease._restore(state)
 
         self.assertFalse(result["recovery_complete"])
         self.assertTrue(result["pointer_restore_required"])
@@ -309,7 +310,7 @@ class LeaseTests(TestCase):
         }
         self.lease_file.write_text(json.dumps(state))
 
-        result = server._restore(state)
+        result = focus_lease._restore(state)
 
         self.assertFalse(result["recovery_complete"])
         self.assertFalse(result["verified"]["desktop"])
