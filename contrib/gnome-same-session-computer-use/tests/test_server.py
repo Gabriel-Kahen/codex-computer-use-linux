@@ -5,10 +5,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from typing import Any
 from unittest import TestCase
 from unittest.mock import patch
 
 from gnome_same_session import server
+from gnome_same_session.claims import ClaimRegistry
 
 
 WINDOWS = [
@@ -16,6 +18,11 @@ WINDOWS = [
     {"id": "12", "title": "Terminal", "app_id": "org.gnome.Terminal.desktop", "wm_class": "Gnome-terminal", "focused": True, "frame": {"width": 640, "height": 480}},
 ]
 CAPABILITY = "c" * 64
+SHELL_STATUS = {
+    "shell_instance": "shell-1",
+    "protocol_version": server.CLAIMED_LEASE_PROTOCOL_VERSION,
+    "capabilities": [server.CLAIMED_LEASE_CAPABILITY],
+}
 
 
 class ResolutionTests(TestCase):
@@ -165,6 +172,273 @@ class LeaseTests(TestCase):
 
                 call.assert_called_once_with("BeginLease", "11")
                 self.assertFalse(lease_file.exists())
+
+    def test_shell_restart_during_begin_cleans_pending_lease_without_activation(self) -> None:
+        events: list[str] = []
+
+        def call(method: str, *_args: str):
+            events.append(method)
+            if method == "Status":
+                return {"shell_instance": "shell-a"}
+            if method == "BeginLease":
+                return {
+                    "capability": CAPABILITY,
+                    "target": WINDOWS[0],
+                    "shell_instance": "shell-b",
+                }
+            if method == "RestoreLease":
+                return {"restored": True, "recovery_complete": True, "errors": []}
+            self.fail(f"unexpected D-Bus call {method}")
+
+        with TemporaryDirectory() as directory:
+            lease_file = Path(directory) / "lease.json"
+            with (
+                patch.object(server, "LEASE_FILE", lease_file),
+                patch.object(server, "load_lease", return_value=None),
+                patch.object(server, "dbus_call", side_effect=call),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "restarted while preparing"):
+                    server.begin_lease(
+                        {"window": "11", "acknowledge_interference": True},
+                        selected=WINDOWS[0],
+                        expected_shell_instance="shell-a",
+                    )
+
+            self.assertFalse(lease_file.exists())
+
+        self.assertEqual(events, ["Status", "BeginLease", "RestoreLease"])
+
+    def test_changed_prepared_target_is_cleaned_without_activation(self) -> None:
+        events: list[str] = []
+
+        def call(method: str, *_args: str):
+            events.append(method)
+            if method == "Status":
+                return {"shell_instance": "shell-a"}
+            if method == "BeginLease":
+                return {
+                    "capability": CAPABILITY,
+                    "target": WINDOWS[1],
+                    "shell_instance": "shell-a",
+                }
+            if method == "RestoreLease":
+                return {"restored": True, "recovery_complete": True, "errors": []}
+            self.fail(f"unexpected D-Bus call {method}")
+
+        with TemporaryDirectory() as directory:
+            lease_file = Path(directory) / "lease.json"
+            with (
+                patch.object(server, "LEASE_FILE", lease_file),
+                patch.object(server, "load_lease", return_value=None),
+                patch.object(server, "dbus_call", side_effect=call),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "different focus-lease target"):
+                    server.begin_lease(
+                        {"window": "11", "acknowledge_interference": True},
+                        selected=WINDOWS[0],
+                        expected_shell_instance="shell-a",
+                    )
+
+            self.assertFalse(lease_file.exists())
+
+        self.assertEqual(events, ["Status", "BeginLease", "RestoreLease"])
+
+    def test_claimed_lease_is_bound_to_thread_and_claim_expiry(self) -> None:
+        claim = {"claim_token": "w" * 64, "expires_at": 120.0}
+
+        def call(method: str, *args: str):
+            if method == "BeginClaimedLease":
+                self.assertEqual(args, ("11", "20.000000"))
+                return {"capability": CAPABILITY, "target": WINDOWS[0], "shell_instance": "shell-1"}
+            if method == "ActivateLease":
+                return {"state": {"focused_window": "11"}}
+            self.fail(f"unexpected D-Bus call {method}")
+
+        with TemporaryDirectory() as directory:
+            with (
+                patch.object(server, "LEASE_FILE", Path(directory) / "lease.json"),
+                patch.object(server, "STATE_DIR", Path(directory)),
+                patch.object(server.time, "time", return_value=100.0),
+                patch.object(server, "dbus_call", side_effect=call),
+            ):
+                server.begin_lease(
+                    {"window": "11", "acknowledge_interference": True},
+                    "thread-a",
+                    WINDOWS[0],
+                    claim,
+                )
+                state = json.loads(server.LEASE_FILE.read_text())
+
+        self.assertEqual(state["owner_thread_id"], "thread-a")
+        self.assertEqual(state["claim_token"], claim["claim_token"])
+
+    def test_focus_journal_reserves_expired_claim_until_cleanup(self) -> None:
+        now = [100.0]
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = ClaimRegistry(
+                root / "session",
+                server.SESSION_IDENTITY,
+                clock=lambda: now[0],
+                process_alive=lambda _broker: True,
+                broker=server.BROKER_IDENTITY,
+            )
+            with (
+                patch.object(server, "CLAIMS", registry),
+                patch.object(server, "LEASE_FILE", root / "session" / "focus-lease.json"),
+                patch.object(server, "LOCK_FILE", root / "session" / "focus-lease.lock"),
+                patch.object(server, "LEGACY_LEASE_FILE", root / "legacy.json"),
+                patch.object(server, "LEGACY_LOCK_FILE", root / "legacy.lock"),
+                patch.object(server, "MIGRATION_LOCK_FILE", root / "migration.lock"),
+                patch.object(server, "resolve_window", return_value=WINDOWS[0]),
+                patch.object(server, "shell_status", return_value=SHELL_STATUS),
+            ):
+                first = server.claim_window({"window": "11", "lease_seconds": 5}, "thread-a")
+                server.save_lease({
+                    "version": 3,
+                    "token": CAPABILITY,
+                    "target": WINDOWS[0],
+                    "owner_thread_id": "thread-a",
+                    "claim_token": first["claim_token"],
+                })
+                now[0] = 106.0
+                for owner in ("thread-a", "thread-b"):
+                    with self.subTest(owner=owner), self.assertRaisesRegex(
+                        RuntimeError, "reserved by an older claim"
+                    ):
+                        server.claim_window({"window": "11", "lease_seconds": 5}, owner)
+
+                server.LEASE_FILE.unlink()
+                replacement = server.claim_window(
+                    {"window": "11", "lease_seconds": 5}, "thread-a"
+                )
+
+        self.assertNotEqual(replacement["claim_token"], first["claim_token"])
+        self.assertFalse(replacement["renewed"])
+
+    def test_claim_rejects_shell_restart_without_retaining_claim(self) -> None:
+        cases = (
+            ("during resolution", ["shell-a", "shell-b"]),
+            ("before commit", ["shell-a", "shell-a", "shell-a", "shell-b"]),
+        )
+        for label, instances in cases:
+            with self.subTest(label=label), TemporaryDirectory() as directory:
+                registry = ClaimRegistry(
+                    Path(directory),
+                    server.SESSION_IDENTITY,
+                    process_alive=lambda _broker: True,
+                    broker=server.BROKER_IDENTITY,
+                )
+                statuses = [
+                    {**SHELL_STATUS, "shell_instance": shell_instance}
+                    for shell_instance in instances
+                ]
+                with (
+                    patch.object(server, "CLAIMS", registry),
+                    patch.object(server, "resolve_window", return_value=WINDOWS[0]),
+                    patch.object(server, "shell_status", side_effect=statuses),
+                    patch.object(server, "renew_focus_lease_for_claim"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "GNOME Shell restarted"):
+                        server.claim_window(
+                            {"window": "11", "lease_seconds": 60}, "thread-a"
+                        )
+
+                state = (
+                    json.loads(registry.claims_file.read_text())
+                    if registry.claims_file.exists()
+                    else {"claims": {}}
+                )
+                self.assertEqual(state["claims"], {})
+
+    def test_matching_legacy_journal_is_adopted_but_foreign_state_is_ignored(self) -> None:
+        cases = (
+            ("shell-1", None, True),
+            ("shell-2", None, False),
+            ("shell-1", "another-session", False),
+        )
+        for current_shell, journal_session, adopted in cases:
+            with self.subTest(
+                current_shell=current_shell, journal_session=journal_session
+            ), TemporaryDirectory() as directory:
+                root = Path(directory)
+                local = root / "sessions" / "current" / "focus-lease.json"
+                legacy = root / "focus-lease.json"
+                journal = {
+                    "version": 2,
+                    "token": CAPABILITY,
+                    "target": WINDOWS[0],
+                    "shell_instance": "shell-1",
+                }
+                if journal_session:
+                    journal["session_identity"] = journal_session
+                legacy.write_text(json.dumps(journal))
+                with (
+                    patch.object(server, "LEASE_FILE", local),
+                    patch.object(server, "LEGACY_LEASE_FILE", legacy),
+                    patch.object(server, "LEGACY_LOCK_FILE", root / "focus-lease.lock"),
+                    patch.object(server, "MIGRATION_LOCK_FILE", root / "migration.lock"),
+                    patch.object(
+                        server,
+                        "dbus_call",
+                        return_value={"shell_instance": current_shell},
+                    ),
+                ):
+                    state = server.load_lease()
+
+                self.assertEqual(state is not None, adopted)
+                self.assertEqual(local.exists(), adopted)
+                self.assertEqual(legacy.exists(), not adopted)
+                if state:
+                    self.assertEqual(state["session_identity"], server.SESSION_IDENTITY)
+
+    def test_nonowner_cannot_use_live_focus_lease(self) -> None:
+        state = {
+            "token": CAPABILITY,
+            "target": WINDOWS[0],
+            "owner_thread_id": "thread-a",
+        }
+        with patch.object(server, "load_lease", return_value=state):
+            with self.assertRaisesRegex(RuntimeError, "another computer-use agent"):
+                server.require_lease(CAPABILITY, "thread-b")
+
+    def test_nonowner_recovery_requires_bound_claim_to_be_stale(self) -> None:
+        claim_token = "w" * 64
+        state = {
+            "token": CAPABILITY,
+            "target": WINDOWS[0],
+            "owner_thread_id": "thread-a",
+            "claim_token": claim_token,
+        }
+        with (
+            patch.object(server, "file_guard"),
+            patch.object(server, "load_lease", return_value=state),
+            patch.object(server, "restore_lease", return_value={"restored": True}) as restore,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "still owns"):
+                server.recover_lease("thread-b", {"claim_token": claim_token})
+            result = server.recover_lease("thread-b", None)
+
+        self.assertEqual(result, {"restored": True})
+        restore.assert_called_once_with(state, recovery=True)
+
+    def test_nonowner_cannot_recover_live_unclaimed_broker(self) -> None:
+        state = {
+            "token": CAPABILITY,
+            "target": WINDOWS[0],
+            "owner_thread_id": "thread-a",
+            "claim_token": None,
+            "broker": server.BROKER_IDENTITY,
+        }
+        with (
+            patch.object(server, "file_guard"),
+            patch.object(server, "load_lease", return_value=state),
+            patch.object(server, "restore_lease") as restore,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "original unclaimed"):
+                server.recover_lease("thread-b", None)
+
+        restore.assert_not_called()
 
     def test_restore_keeps_journal_when_shell_restore_fails(self) -> None:
         state = {"token": CAPABILITY, "target": {"id": "11"}, "original": {"workspace": 0}}
@@ -398,7 +672,7 @@ class InputTests(TestCase):
             if path == server.LOCK_FILE:
                 events.append("lock-exit")
 
-        def require(_token: str):
+        def require(_token: str, _owner: str | None = None):
             events.append("validate")
             return {"token": CAPABILITY, "target": WINDOWS[0]}
 
@@ -454,9 +728,10 @@ class StatusTests(TestCase):
             patch.object(server, "Gio", object()),
             patch.object(server, "GLib", object()),
             patch.object(server.shutil, "which", return_value="/usr/bin/gdbus"),
-            patch.object(server, "dbus_call", return_value={"shell_version": "45"}),
+            patch.object(server, "dbus_call", return_value={"shell_version": "45", **SHELL_STATUS}),
             patch.object(server, "run", return_value=subprocess.CompletedProcess([], 0, "ScreenshotWindow", "")),
             patch.object(server, "load_lease", return_value=None),
+            patch.object(server.CLAIMS, "list", return_value=[]),
         ):
             result = server.status()
 
