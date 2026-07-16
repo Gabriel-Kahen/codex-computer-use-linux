@@ -36,8 +36,42 @@ class McpSmokeTests(TestCase):
         self.assertIn("AT-SPI", responses[1]["result"]["instructions"])
         tools = responses[2]["result"]["tools"]
         names = [tool["name"] for tool in tools]
-        self.assertEqual(len(names), 11)
+        self.assertEqual(len(names), 14)
         self.assertEqual(len(names), len(set(names)))
+        self.assertLessEqual(
+            {"claim_session_window", "release_session_window", "list_window_claims"},
+            set(names),
+        )
+        release_tool = next(
+            tool for tool in tools if tool["name"] == "release_session_window"
+        )
+        self.assertEqual(
+            release_tool["inputSchema"]["properties"]["claim_token"]["maxLength"],
+            128,
+        )
+        shortcut_tool = next(
+            tool for tool in tools if tool["name"] == "send_window_shortcut"
+        )
+        shortcut_properties = shortcut_tool["inputSchema"]["properties"]
+        self.assertEqual(shortcut_properties["key"]["maxLength"], 64)
+        self.assertEqual(shortcut_properties["modifiers"]["maxLength"], 64)
+        lease_key_tool = next(tool for tool in tools if tool["name"] == "lease_key")
+        lease_key_properties = lease_key_tool["inputSchema"]["properties"]
+        self.assertEqual(lease_key_properties["key"]["maxLength"], 64)
+        self.assertEqual(lease_key_properties["modifiers"]["maxLength"], 64)
+        claim_token_tools = {
+            tool["name"]
+            for tool in tools
+            if "claim_token" in tool["inputSchema"]["properties"]
+        }
+        self.assertEqual(
+            claim_token_tools,
+            {
+                "release_session_window",
+                "capture_session_window",
+                "send_window_shortcut",
+            },
+        )
         self.assertEqual(responses[3]["result"], {})
         for tool in tools:
             self.assertEqual(tool["inputSchema"]["type"], "object")

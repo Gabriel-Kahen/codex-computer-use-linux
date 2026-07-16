@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -18,9 +19,16 @@ from typing import Any
 from .capture import build_requirements
 from .capture import capture_window
 from .capture import ensure_capture_helper
+from .coordination import DEFAULT_LEASE_SECONDS
+from .coordination import MAX_CLAIM_TOKEN_LENGTH
+from .coordination import MAX_INFLIGHT_SECONDS
+from .coordination import MAX_LEASE_SECONDS
+from .coordination import MAX_OWNER_LENGTH
+from .coordination import MIN_LEASE_SECONDS
+from .coordination import WindowClaimStore
 
 
-SERVER_INFO = {"name": "x11-same-session-computer-use", "version": "0.1.0"}
+SERVER_INFO = {"name": "x11-same-session-computer-use", "version": "0.2.0"}
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", PROTOCOL_VERSION})
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "x11-same-session-computer-use"
@@ -30,6 +38,9 @@ MAX_WINDOW_RESULT_BYTES = 32 * 1024
 MAX_WINDOWS_PER_PAGE = 20
 MAX_WINDOW_TEXT_CHARS = 512
 MAX_ERROR_RESULT_BYTES = 8 * 1024
+MAX_CLAIM_RESULT_BYTES = 2 * 1024
+MAX_SHORTCUT_KEY_CHARS = 64
+MAX_SHORTCUT_MODIFIERS_CHARS = 64
 
 
 class IdentityMatch(Enum):
@@ -120,13 +131,24 @@ def tool(name: str, description: str, properties: dict[str, Any], required: list
 
 WINDOW = {"window": {"type": "string", "description": "Live XID, exact WM_CLASS, or unique title substring from list_session_windows."}}
 TOKEN = {"lease_token": {"type": "string"}}
+CLAIM_TOKEN = {
+    "claim_token": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": MAX_CLAIM_TOKEN_LENGTH,
+        "description": "Optional fencing token returned by claim_session_window.",
+    }
+}
 TOOLS = [
     tool("session_status", "Inspect EWMH X11 session support and the exact safety boundary.", {}, read_only=True, idempotent=True),
     tool("list_session_windows", "List one bounded page of same-UID windows advertised by the current EWMH window manager, including stable-for-lifetime XIDs and AT-SPI correlation hints.", {"cursor": {"type": ["string", "null"]}, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_WINDOWS_PER_PAGE}}, read_only=True, idempotent=True),
-    tool("capture_session_window", "Capture the compositor's exact unobscured pixmap for one mapped X11 window without focusing it, changing desktops, or moving the pointer.", {**WINDOW, "save_path": {"type": ["string", "null"]}}, ["window"], idempotent=True),
-    tool("send_window_shortcut", "Best-effort no-focus XSendEvent shortcut delivery. Many modern clients reject synthetic events; use an acknowledged input lease when reliable delivery is required.", {**WINDOW, "key": {"type": "string"}, "modifiers": {"type": "string", "default": ""}}, ["window", "key"]),
+    tool("claim_session_window", "Claim one live window for this Codex agent's observe-act-verify cycle. Different windows remain available to other agents; a same-window claim is exclusive and expiring.", {**WINDOW, "lease_seconds": {"type": "integer", "minimum": MIN_LEASE_SECONDS, "maximum": MAX_LEASE_SECONDS, "default": DEFAULT_LEASE_SECONDS}}, ["window"]),
+    tool("release_session_window", "Release this Codex agent's live window claim unless an unfinished input lease still reserves that window.", CLAIM_TOKEN, ["claim_token"], idempotent=True),
+    tool("list_window_claims", "List active, session-bound window claims after pruning expired agent ownership.", {}, read_only=True, idempotent=True),
+    tool("capture_session_window", "Capture the compositor's exact unobscured pixmap for one mapped X11 window without focusing it, changing desktops, or moving the pointer.", {**WINDOW, **CLAIM_TOKEN, "save_path": {"type": ["string", "null"]}}, ["window"], idempotent=True),
+    tool("send_window_shortcut", "Best-effort no-focus XSendEvent shortcut delivery. Many modern clients reject synthetic events; use an acknowledged input lease when reliable delivery is required.", {**WINDOW, **CLAIM_TOKEN, "key": {"type": "string", "minLength": 1, "maxLength": MAX_SHORTCUT_KEY_CHARS}, "modifiers": {"type": "string", "maxLength": MAX_SHORTCUT_MODIFIERS_CHARS, "default": ""}}, ["window", "key"]),
     tool("begin_input_lease", "Begin an explicit journaled focus/pointer lease for reliable XTEST input, snapshotting the active desktop, focus, pointer, and target minimized state for restoration.", {**WINDOW, "acknowledge_interference": {"type": "boolean"}}, ["window", "acknowledge_interference"]),
-    tool("lease_key", "Send a reliable key or shortcut while the acknowledged target input lease is active.", {**TOKEN, "key": {"type": "string"}, "modifiers": {"type": "string", "default": ""}}, ["lease_token", "key"]),
+    tool("lease_key", "Send a reliable key or shortcut while the acknowledged target input lease is active.", {**TOKEN, "key": {"type": "string", "minLength": 1, "maxLength": MAX_SHORTCUT_KEY_CHARS}, "modifiers": {"type": "string", "maxLength": MAX_SHORTCUT_MODIFIERS_CHARS, "default": ""}}, ["lease_token", "key"]),
     tool("lease_pointer_click", "Click a target-window-local coordinate during an acknowledged input lease, then restore the pointer position.", {**TOKEN, "x": {"type": "integer"}, "y": {"type": "integer"}, "button": {"type": "string", "enum": ["left", "middle", "right"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
     tool("lease_pointer_scroll", "Scroll a target-window-local coordinate during an acknowledged input lease, then restore the pointer position.", {**TOKEN, "x": {"type": "integer"}, "y": {"type": "integer"}, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
     tool("lease_pointer_drag", "Drag between target-window-local coordinates during an acknowledged input lease. A journaled pressed-button marker allows crash recovery.", {**TOKEN, "start_x": {"type": "integer"}, "start_y": {"type": "integer"}, "end_x": {"type": "integer"}, "end_y": {"type": "integer"}, "button": {"type": "string", "enum": ["left", "middle", "right"], "default": "left"}, "motion_steps": {"type": "integer", "minimum": 2, "maximum": 32, "default": 8}}, ["lease_token", "start_x", "start_y", "end_x", "end_y"]),
@@ -137,6 +159,29 @@ TOOLS = [
 
 def run(args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def _request_owner(meta: Any) -> str:
+    if isinstance(meta, dict) and "threadId" in meta:
+        thread_id = meta["threadId"]
+        if not isinstance(thread_id, str) or not thread_id or len(thread_id) > MAX_OWNER_LENGTH:
+            raise ValueError(f"MCP _meta.threadId must be a non-empty string of at most {MAX_OWNER_LENGTH} characters")
+        return thread_id
+    return f"mcp-process:{os.getpid()}"
+
+
+def _claim_token(arguments: dict[str, Any]) -> str | None:
+    token = arguments.get("claim_token")
+    if token is not None and (
+        not isinstance(token, str)
+        or not token
+        or len(token) > MAX_CLAIM_TOKEN_LENGTH
+    ):
+        raise ValueError(
+            "claim_token must be a non-empty string of at most "
+            f"{MAX_CLAIM_TOKEN_LENGTH} characters"
+        )
+    return token
 
 
 def _process_start_time(pid: int) -> str | None:
@@ -325,10 +370,14 @@ def _window_identity(xid: str | None) -> dict[str, Any] | None:
     start_time = _process_start_time(pid) if pid else None
     if not pid or not start_time or not _pid_belongs_to_session(pid):
         return None
-    wm_class = run(["xprop", "-id", xid, "WM_CLASS"])
-    if wm_class.returncode:
+    return {"xid": xid, "pid": pid, "process_start_time": start_time}
+
+
+def _stable_window_identity(identity: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(identity, dict):
         return None
-    return {"xid": xid, "pid": pid, "process_start_time": start_time, "wm_class": wm_class.stdout[:MAX_WINDOW_TEXT_CHARS].strip()}
+    stable = {key: identity.get(key) for key in ("xid", "pid", "process_start_time")}
+    return stable if all(value is not None for value in stable.values()) else None
 
 
 def _identity_matches(expected: dict[str, Any] | None) -> IdentityMatch:
@@ -340,7 +389,10 @@ def _identity_matches(expected: dict[str, Any] | None) -> IdentityMatch:
     try:
         current = _window_identity(xid)
         if current is not None:
-            return IdentityMatch.MATCH if current == expected else IdentityMatch.CHANGED
+            stable_current = _stable_window_identity(current)
+            stable_expected = _stable_window_identity(expected)
+            matches = stable_current == stable_expected if stable_current and stable_expected else current == expected
+            return IdentityMatch.MATCH if matches else IdentityMatch.CHANGED
         existence = run(["xprop", "-id", xid, "WM_CLASS"])
     except (OSError, RuntimeError, subprocess.SubprocessError):
         return IdentityMatch.INDETERMINATE
@@ -352,10 +404,72 @@ def _identity_matches(expected: dict[str, Any] | None) -> IdentityMatch:
     return IdentityMatch.INDETERMINATE
 
 
+def _resolve_target(query: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    window = resolve_window(query)
+    identity = _window_identity(window["xid"])
+    if not identity or identity["pid"] != window["pid"]:
+        raise RuntimeError("the target X11 window identity changed while it was being resolved")
+    return window, identity
+
+
+def _resolve_bound_target(query: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    before = ensure_session()
+    window, identity = _resolve_target(query)
+    after = ensure_session()
+    if before != after:
+        raise RuntimeError("the verified X11 server or window manager changed during resolution")
+    return window, identity, after
+
+
+def _claim_store(session_fingerprint: dict[str, Any] | None = None) -> WindowClaimStore:
+    return WindowClaimStore(STATE_DIR, session_fingerprint or ensure_session())
+
+
+def _require_lease_reservation_access(
+    identity: dict[str, Any],
+    owner_thread_id: str,
+) -> dict[str, Any] | None:
+    state = load_lease()
+    if (
+        not state
+        or _stable_window_identity(state.get("target_identity"))
+        != _stable_window_identity(identity)
+    ):
+        return None
+    lease_owner = state.get("owner_thread_id") or "<legacy-input-lease>"
+    if lease_owner != owner_thread_id:
+        raise RuntimeError("window is reserved by another agent's unfinished input lease")
+    return state
+
+
+def _prevent_claim_release_during_lease(record: dict[str, Any]) -> None:
+    state = load_lease()
+    if not state:
+        return
+    same_token = secrets.compare_digest(
+        str(state.get("window_claim_token") or ""),
+        str(record.get("token") or ""),
+    )
+    same_window = (
+        _stable_window_identity(state.get("target_identity"))
+        == _stable_window_identity(record.get("window_identity"))
+    )
+    if same_token or same_window:
+        raise RuntimeError("end or recover the bound input lease before releasing its window claim")
+
+
+def _validate_session_fingerprint(expected: dict[str, Any]) -> None:
+    if ensure_session() != expected:
+        raise RuntimeError(
+            "refusing lease recovery because the verified X11 login or X server/WM fingerprint changed"
+        )
+
+
 def _validate_session_binding(state: dict[str, Any]) -> None:
     expected = state.get("session_fingerprint")
-    if not isinstance(expected, dict) or ensure_session() != expected:
+    if not isinstance(expected, dict):
         raise RuntimeError("refusing lease recovery because the verified X11 login or X server/WM fingerprint changed")
+    _validate_session_fingerprint(expected)
 
 
 def _validate_lease_binding(state: dict[str, Any]) -> None:
@@ -589,8 +703,20 @@ def _ensure_target_active(state: dict[str, Any]) -> None:
 
 
 def _shortcut(arguments: dict[str, Any]) -> str:
-    key = str(arguments["key"])
-    modifiers = str(arguments.get("modifiers") or "")
+    key = arguments["key"]
+    modifiers = arguments.get("modifiers") or ""
+    if not isinstance(key, str) or not 1 <= len(key) <= MAX_SHORTCUT_KEY_CHARS:
+        raise ValueError(
+            f"key must contain 1..{MAX_SHORTCUT_KEY_CHARS} characters"
+        )
+    if (
+        not isinstance(modifiers, str)
+        or len(modifiers) > MAX_SHORTCUT_MODIFIERS_CHARS
+    ):
+        raise ValueError(
+            "modifiers must contain at most "
+            f"{MAX_SHORTCUT_MODIFIERS_CHARS} characters"
+        )
     if not re.fullmatch(r"[A-Za-z0-9_+\-]+", key):
         raise ValueError("key contains unsupported characters")
     names = [name.lower() for name in modifiers.split()]
@@ -728,6 +854,13 @@ def status() -> dict[str, Any]:
     session_ok = session_error is None
     compositor = _compositor_active() if not session_error else False
     lock_state = _lock_state() if session_ok else None
+    active_claims: list[dict[str, Any]] = []
+    claim_error = None
+    if session_ok:
+        try:
+            active_claims = _claim_store().list_active()
+        except Exception as exc:
+            claim_error = _bounded_error_text(exc)
     return {
         "session": "current local Xorg/EWMH login",
         "display": os.environ.get("DISPLAY"),
@@ -738,15 +871,20 @@ def status() -> dict[str, Any]:
             "reliable_journaled_focus_pointer_lease": session_ok and checks["xdotool"] and checks["xinput"] and lock_state is not None,
             "targeted_background_pointer_without_interference": False,
             "background_semantic_actions": False,
+            "parallel_distinct_window_claims": session_ok and claim_error is None,
+            "parallel_exact_capture_for_distinct_windows": compositor and all(build.values()),
+            "parallel_reliable_global_input": False,
         },
         "checks": checks,
         "capture_build_requirements": build,
         "compositing_manager_active": compositor,
         "locked_hint_verified": lock_state is not None,
         "same_uid_window_count": sum(window["same_uid"] for window in windows),
+        "active_window_claim_count": len(active_claims),
+        "window_claim_error": claim_error,
         "unfinished_lease": LEASE_FILE.exists(),
         "semantic_action_companion": "Use the separate Computer Use plugin over AT-SPI, correlated by PID/title/WM_CLASS from list_session_windows.",
-        "input_boundary": "X11 has one shared focus and pointer. XSendEvent shortcuts are unconfirmed; reliable XTEST input requires an explicit lease and briefly interferes with the real session.",
+        "input_boundary": "Distinct claimed windows can be captured and receive targeted XSendEvent shortcuts concurrently. X11 still has one shared focus and pointer, so reliable XTEST actions use one serialized global-input lane and briefly interfere with the real session.",
     }
 
 
@@ -776,7 +914,12 @@ def tool_error(exc: Exception) -> dict[str, Any]:
     return result(error[:low] + suffix)
 
 
-def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def call_tool(
+    name: str,
+    arguments: dict[str, Any],
+    owner_thread_id: str | None = None,
+) -> dict[str, Any]:
+    owner_thread_id = owner_thread_id or _request_owner(None)
     if name == "session_status":
         return text_result(status())
     if name == "list_session_windows":
@@ -808,20 +951,107 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if not page and offset < len(windows):
             raise RuntimeError("a window entry exceeds the bounded listing result size")
         return text_result({"windows": page, "next_cursor": str(end) if end < len(windows) else None})
-    if name == "capture_session_window":
-        return capture_window(resolve_window(str(arguments["window"])), arguments.get("save_path"))
-    if name == "send_window_shortcut":
+    if name == "claim_session_window":
+        window, identity, session_fingerprint = _resolve_bound_target(str(arguments["window"]))
+        store = _claim_store(session_fingerprint)
+        with store.window_guard(identity):
+            _validate_session_fingerprint(session_fingerprint)
+            if _identity_matches(identity) is not IdentityMatch.MATCH:
+                raise RuntimeError("the target X11 window identity changed before it could be claimed")
+            if _require_lease_reservation_access(identity, owner_thread_id):
+                raise RuntimeError(
+                    "end or recover the unfinished input lease before renewing or reacquiring its window claim"
+                )
+            return text_result(
+                store.claim(
+                    owner_thread_id,
+                    window,
+                    identity,
+                    arguments.get("lease_seconds", DEFAULT_LEASE_SECONDS),
+                )
+            )
+    if name == "release_session_window":
+        claim_token = _claim_token(arguments)
         with lease_guard():
-            if load_lease():
-                raise RuntimeError("end or recover the active input lease before sending a direct shortcut")
-            window = resolve_window(str(arguments["window"]))
+            store = _claim_store()
+            session_fingerprint = store.session_fingerprint
+            return text_result(
+                store.release(
+                    owner_thread_id,
+                    claim_token,
+                    validate_guarded=lambda: _validate_session_fingerprint(
+                        session_fingerprint
+                    ),
+                    before_release=_prevent_claim_release_during_lease,
+                )
+            )
+    if name == "list_window_claims":
+        active = _claim_store().list_active()
+        claims: list[dict[str, Any]] = []
+        for claim in active:
+            candidate = {"claims": [*claims, claim], "truncated": False}
+            if _serialized_size(candidate) > MAX_CLAIM_RESULT_BYTES:
+                break
+            claims.append(claim)
+        return text_result({"claims": claims, "truncated": len(claims) < len(active)})
+    if name == "capture_session_window":
+        window, identity, session_fingerprint = _resolve_bound_target(str(arguments["window"]))
+        store = _claim_store(session_fingerprint)
+        with store.window_guard(identity):
+            _validate_session_fingerprint(session_fingerprint)
+            if _identity_matches(identity) is not IdentityMatch.MATCH:
+                raise RuntimeError("the target X11 window identity changed before capture")
+            _require_lease_reservation_access(identity, owner_thread_id)
+            claim = store.assert_access(
+                owner_thread_id,
+                identity,
+                _claim_token(arguments),
+                mark_inflight=True,
+            )
+            succeeded = False
+            try:
+                result = capture_window(window, arguments.get("save_path"))
+                succeeded = True
+                return result
+            finally:
+                if claim:
+                    store.finish_access(
+                        owner_thread_id,
+                        identity,
+                        claim["claim_token"],
+                        renew=succeeded,
+                    )
+    if name == "send_window_shortcut":
+        window, identity, session_fingerprint = _resolve_bound_target(str(arguments["window"]))
+        store = _claim_store(session_fingerprint)
+        with store.window_guard(identity):
+            _validate_session_fingerprint(session_fingerprint)
+            if _identity_matches(identity) is not IdentityMatch.MATCH:
+                raise RuntimeError("the target X11 window identity changed before shortcut delivery")
+            _require_lease_reservation_access(identity, owner_thread_id)
+            claim = store.assert_access(
+                owner_thread_id,
+                identity,
+                _claim_token(arguments),
+                mark_inflight=True,
+            )
+            succeeded = False
             shortcut = _shortcut(arguments)
-            ensure_session()
-            _ensure_input_safe()
-            proc = run(["xdotool", "key", "--window", window["xid"], shortcut])
-            if proc.returncode:
-                raise RuntimeError(proc.stderr.strip() or "best-effort XSendEvent shortcut failed")
-            return text_result({"sent": True, "delivery_confirmed": False, "mechanism": "XSendEvent", "window": window, "shortcut": shortcut, "focus_changed": False})
+            try:
+                _ensure_input_safe()
+                proc = run(["xdotool", "key", "--window", window["xid"], shortcut])
+                if proc.returncode:
+                    raise RuntimeError(proc.stderr.strip() or "best-effort XSendEvent shortcut failed")
+                succeeded = True
+                return text_result({"sent": True, "delivery_confirmed": False, "mechanism": "XSendEvent", "window": window, "shortcut": shortcut, "focus_changed": False})
+            finally:
+                if claim:
+                    store.finish_access(
+                        owner_thread_id,
+                        identity,
+                        claim["claim_token"],
+                        renew=succeeded,
+                    )
     if name == "begin_input_lease":
         with lease_guard():
             return text_result(begin_lease(arguments))
@@ -850,7 +1080,7 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
         if method == "initialize":
             requested = (message.get("params") or {}).get("protocolVersion")
             negotiated = requested if isinstance(requested, str) and requested in SUPPORTED_PROTOCOL_VERSIONS else PROTOCOL_VERSION
-            result = {"protocolVersion": negotiated, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate only same-UID windows in the current local EWMH Xorg login. Prefer AT-SPI through the separate Computer Use plugin; use exact XComposite capture here, and acknowledge a journaled input lease for reliable coordinate or keyboard input."}
+            result = {"protocolVersion": negotiated, "capabilities": {"tools": {}}, "serverInfo": SERVER_INFO, "instructions": "Operate only same-UID windows in the current local EWMH Xorg login. Claim windows for concurrent exact capture or targeted XSendEvent shortcuts. Prefer AT-SPI through the separate Computer Use plugin; reliable XTEST input still uses the serialized acknowledged global-seat lease."}
         elif method == "tools/list":
             result = {"tools": TOOLS}
         elif method == "tools/call":
@@ -859,7 +1089,11 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must be an object")
             try:
-                result = call_tool(str(params.get("name") or ""), arguments)
+                result = call_tool(
+                    str(params.get("name") or ""),
+                    arguments,
+                    _request_owner(params.get("_meta")),
+                )
             except Exception as exc:
                 result = tool_error(exc)
         elif method == "ping":
