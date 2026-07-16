@@ -740,6 +740,33 @@ class StatusTests(TestCase):
         self.assertFalse(capabilities["targeted_background_pointer"])
         self.assertFalse(capabilities["targeted_background_keyboard"])
         self.assertTrue(capabilities["recoverable_focus_lease"])
+        self.assertTrue(capabilities["parallel_window_claims"])
+
+    def test_old_extension_keeps_legacy_leases_but_disables_claimed_leases(self) -> None:
+        legacy = {"shell_version": "45", "shell_instance": "shell-1"}
+        with (
+            patch.dict(server.os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}),
+            patch.object(server, "Gio", object()),
+            patch.object(server, "GLib", object()),
+            patch.object(server.shutil, "which", return_value="/usr/bin/gdbus"),
+            patch.object(server, "dbus_call", return_value=legacy),
+            patch.object(server, "run", return_value=subprocess.CompletedProcess([], 0, "ScreenshotWindow", "")),
+            patch.object(server, "load_lease", return_value=None),
+            patch.object(server.CLAIMS, "list", return_value=[]),
+        ):
+            result = server.status()
+
+        self.assertTrue(result["capabilities"]["recoverable_focus_lease"])
+        self.assertFalse(result["capabilities"]["parallel_window_claims"])
+        self.assertFalse(result["requirements"]["claimed_focus_lease_protocol"])
+
+        with (
+            patch.object(server, "shell_status", return_value=legacy),
+            patch.object(server, "resolve_window") as resolve,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "install-gnome-integration"):
+                server.claim_window({"window": "11"}, "thread-a")
+        resolve.assert_not_called()
 
     def test_bounds_integration_status(self) -> None:
         oversized = "x" * server.MAX_MCP_STDOUT_LINE_BYTES
@@ -882,6 +909,312 @@ class McpTests(TestCase):
                 self.assertLessEqual(len(result["error"]["message"]), server.MAX_ERROR_TEXT_CHARS)
                 self.assertLess(len(encoded), 4096)
 
+    def test_host_metadata_is_the_only_claim_owner_source(self) -> None:
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "claim_session_window",
+                "_meta": {"threadId": "trusted-thread"},
+                "arguments": {"window": "11", "threadId": "spoofed-thread"},
+            },
+        }
+        with patch.object(server, "claim_window", return_value={"claim_token": "w" * 64}) as claim:
+            response = server.dispatch(request)
+
+        self.assertNotIn("error", response)
+        claim.assert_called_once_with(request["params"]["arguments"], "trusted-thread")
+        self.assertIsNone(
+            server.owner_from_params({"arguments": {"_meta": {"threadId": "spoofed-thread"}}})
+        )
+
+    def test_call_tool_routes_claimed_capture_through_session_and_input_fences(self) -> None:
+        events: list[str] = []
+        claim = {
+            "claim_token": "w" * 64,
+            "owner_thread_id": "thread-a",
+            "window": WINDOWS[0],
+            "lease_seconds": 60,
+        }
+
+        @contextmanager
+        def authorize(window_id, owner, token, shell_instance, *, on_complete):
+            self.assertEqual(
+                (window_id, owner, token, shell_instance),
+                ("11", "thread-a", claim["claim_token"], "shell-1"),
+            )
+            events.append("claim-enter")
+            yield claim
+            on_complete(claim)
+            events.append("claim-exit")
+
+        @contextmanager
+        def guard(path):
+            events.append(f"{path.name}-enter")
+            yield
+            events.append(f"{path.name}-exit")
+
+        @contextmanager
+        def input_lock():
+            events.append("input-thread-enter")
+            yield
+            events.append("input-thread-exit")
+
+        def capture(*args, **kwargs):
+            events.append("capture")
+            self.assertEqual(args[:4], ({"window": "11", "claim_token": claim["claim_token"]}, "thread-a", WINDOWS[0], claim))
+            self.assertEqual(kwargs, {"expected_shell_instance": "shell-1"})
+            return {"content": [], "isError": False}
+
+        with (
+            patch.object(server, "resolve_window_for_shell", return_value=(WINDOWS[0], "shell-1")),
+            patch.object(server, "shell_status", return_value=SHELL_STATUS),
+            patch.object(server.CLAIMS, "authorize", side_effect=authorize),
+            patch.object(server, "file_guard", side_effect=guard),
+            patch.object(server, "INPUT_LOCK", input_lock()),
+            patch.object(server, "capture_window", side_effect=capture),
+            patch.object(
+                server,
+                "renew_focus_lease_for_claim",
+                side_effect=lambda _claim: events.append("renew"),
+            ),
+        ):
+            result = server.call_tool(
+                "capture_session_window",
+                {"window": "11", "claim_token": claim["claim_token"]},
+                "thread-a",
+            )
+
+        self.assertFalse(result["isError"])
+        self.assertEqual(
+            events,
+            [
+                "claim-enter",
+                "focus-lease.lock-enter",
+                "input-thread-enter",
+                "input.lock-enter",
+                "capture",
+                "input.lock-exit",
+                "input-thread-exit",
+                "focus-lease.lock-exit",
+                "renew",
+                "claim-exit",
+            ],
+        )
+
+    def test_call_tool_keeps_unclaimed_capture_compatible_with_old_extension(self) -> None:
+        @contextmanager
+        def authorize(*_args, **_kwargs):
+            yield None
+
+        @contextmanager
+        def unlocked(*_args, **_kwargs):
+            yield
+
+        with (
+            patch.object(server, "resolve_window_for_shell", return_value=(WINDOWS[1], "legacy-shell")),
+            patch.object(server, "shell_status") as shell_status,
+            patch.object(server.CLAIMS, "authorize", side_effect=authorize),
+            patch.object(server, "file_guard", side_effect=unlocked),
+            patch.object(server, "capture_window", return_value={"content": [], "isError": False}) as capture,
+        ):
+            result = server.call_tool("capture_session_window", {"window": "12"}, None)
+
+        self.assertFalse(result["isError"])
+        shell_status.assert_not_called()
+        capture.assert_called_once_with(
+            {"window": "12"},
+            None,
+            WINDOWS[1],
+            None,
+            expected_shell_instance="legacy-shell",
+        )
+
+    def test_call_tool_forwards_claim_to_begin_pointer_and_shortcut(self) -> None:
+        claim = {
+            "claim_token": "w" * 64,
+            "owner_thread_id": "thread-a",
+            "window": WINDOWS[0],
+            "lease_seconds": 60,
+        }
+        authorizations: list[tuple[str, str | None, Any, str]] = []
+
+        @contextmanager
+        def authorize(window_id, owner, token, shell_instance, *, on_complete):
+            authorizations.append((window_id, owner, token, shell_instance))
+            if owner != "thread-a" or token != claim["claim_token"]:
+                raise ValueError("claim authorization rejected")
+            yield claim
+            on_complete(claim)
+
+        @contextmanager
+        def unlocked(*_args, **_kwargs):
+            yield
+
+        with (
+            patch.object(server, "resolve_window_for_shell", return_value=(WINDOWS[0], "shell-1")),
+            patch.object(server, "shell_status", return_value=SHELL_STATUS),
+            patch.object(server, "lease_target_id", return_value="11"),
+            patch.object(server.CLAIMS, "authorize", side_effect=authorize),
+            patch.object(server, "file_guard", side_effect=unlocked),
+            patch.object(server, "begin_lease", return_value={"lease_token": CAPABILITY}) as begin,
+            patch.object(server, "pointer_action", return_value={"clicked": True}) as pointer,
+            patch.object(server, "send_shortcut", return_value={"sent": True}) as shortcut,
+            patch.object(server, "renew_focus_lease_for_claim") as renew,
+        ):
+            server.call_tool(
+                "begin_focus_lease",
+                {"window": "11", "acknowledge_interference": True, "claim_token": claim["claim_token"]},
+                "thread-a",
+            )
+            server.call_tool(
+                "lease_pointer_click",
+                {"lease_token": CAPABILITY, "claim_token": claim["claim_token"], "x": 1, "y": 2},
+                "thread-a",
+            )
+            server.call_tool(
+                "send_lease_shortcut",
+                {"lease_token": CAPABILITY, "claim_token": claim["claim_token"], "key": "F6"},
+                "thread-a",
+            )
+            with self.assertRaisesRegex(ValueError, "authorization rejected"):
+                server.call_tool(
+                    "lease_pointer_click",
+                    {"lease_token": CAPABILITY, "claim_token": "x" * 64, "x": 1, "y": 2},
+                    "thread-b",
+                )
+
+        self.assertEqual(authorizations, [
+            ("11", "thread-a", claim["claim_token"], "shell-1"),
+            ("11", "thread-a", claim["claim_token"], "shell-1"),
+            ("11", "thread-a", claim["claim_token"], "shell-1"),
+            ("11", "thread-b", "x" * 64, "shell-1"),
+        ])
+        begin.assert_called_once_with(
+            {"window": "11", "acknowledge_interference": True, "claim_token": claim["claim_token"]},
+            "thread-a",
+            WINDOWS[0],
+            claim,
+            expected_shell_instance="shell-1",
+        )
+        pointer.assert_called_once_with(
+            {"lease_token": CAPABILITY, "claim_token": claim["claim_token"], "x": 1, "y": 2},
+            "click",
+            "thread-a",
+            claim,
+            "11",
+        )
+        shortcut.assert_called_once_with(
+            {"lease_token": CAPABILITY, "claim_token": claim["claim_token"], "key": "F6"},
+            "thread-a",
+            claim,
+            "11",
+        )
+        self.assertEqual(renew.call_count, 3)
+
+    def test_call_tool_end_and_recovery_preserve_owner_and_token_fencing(self) -> None:
+        state = {
+            "token": CAPABILITY,
+            "target": WINDOWS[0],
+            "owner_thread_id": "thread-a",
+            "claim_token": "w" * 64,
+            "broker": server.BROKER_IDENTITY,
+        }
+
+        @contextmanager
+        def unlocked(*_args, **_kwargs):
+            yield
+
+        @contextmanager
+        def inspect(*_args, **_kwargs):
+            yield {"claim_token": "w" * 64, "owner_thread_id": "thread-a"}
+
+        with (
+            patch.object(server, "file_guard", side_effect=unlocked),
+            patch.object(server, "load_lease", return_value=state),
+            patch.object(server, "shell_status", return_value=SHELL_STATUS),
+            patch.object(server.CLAIMS, "inspect", side_effect=inspect),
+            patch.object(server, "restore_lease", return_value={"restored": True}) as restore,
+        ):
+            ended = server.call_tool("end_focus_lease", {"lease_token": CAPABILITY}, "thread-a")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                server.call_tool("end_focus_lease", {"lease_token": "x" * 64}, "thread-a")
+            with self.assertRaisesRegex(RuntimeError, "another computer-use agent"):
+                server.call_tool("recover_focus_lease", {}, "thread-b")
+
+        self.assertTrue(ended["structuredContent"]["restored"])
+        restore.assert_called_once_with(state, recovery=False)
+
+    def test_unicode_claim_pages_are_byte_bounded_without_token_disclosure(self) -> None:
+        claims = [
+            {
+                "window": {
+                    "id": str(index),
+                    "title": "🧪" * 128,
+                    "app_id": "🖥️" * 96,
+                },
+                "owner_thread_id": "🤖" * 128,
+                "claimed_at": 100.0,
+                "expires_at": 160.0,
+                "lease_seconds": 60,
+            }
+            for index in range(12)
+        ]
+        with (
+            patch.object(server, "shell_status", return_value={"shell_instance": "shell-1"}),
+            patch.object(server.CLAIMS, "list", return_value=claims),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "retry with limit"):
+                server.call_tool("list_window_claims", {})
+
+            pages = []
+            cursor = None
+            while True:
+                arguments = {"limit": server.MAX_CLAIMS_PER_PAGE}
+                if cursor is not None:
+                    arguments["cursor"] = cursor
+                page = server.call_tool("list_window_claims", arguments)
+                pages.append(page)
+                cursor = page["structuredContent"]["next_cursor"]
+                if cursor is None:
+                    break
+
+        self.assertEqual(
+            [claim["window"]["id"] for page in pages for claim in page["structuredContent"]["claims"]],
+            sorted(str(index) for index in range(12)),
+        )
+        for page in pages:
+            structured = json.dumps(
+                page["structuredContent"], ensure_ascii=False, separators=(",", ":")
+            ).encode()
+            response = json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "result": page},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode()
+            self.assertLessEqual(len(structured), server.MAX_CLAIM_RESULT_BYTES)
+            self.assertLess(len(response), 12 * 1024)
+            self.assertNotIn("claim_token", page["structuredContent"]["claims"][0])
+
+    def test_invalid_claim_token_is_bounded_and_not_echoed(self) -> None:
+        untrusted = "untrusted-secret-" + "x" * 300
+        with patch.object(server, "shell_status", return_value={"shell_instance": "shell-1"}):
+            response = server.dispatch({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "release_session_window",
+                    "_meta": {"threadId": "thread-a"},
+                    "arguments": {"claim_token": untrusted},
+                },
+            })
+
+        encoded = json.dumps(response, separators=(",", ":"))
+        self.assertNotIn(untrusted, encoded)
+        self.assertLessEqual(len(response["error"]["message"]), server.MAX_ERROR_TEXT_CHARS)
+
     def test_manifest_launcher_and_protocol_smoke(self) -> None:
         root = Path(__file__).resolve().parents[1]
         manifest = json.loads((root / ".codex-plugin/plugin.json").read_text())
@@ -893,6 +1226,14 @@ class McpTests(TestCase):
 
         self.assertEqual(manifest["name"], "gnome-same-session-computer-use")
         self.assertEqual(len(tools), len({item["name"] for item in tools}))
-        self.assertEqual(len(tools), 10)
+        self.assertEqual(len(tools), 13)
         annotations = {item["name"]: item["annotations"] for item in tools}
         self.assertFalse(annotations["end_focus_lease"]["idempotentHint"])
+        schemas = {item["name"]: item["inputSchema"] for item in tools}
+        self.assertEqual(schemas["release_session_window"]["required"], ["claim_token"])
+        self.assertEqual(schemas["release_session_window"]["properties"]["claim_token"]["maxLength"], 256)
+        self.assertEqual(schemas["list_window_claims"]["properties"]["cursor"]["maxLength"], 20)
+        self.assertEqual(
+            schemas["claim_session_window"]["properties"]["lease_seconds"],
+            {"type": "integer", "minimum": 5, "maximum": 300, "default": 60},
+        )

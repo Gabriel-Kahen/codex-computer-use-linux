@@ -36,7 +36,7 @@ except (ImportError, ValueError):
     GLib = None
 
 
-SERVER_INFO = {"name": "gnome-same-session-computer-use", "version": "0.1.0"}
+SERVER_INFO = {"name": "gnome-same-session-computer-use", "version": "0.2.0"}
 PROTOCOL_VERSION = "2025-11-25"
 MAX_MCP_STDOUT_LINE_BYTES = 8 * 1024 * 1024
 MAX_CAPTURE_PNG_BYTES = 5 * 1024 * 1024
@@ -86,18 +86,23 @@ def tool(name: str, description: str, properties: dict[str, Any], required: list
     }
 
 
-WINDOW = {"type": "string", "description": "Stable GNOME window id, exact app id/class, or title substring."}
-TOKEN = {"type": "string", "description": "Token returned by begin_focus_lease."}
+WINDOW = {"type": "string", "minLength": 1, "maxLength": 512, "description": "Stable GNOME window id, exact app id/class, or title substring."}
+TOKEN = {"type": "string", "minLength": 64, "maxLength": 256, "description": "Token returned by begin_focus_lease."}
+CLAIM_TOKEN = {"type": "string", "minLength": 64, "maxLength": 256, "description": "Opaque token returned by claim_session_window."}
+CURSOR = {"type": ["string", "null"], "maxLength": 20}
 POINT = {"type": "number", "minimum": 0}
 TOOLS = [
     tool("session_status", "Report GNOME/Mutter integration health and exact capability boundaries.", {}, [], read_only=True, idempotent=True),
-    tool("list_session_windows", "List one bounded page of windows in the user's real GNOME Shell session.", {"cursor": {"type": ["string", "null"]}, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_WINDOWS_PER_PAGE}}, [], read_only=True, idempotent=True),
-    tool("capture_session_window", "Capture an exact focused window. An unfocused window must first be placed under an acknowledged focus lease.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}}, ["window"], idempotent=True),
-    tool("begin_focus_lease", "Journal desktop state, switch to and focus an existing window, and authorize brief global-seat contention until restored.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}}, ["window", "acknowledge_interference"]),
-    tool("lease_pointer_click", "Click a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "x": POINT, "y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
-    tool("lease_pointer_scroll", "Scroll in a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "x": POINT, "y": POINT, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
-    tool("lease_pointer_drag", "Drag in a leased window using Mutter's global virtual seat, restoring the pointer after release.", {"lease_token": TOKEN, "start_x": POINT, "start_y": POINT, "end_x": POINT, "end_y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "motion_steps": {"type": "integer", "minimum": 2, "maximum": 32, "default": 8}}, ["lease_token", "start_x", "start_y", "end_x", "end_y"]),
-    tool("send_lease_shortcut", "Send one key or shortcut to the currently focused leased window through Mutter's global virtual keyboard.", {"lease_token": TOKEN, "key": {"type": "string"}, "modifiers": {"type": "array", "items": {"type": "string", "enum": ["CTRL", "SHIFT", "ALT", "SUPER"]}, "default": []}}, ["lease_token", "key"]),
+    tool("list_session_windows", "List one bounded page of windows in the user's real GNOME Shell session.", {"cursor": CURSOR, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_WINDOWS_PER_PAGE}}, [], read_only=True, idempotent=True),
+    tool("claim_session_window", "Exclusively claim one window for this Codex thread while allowing other threads to claim different windows concurrently.", {"window": WINDOW, "lease_seconds": {"type": "integer", "minimum": MIN_LEASE_SECONDS, "maximum": MAX_LEASE_SECONDS, "default": DEFAULT_LEASE_SECONDS}}, ["window"]),
+    tool("release_session_window", "Release a window claim owned by this Codex thread.", {"claim_token": CLAIM_TOKEN}, ["claim_token"], idempotent=True),
+    tool("list_window_claims", "List one bounded page of live window claims without exposing their capability tokens.", {"cursor": CURSOR, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_CLAIMS_PER_PAGE}}, [], read_only=True, idempotent=True),
+    tool("capture_session_window", "Capture an exact focused window. An unfocused window must first be placed under an acknowledged focus lease.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}, "claim_token": CLAIM_TOKEN}, ["window"], idempotent=True),
+    tool("begin_focus_lease", "Journal desktop state, switch to and focus an existing window, and authorize brief global-seat contention until restored.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}, "claim_token": CLAIM_TOKEN}, ["window", "acknowledge_interference"]),
+    tool("lease_pointer_click", "Click a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
+    tool("lease_pointer_scroll", "Scroll in a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
+    tool("lease_pointer_drag", "Drag in a leased window using Mutter's global virtual seat, restoring the pointer after release.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "start_x": POINT, "start_y": POINT, "end_x": POINT, "end_y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "motion_steps": {"type": "integer", "minimum": 2, "maximum": 32, "default": 8}}, ["lease_token", "start_x", "start_y", "end_x", "end_y"]),
+    tool("send_lease_shortcut", "Send one key or shortcut to the currently focused leased window through Mutter's global virtual keyboard.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "key": {"type": "string", "minLength": 1, "maxLength": 64}, "modifiers": {"type": "array", "maxItems": 4, "items": {"type": "string", "enum": ["CTRL", "SHIFT", "ALT", "SUPER"]}, "default": []}}, ["lease_token", "key"]),
     tool("end_focus_lease", "Restore the pre-lease workspace, focused window, and pointer from the journal.", {"lease_token": TOKEN}, ["lease_token"]),
     tool("recover_focus_lease", "Restore any unfinished focus lease after a broker interruption or crash.", {}, [], idempotent=True),
 ]
@@ -938,8 +943,16 @@ def status() -> dict[str, Any]:
         screenshot_service = screenshot.returncode == 0 and "ScreenshotWindow" in screenshot.stdout
     checks["focused_window_screenshot"] = screenshot_service or shutil.which("gnome-screenshot") is not None
     ready = integration is not None
+    claimed_leases_ready = ready and shell_supports_claimed_leases(integration)
+    claim_count: int | None = None
+    claim_error: str | None = None
+    if integration:
+        try:
+            claim_count = len(CLAIMS.list(integration["shell_instance"]))
+        except Exception as exc:
+            claim_error = bounded_text(exc, MAX_ERROR_TEXT_CHARS)
     return {
-        "desktop": desktop,
+        "desktop": bounded_text(desktop),
         "integration": integration,
         "integration_error": error,
         "capabilities": {
@@ -952,13 +965,19 @@ def status() -> dict[str, Any]:
             "targeted_background_keyboard": False,
             "recoverable_focus_lease": ready,
             "lease_pointer_restoration": ready,
+            "parallel_window_claims": claimed_leases_ready,
+            "serialized_global_seat": ready,
         },
         "requirements": {
             **checks,
             "gnome_shell_extension": ready,
-            "background_semantic_actions": "provided by the separate computer-use@openai-bundled AT-SPI plugin",
+            "claimed_focus_lease_protocol": claimed_leases_ready,
+            "background_semantic_actions": "provided by a separate AT-SPI process; broker claims are policy coordination there, not a mechanical fence",
         },
         "active_lease": load_lease() is not None,
+        "active_window_claims": claim_count,
+        "claim_journal_error": claim_error,
+        "session_identity": SESSION_IDENTITY,
         "safety_note": "Mutter exposes one global seat; lease input can visibly contend with physical input and cannot detect every held hardware button.",
     }
 
@@ -967,26 +986,30 @@ def text_result(value: Any) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(value, indent=2, ensure_ascii=False)}], "structuredContent": value, "isError": False}
 
 
-def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def page_arguments(arguments: dict[str, Any], maximum: int) -> tuple[int, int | None, bool]:
+    requested_limit = arguments.get("limit")
+    if requested_limit is not None and (
+        isinstance(requested_limit, bool)
+        or not isinstance(requested_limit, int)
+        or not 1 <= requested_limit <= maximum
+    ):
+        raise ValueError(f"limit must be an integer between 1 and {maximum}")
+    cursor = arguments.get("cursor")
+    if cursor is None:
+        offset = 0
+    elif isinstance(cursor, str) and len(cursor) <= 20 and cursor.isascii() and cursor.isdigit():
+        offset = int(cursor)
+    else:
+        raise ValueError("cursor must be the next_cursor string from a previous result")
+    return offset, requested_limit, requested_limit is not None or cursor is not None
+
+
+def call_tool(name: str, arguments: dict[str, Any], owner: str | None = None) -> dict[str, Any]:
     if name == "session_status":
         return text_result(status())
     if name == "list_session_windows":
-        requested_limit = arguments.get("limit")
-        if requested_limit is not None and (
-            isinstance(requested_limit, bool)
-            or not isinstance(requested_limit, int)
-            or not 1 <= requested_limit <= MAX_WINDOWS_PER_PAGE
-        ):
-            raise ValueError(f"limit must be an integer between 1 and {MAX_WINDOWS_PER_PAGE}")
-        cursor = arguments.get("cursor")
-        if cursor is None:
-            offset = 0
-        elif isinstance(cursor, str) and len(cursor) <= 20 and cursor.isascii() and cursor.isdigit():
-            offset = int(cursor)
-        else:
-            raise ValueError("cursor must be the next_cursor string from a previous result")
+        offset, requested_limit, paginated = page_arguments(arguments, MAX_WINDOWS_PER_PAGE)
         listed = [window_summary(window) for window in windows()]
-        paginated = requested_limit is not None or cursor is not None
         limit = requested_limit if requested_limit is not None else (MAX_WINDOWS_PER_PAGE if paginated else len(listed))
         page: list[dict[str, Any]] = []
         end = offset
@@ -1012,25 +1035,129 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             "next_cursor": str(end) if end < len(listed) else None,
             "stable_id_lifetime": "until GNOME Shell or the window restarts",
         })
+    if name == "claim_session_window":
+        result = claim_window(arguments, owner)
+        if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) > MAX_CLAIM_RESULT_BYTES:
+            raise RuntimeError("window claim result exceeds the bounded model-visible result size")
+        return text_result(result)
+    if name == "release_session_window":
+        return text_result(release_window(arguments, owner))
+    if name == "list_window_claims":
+        shell = shell_status()
+        offset, requested_limit, paginated = page_arguments(arguments, MAX_CLAIMS_PER_PAGE)
+        listed = sorted(
+            CLAIMS.list(shell["shell_instance"]),
+            key=lambda claim: str((claim.get("window") or {}).get("id") or ""),
+        )
+        limit = requested_limit if requested_limit is not None else (MAX_CLAIMS_PER_PAGE if paginated else len(listed))
+        page: list[dict[str, Any]] = []
+        end = offset
+        while end < len(listed) and len(page) < limit:
+            candidate = [*page, listed[end]]
+            candidate_end = end + 1
+            candidate_result = {
+                "claims": candidate,
+                "next_cursor": str(candidate_end) if candidate_end < len(listed) else None,
+                "truncated": candidate_end < len(listed),
+            }
+            encoded = json.dumps(candidate_result, ensure_ascii=False, separators=(",", ":")).encode()
+            if len(encoded) > MAX_CLAIM_RESULT_BYTES:
+                break
+            page = candidate
+            end = candidate_end
+        if not paginated and end < len(listed):
+            raise RuntimeError("window claim list exceeds the model-visible result size; retry with limit to paginate")
+        if not page and offset < len(listed):
+            raise RuntimeError("a window claim entry exceeds the bounded listing result size")
+        return text_result({
+            "claims": page,
+            "next_cursor": str(end) if end < len(listed) else None,
+            "truncated": end < len(listed),
+        })
     if name == "capture_session_window":
-        return capture_window(arguments)
+        selected, shell_instance = resolve_window_for_shell(arguments.get("window"))
+        with CLAIMS.authorize(
+            str(selected["id"]),
+            owner,
+            arguments.get("claim_token"),
+            shell_instance,
+            on_complete=renew_focus_lease_for_claim,
+        ) as claim:
+            if claim:
+                require_claimed_lease_support(require_shell_instance(shell_instance))
+            with file_guard(LOCK_FILE):
+                with INPUT_LOCK, file_guard(INPUT_FILE):
+                    return capture_window(
+                        arguments,
+                        owner,
+                        selected,
+                        claim,
+                        expected_shell_instance=shell_instance,
+                    )
     if name == "begin_focus_lease":
-        with file_guard(LOCK_FILE):
-            return text_result(begin_lease(arguments))
+        selected, shell_instance = resolve_window_for_shell(arguments.get("window"))
+        with CLAIMS.authorize(
+            str(selected["id"]),
+            owner,
+            arguments.get("claim_token"),
+            shell_instance,
+            on_complete=renew_focus_lease_for_claim,
+        ) as claim:
+            if claim:
+                require_claimed_lease_support(require_shell_instance(shell_instance))
+            with file_guard(LOCK_FILE):
+                with INPUT_LOCK, file_guard(INPUT_FILE):
+                    return text_result(
+                        begin_lease(
+                            arguments,
+                            owner,
+                            selected,
+                            claim,
+                            expected_shell_instance=shell_instance,
+                        )
+                    )
     if name in {"lease_pointer_click", "lease_pointer_scroll", "lease_pointer_drag"}:
         action = name.removeprefix("lease_pointer_")
-        return text_result(pointer_action(arguments, action))
+        target = lease_target_id()
+        shell = shell_status()
+        with CLAIMS.authorize(
+            target,
+            owner,
+            arguments.get("claim_token"),
+            shell["shell_instance"],
+            on_complete=renew_focus_lease_for_claim,
+        ) as claim:
+            if claim:
+                require_claimed_lease_support(shell)
+            return text_result(pointer_action(arguments, action, owner, claim, target))
     if name == "send_lease_shortcut":
-        return text_result(send_shortcut(arguments))
+        target = lease_target_id()
+        shell = shell_status()
+        with CLAIMS.authorize(
+            target,
+            owner,
+            arguments.get("claim_token"),
+            shell["shell_instance"],
+            on_complete=renew_focus_lease_for_claim,
+        ) as claim:
+            if claim:
+                require_claimed_lease_support(shell)
+            return text_result(send_shortcut(arguments, owner, claim, target))
     if name == "end_focus_lease":
-        with file_guard(LOCK_FILE):
-            with INPUT_LOCK, file_guard(INPUT_FILE):
-                return text_result(restore_lease(require_lease(str(arguments["lease_token"]))))
+        return text_result(end_lease(arguments, owner))
     if name == "recover_focus_lease":
         with file_guard(LOCK_FILE):
-            with INPUT_LOCK, file_guard(INPUT_FILE):
-                state = load_lease()
-                return text_result({"restored": True, "recovery_complete": True, "message": "no unfinished focus lease"} if not state else restore_lease(state, recovery=True))
+            snapshot = load_lease()
+        if not snapshot:
+            return text_result({"restored": True, "recovery_complete": True, "message": "no unfinished focus lease"})
+        target = lease_window_id(snapshot)
+        if not target:
+            raise RuntimeError("focus lease journal has no valid target")
+        shell = shell_status()
+        with CLAIMS.inspect(target, shell["shell_instance"]) as claim:
+            if claim:
+                require_claimed_lease_support(shell)
+            return text_result(recover_lease(owner, claim, str(snapshot.get("token") or "")))
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -1045,16 +1172,20 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": SERVER_INFO,
-                "instructions": "Operate the real GNOME session. Prefer the separate Computer Use plugin's AT-SPI tools; global-seat actions require an acknowledged, journaled focus lease.",
+                "instructions": "Operate the real GNOME session. Claim one window per parallel agent, treat claims as cooperative policy for the separate AT-SPI process, and use this broker's serialized acknowledged focus-lease lane for capture or global-seat input.",
             }
         elif method == "tools/list":
             result = {"tools": TOOLS}
         elif method == "tools/call":
             params = message.get("params") or {}
+            if not isinstance(params, dict):
+                raise ValueError("tools/call params must be an object")
             arguments = params.get("arguments") or {}
             if not isinstance(arguments, dict):
                 raise ValueError("tool arguments must be an object")
-            result = call_tool(str(params.get("name") or ""), arguments)
+            result = call_tool(
+                str(params.get("name") or ""), arguments, owner_from_params(params)
+            )
         elif method == "ping":
             result = {}
         else:
@@ -1081,7 +1212,8 @@ def main() -> int:
             message = json.loads(line)
         except Exception as exc:
             with write_lock:
-                print(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}), flush=True)
+                message = bounded_text(exc, MAX_ERROR_TEXT_CHARS)
+                print(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": message}}), flush=True)
             continue
         worker = threading.Thread(target=process, args=(message,), daemon=True)
         workers.append(worker)

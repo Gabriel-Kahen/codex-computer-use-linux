@@ -1,7 +1,7 @@
 {
   "name": "gnome-same-session-computer-use",
-  "version": "0.1.0",
-  "description": "Operate existing GNOME/Mutter windows through a recoverable focus lease.",
+  "version": "0.2.0",
+  "description": "Operate existing GNOME/Mutter windows with parallel per-window claims and a recoverable focus lease.",
   "author": {"name": "Gabe", "url": "https://github.com/Gabriel-Kahen"},
   "homepage": "https://github.com/Gabriel-Kahen/codex-computer-use-linux/tree/main/contrib/gnome-same-session-computer-use",
   "repository": "https://github.com/Gabriel-Kahen/codex-computer-use-linux",
@@ -10,8 +10,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "GNOME Same-session Computer Use",
-    "shortDescription": "Recoverable control of existing GNOME apps.",
-    "longDescription": "Adds stable GNOME window discovery, focused-window capture, and explicitly acknowledged global-seat input transactions which restore focus, workspace, and pointer state.",
+    "shortDescription": "Parallel, recoverable control of GNOME apps.",
+    "longDescription": "Adds concurrent per-window agent claims, stable GNOME window discovery, focused-window capture, and explicitly acknowledged serialized global-seat input transactions which restore focus, workspace, and pointer state.",
     "developerName": "Gabe",
     "category": "Productivity",
     "capabilities": ["Interactive", "Write", "Local Desktop"],
