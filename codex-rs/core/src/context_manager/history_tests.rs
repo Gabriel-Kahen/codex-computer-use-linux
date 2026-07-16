@@ -1258,119 +1258,105 @@ fn record_items_respects_custom_token_limit() {
 }
 
 #[test]
-fn record_items_hard_caps_complete_function_output_with_multiple_images() {
-    let image_urls = (0..7)
+fn record_items_hard_caps_mixed_text_and_images_by_detail() {
+    let default_urls = (0..7)
         .map(|index| format!("data:image/png;base64,IMAGE-{index}"))
         .collect::<Vec<_>>();
-    let mut content = vec![
-        FunctionCallOutputContentItem::InputText {
-            text: "Wall time: 1.2500 seconds\nOutput:".to_string(),
-        },
-        FunctionCallOutputContentItem::InputText {
-            text: format!("leading caption {}", "a".repeat(40_000)),
-        },
-    ];
-    content.extend(
-        image_urls
-            .iter()
-            .map(|image_url| FunctionCallOutputContentItem::InputImage {
-                image_url: image_url.clone(),
-                detail: Some(DEFAULT_IMAGE_DETAIL),
-            }),
-    );
-    content.push(FunctionCallOutputContentItem::InputText {
-        text: format!("trailing caption {}", "z".repeat(40_000)),
-    });
-    let item = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: format!("call-hard-cap-{}", "c".repeat(4_000)),
-        output: FunctionCallOutputPayload::from_content_items(content),
-        internal_chat_message_metadata_passthrough: None,
-    };
-
-    let history = ContextManager::new();
-    let first = history.process_item(&item, TruncationPolicy::Tokens(100_000));
-    let second = history.process_item(&item, TruncationPolicy::Tokens(100_000));
-
-    assert_eq!(first, second);
-    assert!(estimate_item_token_count(&first) <= 10_000);
-    let ResponseItem::FunctionCallOutput { output, .. } = first else {
-        panic!("expected function output");
-    };
-    let FunctionCallOutputBody::ContentItems(items) = output.body else {
-        panic!("expected content items");
-    };
-    let retained_image_urls = items
-        .iter()
-        .filter_map(|item| match item {
-            FunctionCallOutputContentItem::InputImage { image_url, .. } => Some(image_url.clone()),
-            FunctionCallOutputContentItem::InputText { .. }
-            | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    let omitted_marker = items.iter().find_map(|item| match item {
-        FunctionCallOutputContentItem::InputText { text }
-            if text.contains("image or encrypted") =>
-        {
-            Some(text)
-        }
-        FunctionCallOutputContentItem::InputText { .. }
-        | FunctionCallOutputContentItem::InputImage { .. }
-        | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
-    });
-
-    assert_eq!(retained_image_urls, image_urls[..4]);
-    assert!(omitted_marker.is_some_and(|marker| marker.contains("omitted 3")));
-}
-
-#[test]
-fn record_items_hard_cap_accounts_for_original_detail_images() {
     let image = ImageBuffer::from_pixel(2304, 864, Rgba([12u8, 34, 56, 255]));
     let mut bytes = std::io::Cursor::new(Vec::new());
     image
         .write_to(&mut bytes, ImageFormat::Png)
         .expect("encode png");
-    let image_url = format!(
+    let original_url = format!(
         "data:image/png;base64,{}",
         BASE64_STANDARD.encode(bytes.get_ref())
     );
-    let item = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: "call-original-hard-cap".to_string(),
-        output: FunctionCallOutputPayload::from_content_items(
-            std::iter::once(FunctionCallOutputContentItem::InputText {
-                text: "Wall time: 1.2500 seconds\nOutput:".to_string(),
-            })
-            .chain((0..6).map(|_| FunctionCallOutputContentItem::InputImage {
-                image_url: image_url.clone(),
-                detail: Some(ImageDetail::Original),
-            }))
-            .collect(),
-        ),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let stored = ContextManager::new().process_item(&item, TruncationPolicy::Tokens(100_000));
-    assert!(estimate_item_token_count(&stored) <= 10_000);
-    let ResponseItem::FunctionCallOutput { output, .. } = &stored else {
-        panic!("expected function output");
-    };
-    let FunctionCallOutputBody::ContentItems(items) = &output.body else {
-        panic!("expected content items");
-    };
-    assert_eq!(
-        items
-            .iter()
-            .filter(|item| matches!(item, FunctionCallOutputContentItem::InputImage { .. }))
-            .count(),
-        5
-    );
-    assert!(items.iter().any(|item| {
-        matches!(
+    for (image_urls, detail, retained) in [
+        (default_urls, DEFAULT_IMAGE_DETAIL, 5),
+        (vec![original_url; 6], ImageDetail::Original, 5),
+    ] {
+        let content = std::iter::once(FunctionCallOutputContentItem::InputText {
+            text: format!(
+                "leading {} trailing {}",
+                "a".repeat(40_000),
+                "z".repeat(40_000)
+            ),
+        })
+        .chain(
+            image_urls
+                .iter()
+                .map(|image_url| FunctionCallOutputContentItem::InputImage {
+                    image_url: image_url.clone(),
+                    detail: Some(detail),
+                }),
+        )
+        .collect();
+        let item = ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-hard-cap".to_string(),
+            output: FunctionCallOutputPayload::from_content_items(content),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let stored = ContextManager::new().process_item(&item, TruncationPolicy::Tokens(100_000));
+        assert!(estimate_item_token_count(&stored) <= 10_000);
+        let ResponseItem::FunctionCallOutput { output, .. } = stored else {
+            panic!("expected function output");
+        };
+        let FunctionCallOutputBody::ContentItems(items) = output.body else {
+            panic!("expected content items");
+        };
+        assert_eq!(
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    FunctionCallOutputContentItem::InputImage { image_url, .. } => Some(image_url),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            image_urls[..retained].iter().collect::<Vec<_>>()
+        );
+        assert!(items.iter().any(|item| matches!(
             item,
             FunctionCallOutputContentItem::InputText { text }
-                if text.contains("omitted 1 image or encrypted")
-        )
-    }));
+                if text.contains(&format!("omitted {}", image_urls.len() - retained))
+        )));
+    }
+}
+
+#[test]
+fn for_prompt_removes_pairs_with_oversized_output_envelopes() {
+    let pair = |call_id: String, turn_id: Option<String>| {
+        let metadata = Some(InternalChatMessageMetadataPassthrough { turn_id });
+        [
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "tool".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: call_id.clone(),
+                internal_chat_message_metadata_passthrough: metadata.clone(),
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id,
+                output: FunctionCallOutputPayload::from_text("ok".to_string()),
+                internal_chat_message_metadata_passthrough: metadata,
+            },
+        ]
+    };
+    let normal_pair = pair("normal".to_string(), None);
+    let oversized_call_id_pair = pair("c".repeat(40_001), None);
+    let oversized_turn_id_pair = pair("oversized-turn".to_string(), Some("t".repeat(40_001)));
+    let mut history = ContextManager::new();
+    history.record_items(
+        normal_pair
+            .iter()
+            .chain(&oversized_call_id_pair)
+            .chain(&oversized_turn_id_pair),
+        TruncationPolicy::Tokens(100_000),
+    );
+
+    assert_eq!(history.for_prompt(&default_input_modalities()), normal_pair);
 }
 
 fn assert_truncated_message_matches(message: &str, line: &str, expected_removed: usize) {
