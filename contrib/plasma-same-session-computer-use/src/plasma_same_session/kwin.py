@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")).expanduser() / "plasma-same-session-computer-use"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")).expanduser() / "plasma-same-session-computer-use"
 MAX_COMMAND_ERROR_CHARS = 900
+MAX_WINDOW_ID_CHARS = 80
+MAX_WINDOW_ID_BYTES = 320
 
 
 def run(args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
@@ -60,7 +62,17 @@ def active_window_id() -> str | None:
         value = kdotool("getactivewindow")
     except RuntimeError:
         return None
-    return value.splitlines()[-1].strip() if value else None
+    if not value:
+        return None
+    window_id = value.splitlines()[-1].strip()
+    if (
+        not window_id
+        or len(window_id) > MAX_WINDOW_ID_CHARS
+        or len(window_id.encode()) > MAX_WINDOW_ID_BYTES
+        or any(ord(character) < 32 or ord(character) == 127 for character in window_id)
+    ):
+        return None
+    return window_id
 
 
 def current_desktop() -> int:
@@ -264,19 +276,36 @@ def install_capture_desktop_file(helper: Path) -> None:
 def capture_window(window_id: str, output: Path) -> None:
     with file_guard(STATE_DIR / "capture-helper.lock"):
         helper = build_capture_helper()
+    capture_session = _verified_session_identity()
     proc = run([str(helper), window_id.strip("{}"), str(output)], timeout=30)
     if proc.returncode:
         raise RuntimeError(_command_error(proc, "KWin exact window capture failed"))
     if not output.is_file() or output.stat().st_size == 0:
         raise RuntimeError("KWin capture helper produced no image")
+    if _verified_session_identity() != capture_session:
+        raise RuntimeError("KWin session identity changed during exact window capture")
     marker = STATE_DIR / "exact-capture-authorized"
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.parent.chmod(0o700)
-    marker.write_text(json.dumps(_session_identity()))
+    marker.write_text(json.dumps(capture_session))
     marker.chmod(0o600)
 
 
-def _session_identity() -> dict[str, Any]:
+def kwin_service_owner() -> str | None:
+    if shutil.which("gdbus") is None:
+        return None
+    proc = run([
+        "gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+        "--object-path", "/org/freedesktop/DBus", "--method",
+        "org.freedesktop.DBus.GetNameOwner", "org.kde.KWin",
+    ])
+    if proc.returncode:
+        return None
+    match = re.search(r"['\"](:[^'\"]+)['\"]", proc.stdout)
+    return match[1] if match else None
+
+
+def session_identity() -> dict[str, Any]:
     display = os.environ.get("WAYLAND_DISPLAY")
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     socket_identity = None
@@ -296,7 +325,17 @@ def _session_identity() -> dict[str, Any]:
         "wayland_display": display,
         "wayland_socket": socket_identity,
         "session_id": os.environ.get("XDG_SESSION_ID"),
+        "kwin_service_owner": kwin_service_owner(),
     }
+
+
+def _verified_session_identity() -> dict[str, Any]:
+    identity = session_identity()
+    if not identity.get("kwin_service_owner"):
+        raise RuntimeError("KWin session ownership could not be positively identified")
+    if not identity.get("session_id") and not identity.get("wayland_socket"):
+        raise RuntimeError("the current Plasma login could not be positively identified")
+    return identity
 
 
 def capture_authorized_in_current_session() -> bool:
@@ -305,7 +344,7 @@ def capture_authorized_in_current_session() -> bool:
         value = json.loads(marker.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return False
-    current = _session_identity()
+    current = session_identity()
     if not current["session_id"] and not current["wayland_socket"]:
         return False
     return value == current

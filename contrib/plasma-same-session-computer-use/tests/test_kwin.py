@@ -13,6 +13,24 @@ from plasma_same_session import kwin
 
 
 class KWinTests(TestCase):
+    @patch.object(kwin, "kdotool")
+    def test_active_window_id_rejects_unbounded_or_control_text(self, tool) -> None:
+        tool.return_value = "x" * (kwin.MAX_WINDOW_ID_CHARS + 1)
+        self.assertIsNone(kwin.active_window_id())
+        tool.return_value = "{window}\nspoof"
+        self.assertEqual(kwin.active_window_id(), "spoof")
+        tool.return_value = "{window}\x00"
+        self.assertIsNone(kwin.active_window_id())
+
+    @patch.object(kwin.shutil, "which", return_value="/usr/bin/gdbus")
+    @patch.object(kwin, "run", return_value=subprocess.CompletedProcess([], 0, "(':1.42',)\n", ""))
+    def test_kwin_service_owner_uses_the_dbus_unique_name(self, _run, _which) -> None:
+        self.assertEqual(kwin.kwin_service_owner(), ":1.42")
+
+    @patch.object(kwin.shutil, "which", return_value=None)
+    def test_kwin_service_owner_requires_gdbus(self, _which) -> None:
+        self.assertIsNone(kwin.kwin_service_owner())
+
     @patch.object(kwin, "list_windows", return_value=[])
     def test_resolve_window_rejects_empty_queries(self, _windows) -> None:
         with self.assertRaisesRegex(ValueError, "must not be empty"):
