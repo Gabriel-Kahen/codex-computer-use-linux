@@ -9,16 +9,23 @@ Operate the real logged-in session. Never substitute a VM, nested desktop, alter
 
 ## Workflow
 
-1. Call `session_status`, then `list_session_windows`. Follow `next_cursor` through every bounded page until it is null so windows after the first page are not missed.
+1. Call `session_status` and `list_window_claims`, then call `list_session_windows`. Follow `next_cursor` through every bounded page until it is null so windows after the first page are not missed.
 2. Reuse an existing matching window. Preserve its process, profile, login, open documents, workspace, and fullscreen state.
-3. Capture with `capture_session_window`. This uses the window's Hyprland stable ID and does not focus, move, or raise it.
-4. Inspect and act with the separate `computer-use@openai-bundled` plugin's accessibility tools. Refresh app state immediately before choosing an element. If those tools are absent, stop and ask the user to install that companion plugin.
-5. Prefer semantic AT-SPI operations in this order:
+3. Call `claim_session_window` for that exact window. Keep its `claim_token` private to this task, pass it to every broker capture/action, and renew before `expires_at` if work continues.
+4. Capture with `capture_session_window` and the claim token. This uses the window's Hyprland stable ID and does not focus, move, or raise it.
+5. Inspect and act with the separate `computer-use@openai-bundled` plugin's accessibility tools. Refresh app state immediately before choosing an element. If those tools are absent, stop and ask the user to install that companion plugin. Treat the Hyprland claim as authoritative even though external AT-SPI calls do not pass through this broker.
+6. Prefer semantic AT-SPI operations in this order:
    - `perform_action` for buttons, links, menu items, and other actionable controls.
    - `set_value` or editable-text operations for text fields and sliders.
    - `send_window_shortcut` for discrete keys or shortcuts that Hyprland can deliver to a window address without focus.
-6. For coordinate-only UI, use `targeted_pointer_click`, `targeted_pointer_scroll`, or `targeted_pointer_drag`. These route directly to the selected Wayland surface or XWayland window and do not move the physical cursor or focus the app.
-7. Capture the exact window again to verify the result.
+7. For coordinate-only UI, use `targeted_pointer_click`, `targeted_pointer_scroll`, or `targeted_pointer_drag` with the claim token. These route directly to the selected Wayland surface or XWayland window and do not move the physical cursor or focus the app.
+8. Capture the exact window again to verify the result, then release the window in `finally`-style cleanup.
+
+## Parallel tasks
+
+For one prompt with independent work in multiple windows, fan out one worker per window. Each worker must use its own host-provided task identity and claim only its assigned window. Different native Wayland windows can capture and mutate concurrently through this broker; actions on one window remain serialized. This broker's XWayland, physical-seat, and fallback operations share one global lane and may wait or fail while that lane is reserved. The separate Computer Use process does not share that lock, so workers must coordinate its AT-SPI and global-input calls by policy.
+
+Never share a `claim_token` between workers. A claim defaults to 60 seconds; claimed broker operations renew it, and the owner can explicitly renew from 5 to 300 seconds with `claim_session_window`. Same-owner renewal keeps the token stable. If a token expires, stop acting, reacquire the window, recapture it, and use the newly returned token. A foreign active claim is authoritative even when an action omits `claim_token`.
 
 ## Non-interference rules
 
@@ -26,6 +33,8 @@ Operate the real logged-in session. Never substitute a VM, nested desktop, alter
 - Do not move a real window to a headless output merely to capture it; exact capture works on inactive workspaces.
 - Do not launch another instance of an app when a usable existing instance is present.
 - Treat window addresses and capture IDs as ephemeral. Refresh them before each operation batch.
+- Do not capture, inspect, or mutate a window claimed by another task.
+- Release claims only after the worker has ended its coordinate lease and finished all verification.
 - Never hardcode AT-SPI bus names or object paths. Discover the current accessibility tree and match controls by role, name, and supported action.
 - Stop if a requested action would overwrite unsaved work, close an app, sign out, or otherwise cause data loss without the user's explicit authorization.
 
@@ -33,7 +42,7 @@ Operate the real logged-in session. Never substitute a VM, nested desktop, alter
 
 The same-session broker provides window-local pointer injection without moving Hyprland's physical cursor:
 
-1. Refresh `list_session_windows` immediately before acting, follow `next_cursor` until it is null, and use the current address.
+1. Refresh `list_session_windows` immediately before acting, follow `next_cursor` until it is null, and use the current address and claim token.
 2. Use coordinates from the latest exact `capture_session_window` image. Convert screenshot pixels with the returned `coordinate_space.pixel_to_window_scale` before calling a pointer tool.
 3. Keep every coordinate inside the returned window dimensions.
 4. Prefer `targeted_pointer_click` over the headless lease fallback.
@@ -43,4 +52,4 @@ Native Wayland events are delivered atomically by a version-matched Hyprland plu
 
 ## Headless output
 
-A temporary Hyprland headless output is now an emergency compatibility fallback only. Use it when a client rejects both semantic accessibility actions and targeted pointer injection. Follow [architecture.md](references/architecture.md), obtain explicit interference acknowledgment from the user in the current task, and never treat the tool argument alone as proof of consent. Leave `fullscreen_if_needed` enabled unless the task specifically requires the window's original fallback geometry. The broker fullscreens the target over the temporary screen and records its previous state. When using the separate Computer Use plugin for global fallback input, translate screenshot-local coordinates with the `coordinate_space` origin and scale returned by `capture_coordinate_desktop`. Always restore leased windows, focus, workspace, fullscreen state, and pointer position in a `finally`-style cleanup.
+A temporary Hyprland headless output is now an emergency compatibility fallback only. Use it when a client rejects both semantic accessibility actions and targeted pointer injection. Follow [architecture.md](references/architecture.md), obtain explicit interference acknowledgment from the user in the current task, and never treat the tool argument alone as proof of consent. Pass the window's claim token to `begin_coordinate_lease`. Leave `fullscreen_if_needed` enabled unless the task specifically requires the window's original fallback geometry. The broker fullscreens the target over the temporary screen and records its owning task, claim, display, Hyprland instance, and previous state. Only that task may capture, end, or recover the live lease; another task may recover it after ownership and claim expiry if the owner crashes. When using the separate Computer Use plugin for global fallback input, translate screenshot-local coordinates with the `coordinate_space` origin and scale returned by `capture_coordinate_desktop`. Always restore the lease before releasing the window claim, including after failures.
