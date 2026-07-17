@@ -13,6 +13,7 @@ use atspi_connection::AccessibilityConnection;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::VecDeque;
+use std::sync::Mutex;
 use zbus::{
     fdo::DBusProxy,
     names::{BusName, UniqueName},
@@ -87,6 +88,13 @@ pub struct AccessibilityTextSelection {
     pub end_offset: i32,
 }
 
+struct AccessibilityTextPreview<'a> {
+    proxy: atspi::proxy::text::TextProxy<'a>,
+    character_count: i32,
+    content: Option<String>,
+    truncated: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ActionInvocation {
     pub action_index: i32,
@@ -102,10 +110,16 @@ pub enum ValueSetInvocation {
 
 const MAX_TEXT_READBACK_CHARS: i32 = 4096;
 const MAX_TEXT_SELECTIONS: i32 = 8;
+static CACHED_CONNECTION: Mutex<Option<AccessibilityConnection>> = Mutex::new(None);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeHydration {
+    Full,
+    Compact,
+}
 
 pub async fn list_accessible_apps(limit: usize) -> Result<Vec<AccessibleAppSummary>> {
-    let conn = connect().await?;
-    let roots = registry_children(&conn).await?;
+    let (conn, roots) = connect_with_roots().await?;
     let dbus = DBusProxy::new(conn.connection()).await.ok();
     let mut apps = Vec::new();
 
@@ -124,8 +138,40 @@ pub async fn snapshot_tree(
     max_nodes: usize,
     max_depth: u32,
 ) -> Result<Vec<AccessibilityNode>> {
-    let conn = connect().await?;
-    let roots = registry_children(&conn).await?;
+    snapshot_tree_with_hydration(
+        app_name_or_bundle_identifier,
+        target_pid,
+        max_nodes,
+        max_depth,
+        NodeHydration::Full,
+    )
+    .await
+}
+
+pub(crate) async fn snapshot_compact_tree(
+    app_name_or_bundle_identifier: Option<&str>,
+    target_pid: Option<u32>,
+    max_nodes: usize,
+    max_depth: u32,
+) -> Result<Vec<AccessibilityNode>> {
+    snapshot_tree_with_hydration(
+        app_name_or_bundle_identifier,
+        target_pid,
+        max_nodes,
+        max_depth,
+        NodeHydration::Compact,
+    )
+    .await
+}
+
+async fn snapshot_tree_with_hydration(
+    app_name_or_bundle_identifier: Option<&str>,
+    target_pid: Option<u32>,
+    max_nodes: usize,
+    max_depth: u32,
+    hydration: NodeHydration,
+) -> Result<Vec<AccessibilityNode>> {
+    let (conn, roots) = connect_with_roots().await?;
     let selected_roots =
         select_roots(&conn, roots, app_name_or_bundle_identifier, target_pid).await;
     let mut nodes = Vec::new();
@@ -150,7 +196,7 @@ pub async fn snapshot_tree(
             Vec::new()
         };
 
-        nodes.push(read_node(&proxy, &object_ref, index, parent_index, depth).await);
+        nodes.push(read_node(&proxy, &object_ref, index, parent_index, depth, hydration).await);
 
         for child in child_refs {
             queue.push_back((child, depth + 1, Some(index)));
@@ -180,8 +226,7 @@ const FOCUS_PROBE_MAX_DEPTH: u32 = 16;
 pub async fn focused_element_summary(
     target_pid: Option<u32>,
 ) -> Result<Option<FocusedElementSummary>> {
-    let conn = connect().await?;
-    let roots = registry_children(&conn).await?;
+    let (conn, roots) = connect_with_roots().await?;
     let selected_roots = select_roots(&conn, roots, None, target_pid).await;
     let mut visited = 0_usize;
     let mut queue = VecDeque::new();
@@ -302,6 +347,50 @@ async fn connect() -> Result<AccessibilityConnection> {
     AccessibilityConnection::new()
         .await
         .context("failed to connect to AT-SPI bus")
+}
+
+async fn cached_read_connection() -> Result<AccessibilityConnection> {
+    if let Some(conn) = cached_connection() {
+        return Ok(conn);
+    }
+
+    let new_conn = connect().await?;
+    let mut cached = CACHED_CONNECTION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(cached.get_or_insert(new_conn).clone())
+}
+
+fn cached_connection() -> Option<AccessibilityConnection> {
+    CACHED_CONNECTION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn invalidate_connection(conn: &AccessibilityConnection) {
+    let mut cached = CACHED_CONNECTION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cached.as_ref().is_some_and(|candidate| {
+        candidate.connection().server_guid() == conn.connection().server_guid()
+            && candidate.connection().unique_name() == conn.connection().unique_name()
+    }) {
+        *cached = None;
+    }
+}
+
+async fn connect_with_roots() -> Result<(AccessibilityConnection, Vec<ObjectRefOwned>)> {
+    let conn = cached_read_connection().await?;
+    match registry_children(&conn).await {
+        Ok(roots) => Ok((conn, roots)),
+        Err(_) => {
+            invalidate_connection(&conn);
+            let conn = cached_read_connection().await?;
+            let roots = registry_children(&conn).await?;
+            Ok((conn, roots))
+        }
+    }
 }
 
 /// Open an `AccessibleProxy` for an object on the a11y bus.
@@ -452,25 +541,108 @@ async fn read_node(
     index: u32,
     parent_index: Option<u32>,
     depth: u32,
+    hydration: NodeHydration,
 ) -> AccessibilityNode {
-    let proxies = proxy.proxies().await.ok();
+    let (role, name, description, child_count, proxies) = tokio::join!(
+        role_name(proxy),
+        proxy.name(),
+        proxy.description(),
+        proxy.child_count(),
+        proxy.proxies(),
+    );
+    let name = optional_string(name.ok());
+    let description = optional_string(description.ok());
+    let child_count = child_count.unwrap_or_default();
+    let proxies = proxies.ok();
+
+    let (bounds, states, actions, value, text, supports_editable_text) = if hydration
+        == NodeHydration::Full
+        || node_is_definitely_retained(depth, name.as_deref(), description.as_deref())
+    {
+        tokio::join!(
+            bounds_from_proxies(proxies.as_ref(), proxy),
+            states_from_proxy(proxy),
+            actions_from_proxies(proxies.as_ref()),
+            value_from_proxies(proxies.as_ref()),
+            text_from_proxies(proxies.as_ref()),
+            supports_editable_text(proxies.as_ref()),
+        )
+    } else {
+        let role_needs_bounds = role_needs_bounds_to_retain(&role);
+        let (actions, value, text_preview, supports_editable_text, decision_bounds) = tokio::join!(
+            actions_from_proxies(proxies.as_ref()),
+            value_from_proxies(proxies.as_ref()),
+            text_preview_from_proxies(proxies.as_ref()),
+            supports_editable_text(proxies.as_ref()),
+            async {
+                if role_needs_bounds {
+                    bounds_from_proxies(proxies.as_ref(), proxy).await
+                } else {
+                    None
+                }
+            },
+        );
+        let has_text = text_preview
+            .as_ref()
+            .and_then(|preview| preview.content.as_deref())
+            .is_some_and(|content| !content.trim().is_empty());
+        let retained = !actions.is_empty()
+            || value.is_some()
+            || supports_editable_text
+            || has_text
+            || decision_bounds.is_some();
+        let (bounds, states, text) = if retained && role_needs_bounds {
+            let (states, text) =
+                tokio::join!(states_from_proxy(proxy), text_from_preview(text_preview),);
+            (decision_bounds, states, text)
+        } else if retained {
+            tokio::join!(
+                bounds_from_proxies(proxies.as_ref(), proxy),
+                states_from_proxy(proxy),
+                text_from_preview(text_preview),
+            )
+        } else {
+            let text = text_preview.map(|preview| AccessibilityText {
+                character_count: preview.character_count,
+                caret_offset: None,
+                content: preview.content,
+                truncated: preview.truncated,
+                selections: Vec::new(),
+            });
+            (None, Vec::new(), text)
+        };
+        (bounds, states, actions, value, text, supports_editable_text)
+    };
 
     AccessibilityNode {
         index,
         parent_index,
         depth,
         object_ref: object_ref_id(object_ref),
-        role: role_name(proxy).await,
-        name: optional_string(proxy.name().await.ok()),
-        description: optional_string(proxy.description().await.ok()),
-        child_count: proxy.child_count().await.unwrap_or_default(),
-        bounds: bounds_from_proxies(proxies.as_ref(), proxy).await,
-        states: states_from_proxy(proxy).await,
-        actions: actions_from_proxies(proxies.as_ref()).await,
-        value: value_from_proxies(proxies.as_ref()).await,
-        text: text_from_proxies(proxies.as_ref()).await,
-        supports_editable_text: supports_editable_text(proxies.as_ref()).await,
+        role,
+        name,
+        description,
+        child_count,
+        bounds,
+        states,
+        actions,
+        value,
+        text,
+        supports_editable_text,
     }
+}
+
+fn node_is_definitely_retained(depth: u32, name: Option<&str>, description: Option<&str>) -> bool {
+    depth <= 1
+        || name.is_some_and(|name| !name.trim().is_empty())
+        || description.is_some_and(|description| !description.trim().is_empty())
+}
+
+fn role_needs_bounds_to_retain(role: &str) -> bool {
+    matches!(
+        role,
+        "page tab" | "menu item" | "menu" | "list item" | "tree item"
+    )
 }
 
 async fn role_name(proxy: &AccessibleProxy<'_>) -> String {
@@ -576,23 +748,44 @@ async fn value_from_proxies(
 async fn text_from_proxies(
     proxies: Option<&atspi::proxy::proxy_ext::Proxies<'_>>,
 ) -> Option<AccessibilityText> {
+    let preview = text_preview_from_proxies(proxies).await;
+    text_from_preview(preview).await
+}
+
+async fn text_preview_from_proxies<'a>(
+    proxies: Option<&atspi::proxy::proxy_ext::Proxies<'a>>,
+) -> Option<AccessibilityTextPreview<'a>> {
     let text = proxies?.text().await.ok()?;
     let character_count = text.character_count().await.ok()?.max(0);
-    let caret_offset = text.caret_offset().await.ok();
     let capped_count = character_count.min(MAX_TEXT_READBACK_CHARS);
     let content = if capped_count > 0 {
         optional_string(text.get_text(0, capped_count).await.ok())
     } else {
         None
     };
-    let selection_count = text
+
+    Some(AccessibilityTextPreview {
+        proxy: text,
+        character_count,
+        content,
+        truncated: character_count > MAX_TEXT_READBACK_CHARS,
+    })
+}
+
+async fn text_from_preview(
+    preview: Option<AccessibilityTextPreview<'_>>,
+) -> Option<AccessibilityText> {
+    let preview = preview?;
+    let caret_offset = preview.proxy.caret_offset().await.ok();
+    let selection_count = preview
+        .proxy
         .get_nselections()
         .await
         .unwrap_or_default()
         .clamp(0, MAX_TEXT_SELECTIONS);
     let mut selections = Vec::new();
     for index in 0..selection_count {
-        if let Ok((start_offset, end_offset)) = text.get_selection(index).await {
+        if let Ok((start_offset, end_offset)) = preview.proxy.get_selection(index).await {
             selections.push(AccessibilityTextSelection {
                 start_offset,
                 end_offset,
@@ -601,10 +794,10 @@ async fn text_from_proxies(
     }
 
     Some(AccessibilityText {
-        character_count,
+        character_count: preview.character_count,
         caret_offset,
-        content,
-        truncated: character_count > MAX_TEXT_READBACK_CHARS,
+        content: preview.content,
+        truncated: preview.truncated,
         selections,
     })
 }
