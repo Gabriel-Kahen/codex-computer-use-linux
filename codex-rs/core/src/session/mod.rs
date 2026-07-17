@@ -24,7 +24,6 @@ use crate::config::resolve_tool_suggest_config_from_layer_stack;
 use crate::context::ApprovalPromptContext;
 use crate::context::ApprovedCommandPrefixSaved;
 use crate::context::AvailableSkillsInstructions;
-use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
 use crate::context::MultiAgentModeInstructions;
 use crate::context::NetworkRuleSaved;
@@ -236,6 +235,7 @@ use self::session::SessionConfiguration;
 pub(crate) use self::session::SessionSettingsUpdate;
 #[cfg(test)]
 use self::turn::AssistantMessageStreamParsers;
+use self::turn::agent_message_text;
 #[cfg(test)]
 use self::turn::collect_explicit_app_ids_from_skill_items;
 use self::turn::realtime_text_for_event;
@@ -1885,12 +1885,44 @@ impl Session {
     }
 
     async fn maybe_mirror_event_text_to_realtime(&self, msg: &EventMsg) {
-        let Some((text, phase)) = realtime_text_for_event(msg) else {
-            return;
-        };
         if self.conversation.running_state().await.is_none() {
             return;
         }
+        match msg {
+            EventMsg::ItemStarted(event) => {
+                if let TurnItem::AgentMessage(item) = &event.item {
+                    self.conversation
+                        .register_handoff_stream_item(
+                            item.id.clone(),
+                            item.phase.clone(),
+                            agent_message_text(item),
+                        )
+                        .await;
+                }
+                return;
+            }
+            EventMsg::AgentMessageContentDelta(event) => {
+                if let Err(err) = self
+                    .conversation
+                    .stream_handoff_delta(&event.item_id, event.delta.clone())
+                    .await
+                {
+                    debug!("failed to stream event text to realtime conversation: {err}");
+                }
+                return;
+            }
+            EventMsg::ItemCompleted(event) => {
+                if let TurnItem::AgentMessage(item) = &event.item
+                    && self.conversation.finish_handoff_stream_item(&item.id).await
+                {
+                    return;
+                }
+            }
+            _ => {}
+        }
+        let Some((text, phase)) = realtime_text_for_event(msg) else {
+            return;
+        };
         if let Err(err) = self.conversation.handoff_out(text, phase).await {
             debug!("failed to mirror event text to realtime conversation: {err}");
         }
@@ -3163,7 +3195,6 @@ impl Session {
         let (
             reference_context_item,
             previous_turn_settings,
-            collaboration_mode,
             base_instructions,
             session_source,
             auto_compact_window_ids,
@@ -3172,7 +3203,6 @@ impl Session {
             (
                 state.reference_context_item(),
                 state.previous_turn_settings(),
-                state.session_configuration.collaboration_mode.clone(),
                 state.session_configuration.base_instructions.clone(),
                 state.session_configuration.session_source.clone(),
                 state.auto_compact_window_ids(),
@@ -3228,13 +3258,6 @@ impl Session {
             && !developer_instructions.is_empty()
         {
             developer_sections.push(developer_instructions.to_string());
-        }
-        // Add developer instructions from collaboration_mode if they exist and are non-empty
-        if turn_context.config.include_collaboration_mode_instructions
-            && let Some(collab_instructions) =
-                CollaborationModeInstructions::from_collaboration_mode(&collaboration_mode)
-        {
-            developer_sections.push(collab_instructions.render());
         }
         if let Some(realtime_update) = crate::context_manager::updates::build_initial_realtime_item(
             reference_context_item.as_ref(),
@@ -3438,10 +3461,10 @@ impl Session {
         {
             items.push(usage_hint_message);
         }
-        if let Some(multi_agent_mode) = multi_agents::effective_multi_agent_mode(turn_context) {
-            items.push(ContextualUserFragment::into(
-                MultiAgentModeInstructions::new(multi_agent_mode),
-            ));
+        if let Some(multi_agent_mode) = multi_agents::effective_multi_agent_mode(turn_context)
+            && let Some(instructions) = MultiAgentModeInstructions::from_mode(multi_agent_mode)
+        {
+            items.push(ContextualUserFragment::into(instructions));
         }
         if let Some(contextual_user_message) =
             crate::context_manager::updates::build_contextual_user_message(contextual_user_sections)
