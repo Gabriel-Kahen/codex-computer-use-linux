@@ -4,6 +4,7 @@ pub mod registry;
 pub mod target;
 pub mod types;
 
+pub(crate) use capture::capture_window_exact;
 #[allow(unused_imports)]
 pub(crate) use capture::capture_window_exact;
 #[allow(unused_imports)]
