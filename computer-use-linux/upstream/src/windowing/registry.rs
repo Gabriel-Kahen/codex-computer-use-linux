@@ -1,6 +1,8 @@
 use crate::windowing::backends::{cosmic, gnome, hyprland, i3, kwin, niri, x11};
 use crate::windowing::types::WindowInfo;
 use anyhow::{anyhow, Result};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 pub use cosmic::COSMIC_WAYLAND_BACKEND;
 pub use gnome::{GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND};
@@ -31,7 +33,7 @@ pub struct BackendProbe {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendKind {
     GnomeExtension,
     GnomeIntrospect,
@@ -41,6 +43,79 @@ enum BackendKind {
     Niri,
     I3,
     X11,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowListPolicy {
+    Cached,
+    Fresh,
+}
+
+const WINDOW_LIST_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone)]
+struct CachedWindowList {
+    generation: u64,
+    captured_at: Instant,
+    windows: Vec<WindowInfo>,
+}
+
+#[derive(Debug, Default)]
+struct WindowCache {
+    generation: u64,
+    windows: Option<CachedWindowList>,
+    preferred_backend: Option<BackendKind>,
+}
+
+impl WindowCache {
+    fn windows(&self, policy: WindowListPolicy, now: Instant) -> Option<Vec<WindowInfo>> {
+        let cached = self.windows.as_ref()?;
+        (policy == WindowListPolicy::Cached
+            && cached.generation == self.generation
+            && now.saturating_duration_since(cached.captured_at) < WINDOW_LIST_TTL)
+            .then(|| cached.windows.clone())
+    }
+
+    fn invalidate_windows(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.windows = None;
+    }
+
+    fn record_success(
+        &mut self,
+        generation: u64,
+        backend: BackendKind,
+        windows: Vec<WindowInfo>,
+        now: Instant,
+    ) {
+        if generation == self.generation {
+            self.preferred_backend = Some(backend);
+            self.windows = Some(CachedWindowList {
+                generation,
+                captured_at: now,
+                windows,
+            });
+        }
+    }
+
+    fn record_preferred_failure(&mut self, backend: BackendKind) {
+        if self.preferred_backend == Some(backend) {
+            self.preferred_backend = None;
+            self.invalidate_windows();
+        }
+    }
+}
+
+fn window_cache() -> MutexGuard<'static, WindowCache> {
+    static CACHE: OnceLock<Mutex<WindowCache>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| Mutex::new(WindowCache::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn invalidate_window_cache() {
+    window_cache().invalidate_windows();
 }
 
 const BACKEND_ORDER: &[BackendKind] = &[
@@ -137,11 +212,40 @@ pub fn backend_can_exact_focus(id: &str) -> bool {
 }
 
 pub async fn list_windows() -> Result<Vec<WindowInfo>> {
+    list_windows_with_policy(WindowListPolicy::Cached).await
+}
+
+pub(crate) async fn list_windows_with_policy(policy: WindowListPolicy) -> Result<Vec<WindowInfo>> {
+    let now = Instant::now();
+    let (mut generation, preferred_backend) = {
+        let cache = window_cache();
+        if let Some(windows) = cache.windows(policy, now) {
+            return Ok(windows);
+        }
+        (cache.generation, cache.preferred_backend)
+    };
+
     let mut errors = Vec::new();
+    if let Some(backend) = preferred_backend {
+        if let Some(windows) =
+            usable_backend_windows(backend, list_windows_for(backend).await, &mut errors)
+        {
+            window_cache().record_success(generation, backend, windows.clone(), Instant::now());
+            return Ok(windows);
+        }
+        let mut cache = window_cache();
+        cache.record_preferred_failure(backend);
+        generation = cache.generation;
+    }
+
     for backend in BACKEND_ORDER {
+        if Some(*backend) == preferred_backend {
+            continue;
+        }
         if let Some(windows) =
             usable_backend_windows(*backend, list_windows_for(*backend).await, &mut errors)
         {
+            window_cache().record_success(generation, *backend, windows.clone(), Instant::now());
             return Ok(windows);
         }
     }
@@ -180,20 +284,20 @@ async fn list_windows_for(backend: BackendKind) -> Result<Vec<WindowInfo>> {
 }
 
 pub async fn activate_window(window: &WindowInfo) -> Result<()> {
-    match window.backend.as_str() {
+    let result = match window.backend.as_str() {
         GNOME_SHELL_EXTENSION_BACKEND => gnome::activate_extension_window(window.window_id).await,
         GNOME_SHELL_INTROSPECT_BACKEND => {
             let app_id = window
                 .app_id
                 .as_deref()
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "GNOME Shell can only focus by app_id; the matched window has no app_id"
-                    )
-                })?;
-            gnome::focus_app(app_id).await
+                .filter(|value| !value.is_empty());
+            match app_id {
+                Some(app_id) => gnome::focus_app(app_id).await,
+                None => Err(anyhow!(
+                    "GNOME Shell can only focus by app_id; the matched window has no app_id"
+                )),
+            }
         }
         COSMIC_WAYLAND_BACKEND => cosmic::activate_window(window.window_id),
         KWIN_BACKEND => kwin::activate_window(window.window_id).await,
@@ -204,11 +308,13 @@ pub async fn activate_window(window: &WindowInfo) -> Result<()> {
         backend => Err(anyhow!(
             "Unsupported window backend for activation: {backend}"
         )),
-    }
+    };
+    invalidate_window_cache();
+    result
 }
 
 pub async fn move_window(window: &WindowInfo, x: i32, y: i32) -> Result<String> {
-    match window.backend.as_str() {
+    let result = match window.backend.as_str() {
         GNOME_SHELL_EXTENSION_BACKEND => {
             gnome::move_extension_window(window.window_id, x, y).await
         }
@@ -216,11 +322,13 @@ pub async fn move_window(window: &WindowInfo, x: i32, y: i32) -> Result<String> 
         backend => Err(anyhow!(
             "Window backend {backend} cannot move windows; move_window needs the computer-use-linux GNOME Shell extension or a generic X11/EWMH session."
         )),
-    }
+    };
+    invalidate_window_cache();
+    result
 }
 
 pub async fn resize_window(window: &WindowInfo, width: i32, height: i32) -> Result<String> {
-    match window.backend.as_str() {
+    let result = match window.backend.as_str() {
         GNOME_SHELL_EXTENSION_BACKEND => {
             gnome::resize_extension_window(window.window_id, width, height).await
         }
@@ -228,7 +336,9 @@ pub async fn resize_window(window: &WindowInfo, width: i32, height: i32) -> Resu
         backend => Err(anyhow!(
             "Window backend {backend} cannot resize windows; resize_window needs the computer-use-linux GNOME Shell extension or a generic X11/EWMH session."
         )),
-    }
+    };
+    invalidate_window_cache();
+    result
 }
 
 pub fn focused_window_override() -> Option<WindowInfo> {
@@ -328,5 +438,32 @@ mod tests {
         .is_none());
 
         assert_eq!(errors, vec!["KWin failed: loadScript failed"]);
+    }
+
+    #[test]
+    fn cached_window_lists_honor_policy_ttl_and_generation() {
+        let now = Instant::now();
+        let mut cache = WindowCache::default();
+        cache.record_success(0, BackendKind::Kwin, vec![window(KWIN_BACKEND)], now);
+
+        let cached = cache.windows(WindowListPolicy::Cached, now).unwrap();
+        assert_eq!(cached[0].backend, KWIN_BACKEND);
+        assert!(cache.windows(WindowListPolicy::Fresh, now).is_none());
+        assert!(cache
+            .windows(WindowListPolicy::Cached, now + WINDOW_LIST_TTL)
+            .is_none());
+
+        cache.invalidate_windows();
+        assert!(cache.windows(WindowListPolicy::Cached, now).is_none());
+        assert_eq!(cache.preferred_backend, Some(BackendKind::Kwin));
+        cache.record_success(
+            0,
+            BackendKind::Hyprland,
+            vec![window(HYPRLAND_BACKEND)],
+            now,
+        );
+        assert_eq!(cache.preferred_backend, Some(BackendKind::Kwin));
+        cache.record_preferred_failure(BackendKind::Kwin);
+        assert!(cache.windows(WindowListPolicy::Cached, now).is_none());
     }
 }
