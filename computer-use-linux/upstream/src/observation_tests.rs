@@ -41,8 +41,22 @@ fn observe(
 fn checkpoint_ids_are_isolated_and_unchanged_frames_omit_pixels() {
     let mut tracker = ObservationTracker::default();
     let frame = screenshot(300, 200, &[]);
-    let first = observe(&mut tracker, "demo", &frame, None, 8, false);
-    let unchanged = observe(&mut tracker, "demo", &frame, Some(&first), 8, false);
+    let first = observe(
+        &mut tracker,
+        "demo",
+        &frame,
+        None,
+        DEFAULT_CHECKPOINT_INTERVAL,
+        false,
+    );
+    let unchanged = observe(
+        &mut tracker,
+        "demo",
+        &frame,
+        Some(&first),
+        DEFAULT_CHECKPOINT_INTERVAL,
+        false,
+    );
     assert_eq!(
         unchanged.metadata.visual_kind,
         VisualObservationKind::Unchanged
@@ -52,15 +66,43 @@ fn checkpoint_ids_are_isolated_and_unchanged_frames_omit_pixels() {
         first.metadata.checkpoint_id
     );
 
-    let mismatch = observe(&mut tracker, "demo", &frame, None, 8, false);
+    let mismatch = observe(
+        &mut tracker,
+        "demo",
+        &frame,
+        None,
+        DEFAULT_CHECKPOINT_INTERVAL,
+        false,
+    );
     assert_ne!(
         mismatch.metadata.checkpoint_id,
         first.metadata.checkpoint_id
     );
-    let stale = observe(&mut tracker, "demo", &frame, Some(&first), 8, false);
+    let stale = observe(
+        &mut tracker,
+        "demo",
+        &frame,
+        Some(&first),
+        DEFAULT_CHECKPOINT_INTERVAL,
+        false,
+    );
     assert_eq!(stale.metadata.visual_kind, VisualObservationKind::Full);
-    let other = observe(&mut tracker, "other", &frame, None, 8, false);
-    let wrong_target = observe(&mut tracker, "demo", &frame, Some(&other), 8, false);
+    let other = observe(
+        &mut tracker,
+        "other",
+        &frame,
+        None,
+        DEFAULT_CHECKPOINT_INTERVAL,
+        false,
+    );
+    let wrong_target = observe(
+        &mut tracker,
+        "demo",
+        &frame,
+        Some(&other),
+        DEFAULT_CHECKPOINT_INTERVAL,
+        false,
+    );
     assert_eq!(
         wrong_target.metadata.visual_kind,
         VisualObservationKind::Full
@@ -71,9 +113,24 @@ fn checkpoint_ids_are_isolated_and_unchanged_frames_omit_pixels() {
 fn changes_are_checkpoint_relative_and_cropped() {
     let mut tracker = ObservationTracker::default();
     let before = screenshot(400, 300, &[]);
-    let checkpoint = observe(&mut tracker, "demo", &before, None, 8, false);
+    let checkpoint = observe(
+        &mut tracker,
+        "demo",
+        &before,
+        None,
+        DEFAULT_CHECKPOINT_INTERVAL,
+        false,
+    );
     let after = screenshot(400, 300, &[(150, 150)]);
-    let plan = observe(&mut tracker, "demo", &after, Some(&checkpoint), 8, false);
+    let plan = observe(
+        &mut tracker,
+        "demo",
+        &after,
+        Some(&checkpoint),
+        DEFAULT_CHECKPOINT_INTERVAL,
+        false,
+    );
+    assert!(matches!(plan.visual, VisualPlan::Regions(_)));
     assert_eq!(
         plan.metadata.regions,
         vec![ObservationRegion {
@@ -84,7 +141,14 @@ fn changes_are_checkpoint_relative_and_cropped() {
         }]
     );
     let later = screenshot(400, 300, &[(150, 150), (300, 150)]);
-    let later = observe(&mut tracker, "demo", &later, Some(&checkpoint), 8, false);
+    let later = observe(
+        &mut tracker,
+        "demo",
+        &later,
+        Some(&checkpoint),
+        DEFAULT_CHECKPOINT_INTERVAL,
+        false,
+    );
     assert_eq!(
         later.metadata.checkpoint_id,
         checkpoint.metadata.checkpoint_id
