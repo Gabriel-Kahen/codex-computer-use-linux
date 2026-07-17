@@ -46,10 +46,12 @@ MCP tools exposed by the server:
 - `list_apps` — running desktop apps visible to the AT-SPI registry
 - `list_windows` — compositor windows with title, app id, wm_class, focus state, client type (Wayland/X11), and bounds
 - `focused_window` — the window currently holding keyboard focus
-- `get_app_state` — combined screenshot + accessibility tree for a chosen app, with element indices that the input tools accept
+- `get_app_state` — combined screenshot + accessibility tree for a chosen app, with an opt-in adaptive checkpoint/delta mode and element indices that the input tools accept
 - `screenshot` — capture the screen as a bounded PNG or JPEG image; can target a window, which is raised to the front and cropped to just that window
 
 Screenshot payloads are size-bounded by default before they are returned to the MCP host: max 1920 px width/height and 2 MiB image bytes, with hard caps even when callers request more. Agents that need more detail can pass `max_width`, `max_height`, `max_bytes`, `scale`, `format: "jpeg"`, or `quality`, preferably with a window target or crop. PNG remains the default; JPEG lets callers trade lossless pixels for a smaller payload before the byte cap forces further resizing. Returned screenshot metadata includes `coordinate_width`, `coordinate_height`, `scale`, `format`, and `quality` so callers can convert from a downscaled preview to desktop coordinate pixels.
+
+Pass `observation_mode: "adaptive"` to receive a full checkpoint followed by unchanged summaries or up to four coordinate-anchored changed image regions. Echo its `checkpoint_id` as `base_checkpoint_id`; omission or mismatch forces a full refresh, while the normal bounded AT-SPI snapshot remains available. Full checkpoints recur after eight observations by default, on geometry or large visual changes, or with `force_checkpoint: true`; adaptive images share 4 MiB, 4 megapixel, and 3,072 32-pixel-patch caps. The [ShowUI](https://openaccess.thecvf.com/content/CVPR2025/html/Lin_ShowUI_One_Vision-Language-Action_Model_for_GUI_Visual_Agent_CVPR_2025_paper.html) training result motivates this heuristic but does not measure its inference behavior.
 
 **Input**
 

@@ -10,6 +10,10 @@ use crate::atspi_tree::{
 };
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
+use crate::observation::{
+    prepare_visual_captures, AdaptiveObservationMetadata, ObservationMode, ObservationRegion,
+    ObservationTracker, VisualObservationKind, VisualPlan, DEFAULT_CHECKPOINT_INTERVAL,
+};
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_keycode_chord,
     scroll as portal_scroll, start_portal_keyboard_session, start_portal_pointer_session,
@@ -69,6 +73,8 @@ struct DiagnosticsCache {
 #[derive(Clone, Default)]
 pub struct ComputerUseLinux {
     last_nodes: Arc<Mutex<Vec<AccessibilityNode>>>,
+    observation_tracker: Arc<Mutex<ObservationTracker>>,
+    adaptive_observation_lock: Arc<tokio::sync::Mutex<()>>,
     portal_pointer_session: Arc<Mutex<Option<PortalPointerSession>>>,
     portal_keyboard_session: Arc<Mutex<Option<PortalKeyboardSession>>>,
     /// Lazily-created uinput absolute pointer (preferred coordinate backend).
@@ -321,7 +327,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        description = "Start an app use session if needed, then get a size-bounded screenshot and accessibility state for a Linux app. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y to image coordinates when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates. Screenshot results include coordinate_width, coordinate_height, scale, format, and quality when the returned image is downscaled or compressed; callers can request jpeg/quality for compression before resizing.",
+        description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Legacy calls return a full observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<GetAppStateOutput>(),
         annotations(
             read_only_hint = true,
@@ -345,6 +351,13 @@ impl ComputerUseLinux {
         })?;
         let max_nodes = params.max_nodes.unwrap_or(120).clamp(1, 500);
         let max_depth = params.max_depth.unwrap_or(12).min(12);
+        let observation_mode = params.observation_mode;
+        let adaptive = observation_mode == Some(ObservationMode::Adaptive);
+        let _adaptive_guard = if adaptive {
+            Some(self.adaptive_observation_lock.lock().await)
+        } else {
+            None
+        };
         let include_screenshot = params.include_screenshot.unwrap_or(true);
         let screenshot_options = params.screenshot_options();
         let screenshot_target_requested = params.window_target().has_target();
@@ -376,16 +389,15 @@ impl ComputerUseLinux {
                     .and_then(|window| window.bounds.clone())
             };
             let prepared = tokio::task::spawn_blocking(move || {
-                prepare_app_state_screenshot(
+                crop_raw_screenshot(
                     raw_capture,
                     bounds.as_ref(),
                     screenshot_target_requested && !use_exact_capture,
-                    screenshot_options,
                 )
             })
             .await;
             match prepared {
-                Ok(Ok(capture)) => (Some(capture), None),
+                Ok(Ok((capture, origin))) => (Some((capture, origin.unwrap_or((0, 0)))), None),
                 Ok(Err(error)) => (None, Some(format!("{error:#}"))),
                 Err(error) => (
                     None,
@@ -420,9 +432,11 @@ impl ComputerUseLinux {
             }
         };
         let (
-            (screenshot, screenshot_error),
+            (raw_screenshot_with_origin, mut screenshot_error),
             (accessibility_tree, accessibility_tree_raw_count, accessibility_error),
         ) = tokio::join!(screenshot_future, accessibility_future);
+        let (raw_screenshot, screenshot_origin) = raw_screenshot_with_origin
+            .map_or((None, (0, 0)), |(capture, origin)| (Some(capture), origin));
         if window_error.is_some() || screenshot_error.is_some() || accessibility_error.is_some() {
             self.invalidate_diagnostics();
         }
@@ -431,9 +445,133 @@ impl ComputerUseLinux {
         } else {
             self.clear_cached_nodes();
         }
-        let mut message = if let Some(error) = &accessibility_error {
+
+        let (observation, visual_plan) = if adaptive {
+            let target_key = window_context.as_ref().map_or_else(
+                || {
+                    params
+                        .app_name_or_bundle_identifier
+                        .as_deref()
+                        .unwrap_or("desktop")
+                        .to_string()
+                },
+                |window| format!("window:{}", window.window_id),
+            );
+            let key = format!(
+                "{target_key}|{:?}",
+                (
+                    screenshot_options.max_width,
+                    screenshot_options.max_height,
+                    screenshot_options.max_bytes,
+                    screenshot_options.scale,
+                    screenshot_options.format,
+                    screenshot_options.quality,
+                )
+            );
+            let plan = self
+                .observation_tracker
+                .lock()
+                .map_err(|_| ErrorData::internal_error("observation tracker lock failed", None))?
+                .observe(
+                    key,
+                    raw_screenshot.as_ref(),
+                    params.base_checkpoint_id.as_deref(),
+                    params
+                        .checkpoint_interval
+                        .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL)
+                        .clamp(1, 32),
+                    params.force_checkpoint.unwrap_or(false),
+                )
+                .map_err(|error| {
+                    ErrorData::internal_error(
+                        format!("adaptive observation planning failed: {error}"),
+                        None,
+                    )
+                })?;
+            (Some(plan.metadata), plan.visual)
+        } else {
+            (
+                None,
+                if raw_screenshot.is_some() {
+                    VisualPlan::Full
+                } else {
+                    VisualPlan::None
+                },
+            )
+        };
+        let (captures, preparation_error) = if let Some(raw) = raw_screenshot {
+            match tokio::task::spawn_blocking(move || {
+                if adaptive {
+                    prepare_visual_captures(&raw, &visual_plan, screenshot_options)
+                } else {
+                    let width = raw.width;
+                    let height = raw.height;
+                    prepare_screenshot_payload(raw, screenshot_options).map(|capture| {
+                        vec![(
+                            ObservationRegion {
+                                x: 0,
+                                y: 0,
+                                width,
+                                height,
+                            },
+                            capture,
+                        )]
+                    })
+                }
+            })
+            .await
+            {
+                Ok(Ok(captures)) => (captures, None),
+                Ok(Err(error)) => (Vec::new(), Some(format!("{error:#}"))),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!("screenshot preparation task failed: {error}")),
+                ),
+            }
+        } else {
+            (Vec::new(), None)
+        };
+        if let Some(error) = preparation_error {
+            screenshot_error = Some(error);
+            if adaptive {
+                let _ = self.observation_tracker.lock().map(|mut tracker| {
+                    *tracker = ObservationTracker::default();
+                });
+            }
+        };
+        let screenshot = captures.first().and_then(|(_, capture)| {
+            (!adaptive
+                || observation
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.visual_kind == VisualObservationKind::Full))
+            .then_some(capture)
+        });
+        let screenshot_regions = if adaptive {
+            captures
+                .iter()
+                .map(|(region, capture)| ScreenshotRegionMetadata {
+                    region: *region,
+                    screenshot: ScreenshotMetadata::from_capture(
+                        capture,
+                        window_context.as_ref(),
+                        screenshot_origin,
+                    ),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut message = if let Some(metadata) = &observation {
+            format!(
+                "Adaptive observation {} returned {:?} pixels and {} accessibility nodes (compacted from {}).",
+                metadata.sequence,
+                metadata.visual_kind,
+                accessibility_tree.len(),
+                accessibility_tree_raw_count,
+            )
+        } else if let Some(error) = &accessibility_error {
             format!("MCP registration is working, but AT-SPI tree extraction failed: {error}")
-        } else if let Some((capture, _)) = &screenshot {
+        } else if let Some(capture) = screenshot {
             format!(
                 "MCP registration, screenshot capture, and AT-SPI tree extraction are working. Captured {} accessibility nodes (compacted from {}) and a screenshot through {}.",
                 accessibility_tree.len(),
@@ -474,8 +612,8 @@ impl ComputerUseLinux {
         {
             message.push_str(" Pass verbose=true for full diagnostics.");
         }
-        let screenshot_metadata = screenshot.as_ref().map(|(capture, origin)| {
-            ScreenshotMetadata::from_capture(capture, window_context.as_ref(), *origin)
+        let screenshot_metadata = screenshot.map(|capture| {
+            ScreenshotMetadata::from_capture(capture, window_context.as_ref(), screenshot_origin)
         });
         let output = GetAppStateOutput {
             app_name_or_bundle_identifier: params.app_name_or_bundle_identifier,
@@ -484,6 +622,7 @@ impl ComputerUseLinux {
             window_permissions_hint,
             backend: "linux-atspi".to_string(),
             screenshot: screenshot_metadata,
+            screenshot_regions,
             screenshot_error,
             accessibility_tree,
             accessibility_tree_raw_count,
@@ -491,9 +630,16 @@ impl ComputerUseLinux {
             accessibility_error,
             readiness,
             diagnostics: include_full.then_some(diagnostics),
+            observation,
             message,
         };
-        app_state_tool_result(output, screenshot.as_ref().map(|(capture, _)| capture))
+        app_state_tool_result(
+            output,
+            &captures
+                .iter()
+                .map(|(_, capture)| capture)
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[tool(
@@ -1509,13 +1655,13 @@ impl ComputerUseLinux {
 
 fn app_state_tool_result(
     output: GetAppStateOutput,
-    screenshot: Option<&ScreenshotCapture>,
+    screenshots: &[&ScreenshotCapture],
 ) -> Result<CallToolResult, ErrorData> {
     let value = serde_json::to_value(output).map_err(|error| {
         ErrorData::internal_error(format!("failed to serialize app state: {error}"), None)
     })?;
     let mut result = CallToolResult::structured(value);
-    if let Some(screenshot) = screenshot {
+    for screenshot in screenshots {
         result.content.push(Content::image(
             data_url_payload(&screenshot.data_url),
             screenshot.mime_type.clone(),
@@ -1693,6 +1839,18 @@ struct GetAppStateParams {
     max_depth: Option<u32>,
     #[serde(default)]
     include_screenshot: Option<bool>,
+    /// Additive observation policy. Omit to preserve the legacy full response.
+    #[serde(default)]
+    observation_mode: Option<ObservationMode>,
+    /// Opaque checkpoint ID from the caller's last adaptive result. Omit or mismatch to force a full checkpoint.
+    #[serde(default)]
+    base_checkpoint_id: Option<String>,
+    /// Adaptive full-checkpoint interval, clamped to 1..=32 (default 8).
+    #[serde(default)]
+    checkpoint_interval: Option<u32>,
+    /// Force the next adaptive result to be a full checkpoint.
+    #[serde(default)]
+    force_checkpoint: Option<bool>,
     /// Maximum returned screenshot width in pixels (default 1920, hard-capped).
     #[serde(default)]
     max_width: Option<u32>,
@@ -1828,6 +1986,7 @@ struct GetAppStateOutput {
     window_permissions_hint: Option<String>,
     backend: String,
     screenshot: Option<ScreenshotMetadata>,
+    screenshot_regions: Vec<ScreenshotRegionMetadata>,
     screenshot_error: Option<String>,
     accessibility_tree: Vec<AccessibilityNode>,
     accessibility_tree_raw_count: usize,
@@ -1838,7 +1997,17 @@ struct GetAppStateOutput {
     /// Full diagnostics; populated only when verbose=true.
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<DoctorReport>,
+    /// Present only for observation_mode=adaptive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation: Option<AdaptiveObservationMetadata>,
     message: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ScreenshotRegionMetadata {
+    /// Region coordinates in the current observation frame.
+    region: ObservationRegion,
+    screenshot: ScreenshotMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -3298,19 +3467,6 @@ fn session_is_wayland(session_type: Option<&str>, wayland_display: Option<&str>)
     }
 }
 
-fn prepare_app_state_screenshot(
-    raw: RawScreenshotCapture,
-    bounds: Option<&crate::windowing::WindowBounds>,
-    target_requested: bool,
-    options: ScreenshotPayloadOptions,
-) -> Result<(ScreenshotCapture, (u32, u32))> {
-    let (raw, crop_origin) = crop_raw_screenshot(raw, bounds, target_requested)?;
-    Ok((
-        prepare_screenshot_payload(raw, options)?,
-        crop_origin.unwrap_or((0, 0)),
-    ))
-}
-
 fn crop_raw_screenshot(
     mut raw: RawScreenshotCapture,
     bounds: Option<&crate::windowing::WindowBounds>,
@@ -4227,9 +4383,14 @@ mod tests {
             .find(|tool| tool.name == "get_app_state")
             .unwrap();
         let schema = serde_json::to_string(&tool.output_schema).unwrap();
+        let input_schema = serde_json::to_string(&tool.input_schema).unwrap();
 
         assert!(tool.output_schema.is_some());
         assert!(schema.contains("coordinate_width"));
+        assert!(schema.contains("checkpoint_id"));
+        assert!(schema.contains("screenshot_regions"));
+        assert!(input_schema.contains("base_checkpoint_id"));
+        assert!(input_schema.contains("observation_mode"));
         assert!(!schema.contains("data_url"));
     }
 
@@ -4254,7 +4415,7 @@ mod tests {
     }
 
     #[test]
-    fn app_state_result_carries_image_bytes_once_and_metadata_as_structured_content() {
+    fn app_state_result_carries_each_image_once_and_only_metadata_in_structured_content() {
         let capture = ScreenshotCapture {
             mime_type: "image/png".to_string(),
             data_url: "data:image/png;base64,AAAA".to_string(),
@@ -4279,6 +4440,7 @@ mod tests {
             window_permissions_hint: None,
             backend: "linux-atspi".to_string(),
             screenshot: Some(ScreenshotMetadata::from_capture(&capture, None, (0, 0))),
+            screenshot_regions: Vec::new(),
             screenshot_error: None,
             accessibility_tree: Vec::new(),
             accessibility_tree_raw_count: 0,
@@ -4286,10 +4448,13 @@ mod tests {
             accessibility_error: None,
             readiness: diagnostics.readiness,
             diagnostics: None,
+            observation: None,
             message: "ready".to_string(),
         };
 
-        let result = app_state_tool_result(output, Some(&capture)).unwrap();
+        let mut second_capture = capture.clone();
+        second_capture.data_url = "data:image/png;base64,BBBB".to_string();
+        let result = app_state_tool_result(output, &[&capture, &second_capture]).unwrap();
         let structured = result.structured_content.as_ref().unwrap();
         let text: serde_json::Value = serde_json::from_str(
             result.content[0]
@@ -4309,7 +4474,29 @@ mod tests {
         assert_eq!(structured["screenshot"]["coordinate_origin_y"], 0);
         assert!(structured["screenshot"].get("data_url").is_none());
         assert_eq!(serialized.matches("AAAA").count(), 1);
-        assert_eq!(result.content.len(), 2);
+        assert_eq!(serialized.matches("BBBB").count(), 1);
+        assert_eq!(result.content.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn app_state_observation_modes_respect_screenshot_opt_out() {
+        for observation_mode in [ObservationMode::Adaptive, ObservationMode::Full] {
+            let params = serde_json::from_value(serde_json::json!({
+                "include_screenshot": false,
+                "observation_mode": observation_mode,
+            }))
+            .unwrap();
+            let result = ComputerUseLinux::default()
+                .get_app_state(Parameters(params))
+                .await
+                .unwrap();
+
+            assert_eq!(result.content.len(), 1);
+            assert_eq!(
+                result.structured_content.unwrap()["screenshot"],
+                serde_json::Value::Null
+            );
+        }
     }
 
     #[test]
@@ -4434,10 +4621,9 @@ mod tests {
             width: 200,
             height: 100,
         };
-        let (capture, origin) = prepare_app_state_screenshot(
+        let (raw, origin) = crop_raw_screenshot(raw, Some(&bounds), true).unwrap();
+        let capture = prepare_screenshot_payload(
             raw,
-            Some(&bounds),
-            true,
             ScreenshotPayloadOptions {
                 max_width: Some(100),
                 max_height: Some(100),
@@ -4447,7 +4633,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(origin, (0, 0));
+        assert_eq!(origin, Some((0, 0)));
         assert_eq!(
             (capture.coordinate_width, capture.coordinate_height),
             (200, 100)
@@ -4465,9 +4651,7 @@ mod tests {
             height: 200,
         };
 
-        let error =
-            prepare_app_state_screenshot(raw, None, true, ScreenshotPayloadOptions::default())
-                .unwrap_err();
+        let error = crop_raw_screenshot(raw, None, true).unwrap_err();
 
         assert!(error.to_string().contains("requires a resolved window"));
     }
@@ -4488,15 +4672,10 @@ mod tests {
             height: 100,
         };
 
-        let (capture, origin) = prepare_app_state_screenshot(
-            raw,
-            Some(&bounds),
-            true,
-            ScreenshotPayloadOptions::default(),
-        )
-        .unwrap();
+        let (raw, origin) = crop_raw_screenshot(raw, Some(&bounds), true).unwrap();
+        let capture = prepare_screenshot_payload(raw, ScreenshotPayloadOptions::default()).unwrap();
 
-        assert_eq!(origin, (50, 40));
+        assert_eq!(origin, Some((50, 40)));
         assert_eq!(
             (capture.coordinate_width, capture.coordinate_height),
             (50, 60)
