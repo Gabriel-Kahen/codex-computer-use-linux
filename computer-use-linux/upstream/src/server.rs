@@ -5,8 +5,8 @@ use crate::action_batch::{
 };
 use crate::atspi_tree::{
     focused_element_summary, list_accessible_apps, perform_action as invoke_accessibility_action,
-    set_element_value, snapshot_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
-    Bounds, FocusedElementSummary, ValueSetInvocation,
+    set_element_value, snapshot_compact_tree, AccessibilityAction, AccessibilityNode,
+    AccessibleAppSummary, Bounds, FocusedElementSummary, ValueSetInvocation,
 };
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
@@ -340,7 +340,9 @@ impl ComputerUseLinux {
         let (accessibility_tree, accessibility_tree_raw_count, accessibility_error) =
             if diagnostics.readiness.can_build_accessibility_tree {
                 let target_pid = window_context.as_ref().and_then(|window| window.pid);
-                match snapshot_tree(app_filter.as_deref(), target_pid, max_nodes, max_depth).await {
+                match snapshot_compact_tree(app_filter.as_deref(), target_pid, max_nodes, max_depth)
+                    .await
+                {
                     Ok(nodes) => {
                         let raw_count = nodes.len();
                         (compact_accessibility_tree(nodes), raw_count, None)
