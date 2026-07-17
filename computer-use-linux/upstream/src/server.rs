@@ -20,6 +20,7 @@ use crate::screenshot::{
     capture_screenshot_raw, prepare_screenshot_payload, RawScreenshotCapture, ScreenshotCapture,
     ScreenshotOutputFormat, ScreenshotPayloadOptions,
 };
+use crate::windowing::capture_window_exact;
 use crate::windowing::registry;
 use crate::windows::{
     focus_window_target, focused_window, list_windows, resolve_window_target,
@@ -425,7 +426,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "screenshot",
-        description = "Capture the screen and return it as a viewable, size-bounded image. Optionally target a window (window_id/pid/wm_class/title/app_id): the window is raised to the front and the image is cropped before any resize. Returns the image plus a short caption with returned dimensions, coordinate dimensions, scale, format, quality, source, and crop bounds; callers can request jpeg/quality for compression before resizing.",
+        description = "Capture the screen and return it as a viewable, size-bounded image. Targeted Hyprland captures use exact compositor pixels; pass raise_window=false to avoid focusing. Other backends crop the resolved window before resize. Targeted failures never return desktop pixels. Window-targeted coordinates are window-local: add coordinate_origin_x/y before using relative=true with the same target.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -438,60 +439,84 @@ impl ComputerUseLinux {
         Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let target = params.window_target();
-
-        // When targeting a window, raise it first (so it isn't occluded) and
-        // resolve its bounds so we can crop to just that window.
-        let mut crop: Option<crate::windowing::WindowBounds> = None;
-        let mut window_label: Option<String> = None;
-        if let Some(target) = &target {
-            if params.raise_window.unwrap_or(true) {
-                let _ = focus_window_target(target).await;
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            if !params.full_screen.unwrap_or(false) {
-                if let Ok(windows) = list_windows().await {
-                    if let Ok(window) = resolve_window_target(&windows, target) {
-                        crop = window.bounds.clone();
-                        window_label = window.title.clone();
-                    }
-                }
-            }
+        let full_screen = params.full_screen.unwrap_or(false);
+        let raise_window = params.raise_window.unwrap_or(true);
+        if let Some(target) = target.as_ref().filter(|_| raise_window) {
+            let _ = focus_window_target(target).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
-
-        let raw_capture = capture_screenshot_raw()
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("screenshot failed: {e}"), None))?;
-        self.cache_desktop_size(raw_capture.width, raw_capture.height);
-
-        // Warn when the target window extends past the visible desktop: the
-        // portal only captures on-screen pixels, so the crop silently loses the
-        // off-screen region while coordinate metadata still claims full size.
+        let window = if let Some(target) = target.as_ref().filter(|_| !full_screen) {
+            let windows = list_windows().await.map_err(|error| {
+                ErrorData::internal_error(format!("window resolution failed: {error:#}"), None)
+            })?;
+            Some(
+                resolve_window_target(&windows, target)
+                    .map_err(|error| {
+                        ErrorData::internal_error(
+                            format!("window resolution failed: {error:#}"),
+                            None,
+                        )
+                    })?
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let exact_capture = if full_screen {
+            None
+        } else if let Some(window) = window.as_ref() {
+            capture_window_exact(window).await.map_err(|error| {
+                ErrorData::internal_error(format!("screenshot failed: {error:#}"), None)
+            })?
+        } else {
+            None
+        };
+        let exact = exact_capture.is_some();
+        let raw_capture = match exact_capture {
+            Some(capture) => capture,
+            None => capture_screenshot_raw().await.map_err(|error| {
+                ErrorData::internal_error(format!("screenshot failed: {error:#}"), None)
+            })?,
+        };
+        if !exact {
+            self.cache_desktop_size(raw_capture.width, raw_capture.height);
+        }
+        let crop = if full_screen || exact {
+            None
+        } else {
+            Some(
+                window
+                    .as_ref()
+                    .and_then(|window| window.bounds.clone())
+                    .ok_or_else(|| {
+                        ErrorData::internal_error(
+                            "targeted screenshot requires usable window bounds",
+                            None,
+                        )
+                    })?,
+            )
+        };
         let off_screen_note = match crop.as_ref() {
             Some(bounds) => self.off_screen_note_for_bounds(bounds).await,
             None => None,
         };
-
-        let (capture, cropped) = match crop.as_ref().and_then(window_crop_rect) {
-            Some((x, y, w, h)) => match crop_png(&raw_capture.bytes, x, y, w, h) {
-                Ok((bytes, cw, ch)) => (
-                    RawScreenshotCapture {
-                        mime_type: raw_capture.mime_type.clone(),
-                        bytes,
-                        source: raw_capture.source.clone(),
-                        width: cw,
-                        height: ch,
-                    },
-                    true,
-                ),
-                // If cropping fails, fall back to the full frame rather than erroring.
-                Err(_) => (raw_capture, false),
-            },
-            None => (raw_capture, false),
-        };
-        let capture =
-            prepare_screenshot_payload(capture, params.screenshot_options()).map_err(|e| {
-                ErrorData::internal_error(format!("screenshot resize failed: {e}"), None)
-            })?;
+        let target_requested = target.is_some() && !full_screen && !exact;
+        let screenshot_options = params.screenshot_options();
+        let (capture, crop_origin) = tokio::task::spawn_blocking(move || {
+            let (capture, crop_origin) =
+                crop_raw_screenshot(raw_capture, crop.as_ref(), target_requested)?;
+            Ok::<_, anyhow::Error>((
+                prepare_screenshot_payload(capture, screenshot_options)?,
+                crop_origin,
+            ))
+        })
+        .await
+        .map_err(|error| {
+            ErrorData::internal_error(format!("screenshot preparation task failed: {error}"), None)
+        })?
+        .map_err(|error| {
+            ErrorData::internal_error(format!("screenshot preparation failed: {error}"), None)
+        })?;
 
         let mut caption = serde_json::json!({
             "width": capture.width,
@@ -506,8 +531,13 @@ impl ComputerUseLinux {
             "format": capture.format,
             "quality": capture.quality,
             "source": capture.source,
-            "cropped_to_window": cropped,
-            "window_title": window_label,
+            "coordinate_space": if exact || crop_origin.is_some() { "window_local" } else { "desktop" },
+            "coordinate_origin_x": crop_origin.map_or(0, |(x, _)| x),
+            "coordinate_origin_y": crop_origin.map_or(0, |(_, y)| y),
+            "window_id": window.as_ref().map(|window| window.window_id),
+            "exact_window_capture": exact,
+            "cropped_to_window": exact || crop_origin.is_some(),
+            "window_title": window.as_ref().and_then(|window| window.title.as_deref()),
         });
         if let Some(note) = off_screen_note {
             caption["window_off_screen"] = serde_json::json!(true);
@@ -3180,11 +3210,20 @@ fn session_is_wayland(session_type: Option<&str>, wayland_display: Option<&str>)
 }
 
 fn prepare_app_state_screenshot(
-    mut raw: RawScreenshotCapture,
+    raw: RawScreenshotCapture,
     bounds: Option<&crate::windowing::WindowBounds>,
     target_requested: bool,
     options: ScreenshotPayloadOptions,
 ) -> Result<ScreenshotCapture> {
+    let (raw, _) = crop_raw_screenshot(raw, bounds, target_requested)?;
+    prepare_screenshot_payload(raw, options)
+}
+
+fn crop_raw_screenshot(
+    mut raw: RawScreenshotCapture,
+    bounds: Option<&crate::windowing::WindowBounds>,
+    target_requested: bool,
+) -> Result<(RawScreenshotCapture, Option<(u32, u32)>)> {
     if target_requested && bounds.is_none() {
         anyhow::bail!(
             "targeted screenshot requires a resolved window; refusing to return the full desktop"
@@ -3196,12 +3235,16 @@ fn prepare_app_state_screenshot(
                 "targeted screenshot has unusable window bounds; refusing to return the full desktop"
             )
         })?;
+        let mut origin_x = 0;
+        let mut origin_y = 0;
         if x < 0 {
-            width = width.saturating_sub(x.unsigned_abs());
+            origin_x = x.unsigned_abs();
+            width = width.saturating_sub(origin_x);
             x = 0;
         }
         if y < 0 {
-            height = height.saturating_sub(y.unsigned_abs());
+            origin_y = y.unsigned_abs();
+            height = height.saturating_sub(origin_y);
             y = 0;
         }
         if width == 0 || height == 0 {
@@ -3218,8 +3261,9 @@ fn prepare_app_state_screenshot(
             width,
             height,
         };
+        return Ok((raw, Some((origin_x, origin_y))));
     }
-    prepare_screenshot_payload(raw, options)
+    Ok((raw, None))
 }
 
 /// Convert a window's bounds into a crop rectangle, if it has a usable origin
@@ -4315,14 +4359,10 @@ mod tests {
             height: 100,
         };
 
-        let capture = prepare_app_state_screenshot(
-            raw,
-            Some(&bounds),
-            true,
-            ScreenshotPayloadOptions::default(),
-        )
-        .unwrap();
+        let (raw, origin) = crop_raw_screenshot(raw, Some(&bounds), true).unwrap();
+        let capture = prepare_screenshot_payload(raw, ScreenshotPayloadOptions::default()).unwrap();
 
+        assert_eq!(origin, Some((50, 40)));
         assert_eq!(
             (capture.coordinate_width, capture.coordinate_height),
             (50, 60)
