@@ -3,13 +3,17 @@ use crate::windowing::registry::BackendProbe;
 use crate::windowing::types::{WindowBounds, WindowInfo};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 pub const HYPRLAND_BACKEND: &str = "hyprland";
+const STABLE_CAPTURE_ID_TTL: Duration = Duration::from_secs(1);
+const MAX_STABLE_CAPTURE_IDS: usize = 1024;
 
 pub fn probe() -> BackendProbe {
     match hyprctl_output(&["clients", "-j"]) {
@@ -115,6 +119,7 @@ fn scale_u32(value: u32, scale: f64) -> u32 {
 }
 
 fn windows_from_hyprland_clients(clients: Vec<HyprlandClient>) -> Result<Vec<WindowInfo>> {
+    record_stable_capture_ids(&clients);
     let mut windows = clients
         .into_iter()
         .filter(|client| client.mapped.unwrap_or(true))
@@ -181,6 +186,22 @@ fn exact_capture_id_from_clients(
                 window.window_id
             )
         })?;
+    if let Some(expected_id) = stable_capture_id(window.window_id) {
+        let actual_id = client.stable_id.with_context(|| {
+            format!(
+                "Hyprland window 0x{:x} lost its stable capture identity",
+                window.window_id
+            )
+        })?;
+        if actual_id != expected_id {
+            bail!(
+                "Hyprland window 0x{:x} changed stable capture identity",
+                window.window_id
+            );
+        }
+    } else {
+        return Ok(None);
+    }
     let actual_pid = client.pid.and_then(|pid| u32::try_from(pid).ok());
     if window.pid.is_some() && window.pid != actual_pid {
         bail!(
@@ -206,6 +227,50 @@ fn exact_capture_id_from_clients(
         );
     }
     Ok(client.stable_id.map(|id| id.to_string()))
+}
+
+fn stable_capture_ids() -> &'static Mutex<HashMap<u64, (u64, Instant)>> {
+    static IDS: OnceLock<Mutex<HashMap<u64, (u64, Instant)>>> = OnceLock::new();
+    IDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_stable_capture_ids(clients: &[HyprlandClient]) {
+    let now = Instant::now();
+    let mut ids = stable_capture_ids()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for client in clients {
+        if let (Ok(window_id), Some(stable_id)) =
+            (parse_hyprland_address(&client.address), client.stable_id)
+        {
+            if let Some((recorded_id, recorded_at)) = ids.get_mut(&window_id) {
+                if *recorded_id == stable_id || recorded_at.elapsed() >= STABLE_CAPTURE_ID_TTL {
+                    *recorded_id = stable_id;
+                    *recorded_at = now;
+                }
+                continue;
+            }
+            let oldest = (ids.len() == MAX_STABLE_CAPTURE_IDS)
+                .then(|| {
+                    ids.iter()
+                        .min_by_key(|(_, (_, recorded_at))| *recorded_at)
+                        .map(|(window_id, _)| *window_id)
+                })
+                .flatten();
+            if let Some(oldest) = oldest {
+                ids.remove(&oldest);
+            }
+            ids.insert(window_id, (stable_id, now));
+        }
+    }
+}
+
+fn stable_capture_id(window_id: u64) -> Option<u64> {
+    stable_capture_ids()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&window_id)
+        .map(|(stable_id, _)| *stable_id)
 }
 
 fn lua_focus_dispatch(address: &str) -> String {
@@ -430,14 +495,21 @@ mod tests {
         );
 
         clients[0].stable_id = None;
-        assert_eq!(
-            exact_capture_id_from_clients(&window, &clients).unwrap(),
-            None
-        );
+        let error = exact_capture_id_from_clients(&window, &clients).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lost its stable capture identity"));
         clients[0].stable_id = Some(73);
         clients[0].pid = Some(5252);
         let error = exact_capture_id_from_clients(&window, &clients).unwrap_err();
         assert!(error.to_string().contains("changed process identity"));
+
+        clients[0].pid = Some(4242);
+        clients[0].stable_id = Some(74);
+        let error = exact_capture_id_from_clients(&window, &clients).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed stable capture identity"));
     }
 
     #[test]
