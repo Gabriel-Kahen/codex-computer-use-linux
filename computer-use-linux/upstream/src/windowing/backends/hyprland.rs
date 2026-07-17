@@ -147,6 +147,67 @@ pub fn activate_window(window_id: u64) -> Result<()> {
     }
 }
 
+pub(crate) fn exact_capture_id(window: &WindowInfo) -> Result<Option<String>> {
+    if window.backend != HYPRLAND_BACKEND {
+        bail!(
+            "cannot resolve a Hyprland capture ID for backend {}",
+            window.backend
+        );
+    }
+
+    let output = hyprctl_output(&["clients", "-j"])
+        .context("failed to re-resolve the Hyprland window before exact capture")?;
+    if !output.status.success() {
+        bail!(
+            "hyprctl clients -j failed before exact capture: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let clients: Vec<HyprlandClient> = serde_json::from_slice(&output.stdout)
+        .context("failed to parse hyprctl clients -j before exact capture")?;
+    exact_capture_id_from_clients(window, &clients)
+}
+
+fn exact_capture_id_from_clients(
+    window: &WindowInfo,
+    clients: &[HyprlandClient],
+) -> Result<Option<String>> {
+    let client = clients
+        .iter()
+        .find(|client| parse_hyprland_address(&client.address).ok() == Some(window.window_id))
+        .with_context(|| {
+            format!(
+                "Hyprland window 0x{:x} disappeared before exact capture",
+                window.window_id
+            )
+        })?;
+    let actual_pid = client.pid.and_then(|pid| u32::try_from(pid).ok());
+    if window.pid.is_some() && window.pid != actual_pid {
+        bail!(
+            "Hyprland window 0x{:x} changed process identity before exact capture",
+            window.window_id
+        );
+    }
+    let class_changed = window
+        .app_id
+        .as_deref()
+        .or(window.wm_class.as_deref())
+        .is_some_and(|expected_class| client.class_name.as_deref() != Some(expected_class));
+    if class_changed {
+        bail!(
+            "Hyprland window 0x{:x} changed application identity before exact capture",
+            window.window_id
+        );
+    }
+    if !client.mapped.unwrap_or(true) {
+        bail!(
+            "Hyprland window 0x{:x} is no longer mapped",
+            window.window_id
+        );
+    }
+    Ok(client.stable_id.map(|id| id.to_string()))
+}
+
 fn lua_focus_dispatch(address: &str) -> String {
     format!("hl.dsp.focus({{ window = \"{address}\" }})")
 }
@@ -254,6 +315,8 @@ struct HyprlandMonitor {
 #[derive(Debug, Deserialize)]
 struct HyprlandClient {
     address: String,
+    #[serde(rename = "stableId")]
+    stable_id: Option<u64>,
     mapped: Option<bool>,
     hidden: Option<bool>,
     at: Option<[i32; 2]>,
@@ -352,6 +415,29 @@ mod tests {
             lua_focus_dispatch("address:0x1234abcd"),
             "hl.dsp.focus({ window = \"address:0x1234abcd\" })"
         );
+    }
+
+    #[test]
+    fn resolves_capture_id_and_rejects_reused_window_address() {
+        let clients = r#"[{"address":"0x1234","stableId":73,"mapped":true,"class":"org.example.Editor","pid":4242}]"#;
+        let mut windows = parse_hyprland_clients(clients).unwrap();
+        let window = windows.pop().unwrap();
+        let mut clients: Vec<HyprlandClient> = serde_json::from_str(clients).unwrap();
+
+        assert_eq!(
+            exact_capture_id_from_clients(&window, &clients).unwrap(),
+            Some("73".to_string())
+        );
+
+        clients[0].stable_id = None;
+        assert_eq!(
+            exact_capture_id_from_clients(&window, &clients).unwrap(),
+            None
+        );
+        clients[0].stable_id = Some(73);
+        clients[0].pid = Some(5252);
+        let error = exact_capture_id_from_clients(&window, &clients).unwrap_err();
+        assert!(error.to_string().contains("changed process identity"));
     }
 
     #[test]

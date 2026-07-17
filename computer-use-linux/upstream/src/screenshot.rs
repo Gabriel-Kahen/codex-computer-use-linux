@@ -12,7 +12,8 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::process::Command;
 use zbus::{
@@ -32,6 +33,7 @@ pub const DEFAULT_SCREENSHOT_JPEG_QUALITY: u8 = 80;
 pub const MIN_SCREENSHOT_JPEG_QUALITY: u8 = 1;
 pub const MAX_SCREENSHOT_JPEG_QUALITY: u8 = 95;
 const MIN_SCREENSHOT_MAX_BYTES: usize = 1024;
+const RECENT_SCREENSHOT_TTL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone)]
 pub struct RawScreenshotCapture {
@@ -159,6 +161,78 @@ enum ScreenshotBackend {
     GnomeScreenshot,
 }
 
+const SCREENSHOT_BACKEND_ORDER: &[ScreenshotBackend] = &[
+    ScreenshotBackend::GnomeShell,
+    ScreenshotBackend::GnomeExtension,
+    ScreenshotBackend::Portal,
+    ScreenshotBackend::GnomeScreenshot,
+];
+
+static LAST_HEALTHY_BACKEND: OnceLock<Mutex<Option<ScreenshotBackend>>> = OnceLock::new();
+static LAST_HEALTHY_CAPTURE: OnceLock<Mutex<Option<(Instant, RawScreenshotCapture)>>> =
+    OnceLock::new();
+static RECENT_CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static SESSION_BUS: tokio::sync::Mutex<Option<zbus::Connection>> =
+    tokio::sync::Mutex::const_new(None);
+
+async fn session_bus() -> Result<zbus::Connection> {
+    let mut cached = SESSION_BUS.lock().await;
+    if let Some(connection) = cached.as_ref() {
+        return Ok(connection.clone());
+    }
+    let connection = zbus::Connection::session()
+        .await
+        .context("failed to connect to session bus")?;
+    *cached = Some(connection.clone());
+    Ok(connection)
+}
+
+async fn invalidate_session_bus() {
+    *SESSION_BUS.lock().await = None;
+}
+
+fn last_healthy_backend() -> &'static Mutex<Option<ScreenshotBackend>> {
+    LAST_HEALTHY_BACKEND.get_or_init(|| Mutex::new(None))
+}
+
+fn recent_healthy_capture() -> Option<RawScreenshotCapture> {
+    LAST_HEALTHY_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(captured_at, _)| captured_at.elapsed() <= RECENT_SCREENSHOT_TTL)
+        .map(|(_, capture)| capture.clone())
+}
+
+fn record_healthy_capture(capture: &RawScreenshotCapture) {
+    *LAST_HEALTHY_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((Instant::now(), capture.clone()));
+}
+
+fn cached_backend() -> Option<ScreenshotBackend> {
+    *last_healthy_backend()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn record_healthy_backend(backend: ScreenshotBackend) {
+    *last_healthy_backend()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(backend);
+}
+
+fn invalidate_cached_backend(backend: ScreenshotBackend) {
+    let mut cached = last_healthy_backend()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *cached == Some(backend) {
+        *cached = None;
+    }
+}
+
 impl ScreenshotBackend {
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -171,11 +245,24 @@ impl ScreenshotBackend {
     }
 
     async fn capture(self) -> Result<RawScreenshotCapture> {
-        match self {
+        let result = match self {
             Self::GnomeShell => capture_with_gnome_shell().await,
             Self::GnomeExtension => capture_with_gnome_extension().await,
             Self::Portal => capture_with_portal().await,
             Self::GnomeScreenshot => capture_with_gnome_screenshot().await,
+        };
+        if result.is_err() && self != Self::GnomeScreenshot {
+            invalidate_session_bus().await;
+        }
+        result
+    }
+
+    fn failure_label(self) -> &'static str {
+        match self {
+            Self::GnomeShell => "GNOME Shell screenshot",
+            Self::GnomeExtension => "GNOME Shell extension screenshot",
+            Self::Portal => "XDG portal screenshot",
+            Self::GnomeScreenshot => "gnome-screenshot fallback",
         }
     }
 }
@@ -187,7 +274,23 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
     // background/systemd contexts pin `gnome-screenshot` when the DBus paths are
     // blocked, and aids debugging.
     if let Some(forced) = forced_backend()? {
-        return forced.capture().await;
+        let capture = forced.capture().await?;
+        record_healthy_capture(&capture);
+        return Ok(capture);
+    }
+    let cached = cached_backend();
+    let mut errors = Vec::new();
+    if let Some(cached) = cached {
+        match cached.capture().await {
+            Ok(capture) => {
+                record_healthy_capture(&capture);
+                return Ok(capture);
+            }
+            Err(error) => {
+                invalidate_cached_backend(cached);
+                errors.push(format!("{} failed: {error}", cached.failure_label()));
+            }
+        }
     }
 
     // The Shell and portal DBus paths fail for background processes (systemd
@@ -196,29 +299,32 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
     // response code 2 when there is no foreground window. `gnome-screenshot`
     // claims an allowlisted bus name and works regardless, so it is the final
     // fallback. See issue #20.
-    let gnome_error = match capture_with_gnome_shell().await {
-        Ok(capture) => return Ok(capture),
-        Err(error) => error,
-    };
-    let extension_error = match capture_with_gnome_extension().await {
-        Ok(capture) => return Ok(capture),
-        Err(error) => error,
-    };
-    let portal_error = match capture_with_portal().await {
-        Ok(capture) => return Ok(capture),
-        Err(error) => error,
-    };
-    let cli_error = match capture_with_gnome_screenshot().await {
-        Ok(capture) => return Ok(capture),
-        Err(error) => error,
-    };
+    for backend in SCREENSHOT_BACKEND_ORDER {
+        if Some(*backend) == cached {
+            continue;
+        }
+        match backend.capture().await {
+            Ok(capture) => {
+                record_healthy_backend(*backend);
+                record_healthy_capture(&capture);
+                return Ok(capture);
+            }
+            Err(error) => errors.push(format!("{} failed: {error}", backend.failure_label())),
+        }
+    }
+    Err(anyhow!(errors.join("; ")))
+}
 
-    Err(anyhow!(
-        "GNOME Shell screenshot failed: {gnome_error}; \
-         GNOME Shell extension screenshot failed: {extension_error}; \
-         XDG portal screenshot failed: {portal_error}; \
-         gnome-screenshot fallback failed: {cli_error}"
-    ))
+pub(crate) async fn capture_screenshot_raw_recent() -> Result<RawScreenshotCapture> {
+    let _guard = RECENT_CAPTURE_LOCK.lock().await;
+    if let Some(capture) = forced_backend()?
+        .is_none()
+        .then(recent_healthy_capture)
+        .flatten()
+    {
+        return Ok(capture);
+    }
+    capture_screenshot_raw().await
 }
 
 fn forced_backend() -> Result<Option<ScreenshotBackend>> {
@@ -300,9 +406,7 @@ pub fn prepare_screenshot_payload(
 }
 
 async fn capture_with_gnome_shell() -> Result<RawScreenshotCapture> {
-    let connection = zbus::Connection::session()
-        .await
-        .context("failed to connect to session bus")?;
+    let connection = session_bus().await?;
     let proxy = Proxy::new(
         &connection,
         "org.gnome.Shell.Screenshot",
@@ -342,9 +446,7 @@ async fn capture_with_gnome_extension() -> Result<RawScreenshotCapture> {
     let filename = path
         .to_str()
         .context("temporary screenshot path is not valid UTF-8")?;
-    let connection = zbus::Connection::session()
-        .await
-        .context("failed to connect to session bus")?;
+    let connection = session_bus().await?;
     let proxy = Proxy::new(
         &connection,
         identity::DBUS_SERVICE,
@@ -374,9 +476,7 @@ async fn capture_with_gnome_extension() -> Result<RawScreenshotCapture> {
 }
 
 async fn capture_with_portal() -> Result<RawScreenshotCapture> {
-    let connection = zbus::Connection::session()
-        .await
-        .context("failed to connect to session bus")?;
+    let connection = session_bus().await?;
     let token = request_token();
     // Some portals rewrite the request handle, so subscribe before calling Screenshot
     // and filter by the returned handle instead of subscribing after the call.
@@ -531,7 +631,7 @@ async fn read_png_as_capture(
     result
 }
 
-fn read_png_as_capture_inner(path: &Path, source: &str) -> Result<RawScreenshotCapture> {
+pub(crate) fn read_png_as_capture_inner(path: &Path, source: &str) -> Result<RawScreenshotCapture> {
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read screenshot file {}", path.display()))?;
     if bytes.is_empty() {
@@ -698,7 +798,7 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-fn temp_png_path(source: &str) -> PathBuf {
+pub(crate) fn temp_png_path(source: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "computer-use-linux-{source}-{}.png",
         unique_suffix()
@@ -737,6 +837,24 @@ mod tests {
         png.extend_from_slice(&height.to_be_bytes());
         png.extend_from_slice(&[8, 6, 0, 0, 0]);
         png
+    }
+
+    #[test]
+    fn recent_capture_cache_expires_after_one_frame() {
+        let capture = RawScreenshotCapture {
+            mime_type: "image/png".to_string(),
+            bytes: valid_png(2, 1),
+            source: "test".to_string(),
+            width: 2,
+            height: 1,
+        };
+        let cache = LAST_HEALTHY_CAPTURE.get_or_init(|| Mutex::new(None));
+        *cache.lock().unwrap() = Some((Instant::now(), capture.clone()));
+        assert_eq!(recent_healthy_capture().unwrap().bytes, capture.bytes);
+
+        *cache.lock().unwrap() = Some((Instant::now() - RECENT_SCREENSHOT_TTL, capture));
+        assert!(recent_healthy_capture().is_none());
+        *cache.lock().unwrap() = None;
     }
 
     fn solid_png(width: u32, height: u32) -> Vec<u8> {

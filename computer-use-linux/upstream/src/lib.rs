@@ -20,7 +20,7 @@ mod ydotool;
 pub mod atspi_tree {
     pub(crate) use crate::atspi_tree_impl::{
         focused_element_summary, list_accessible_apps, perform_action, set_element_value,
-        AccessibleAppSummary, FocusedElementSummary, ValueSetInvocation,
+        snapshot_compact_tree, AccessibleAppSummary, FocusedElementSummary, ValueSetInvocation,
     };
     pub use crate::atspi_tree_impl::{
         snapshot_tree, AccessibilityAction, AccessibilityNode, AccessibilityText,
@@ -39,8 +39,8 @@ pub mod diagnostics {
 
 pub mod screenshot {
     pub(crate) use crate::screenshot_impl::{
-        capture_screenshot, prepare_screenshot_payload, ScreenshotCapture, ScreenshotOutputFormat,
-        ScreenshotPayloadOptions,
+        capture_screenshot, capture_screenshot_raw_recent, prepare_screenshot_payload,
+        ScreenshotCapture, ScreenshotOutputFormat, ScreenshotPayloadOptions,
     };
     pub use crate::screenshot_impl::{capture_screenshot_raw, RawScreenshotCapture};
 }
