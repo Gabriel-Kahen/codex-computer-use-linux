@@ -7416,6 +7416,14 @@
           }
         ]
       },
+      "CodexResponseHandoffMode": {
+        "enum": [
+          "thinking",
+          "commentary",
+          "bemTags"
+        ],
+        "type": "string"
+      },
       "CollabAgentState": {
         "properties": {
           "message": {
@@ -14523,7 +14531,8 @@
       "PluginShareUpdateDiscoverability": {
         "enum": [
           "UNLISTED",
-          "PRIVATE"
+          "PRIVATE",
+          "LISTED"
         ],
         "type": "string"
       },
