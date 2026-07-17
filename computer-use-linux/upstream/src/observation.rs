@@ -3,7 +3,7 @@ use crate::screenshot::{
 };
 use anyhow::{Context, Result};
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::RandomState, HashSet, VecDeque};
 use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher};
 use std::io::Cursor;
@@ -24,6 +24,13 @@ const MAX_TOTAL_VISION_PATCHES: usize = 3_072;
 pub(crate) const DEFAULT_CHECKPOINT_INTERVAL: u32 = 8;
 static NEXT_CHECKPOINT_ID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_CHECKPOINT_NONCE: OnceLock<u64> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObservationMode {
+    Adaptive,
+    Full,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
