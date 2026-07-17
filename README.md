@@ -3,87 +3,74 @@
 Improve how Codex sees, understands, and operates Linux desktops.
 
 This repository is a fork of [OpenAI Codex](https://github.com/openai/codex)
-and a home for Linux computer-use work. Its current focus is **same-session
-computer use**: letting Codex inspect and operate applications that are already
-running in your real desktop session while preserving their processes,
-profiles, signed-in state, files, and open windows.
+and a home for Linux computer-use work. Its main feature is **same-session
+computer use**: Codex can inspect and operate applications that are already
+running in your real desktop session while keeping their processes, profiles,
+signed-in state, files, and open windows.
 
-The project combines a native Linux Computer Use backend with optional
-desktop-specific companion plugins. The backend provides broad Linux support;
-the companions add stronger window capture, coordination, and background-input
-behavior where a compositor exposes the required APIs.
+Same-session computer use is one feature implemented across several desktop
+backends. Every backend uses the shared Linux engine for screenshots,
+accessibility, and input, then adds the compositor-specific behavior available
+on that desktop.
 
-## What works today
+## Features
 
-The required [`computer-use-linux`](./computer-use-linux/) plugin can:
+- **Use your existing apps.** Codex works with the windows and applications you
+  already have open instead of starting a separate desktop or fresh profile.
+- **See both pixels and UI structure.** It combines screenshots with Linux
+  accessibility information, window bounds, focus, app identity, and
+  best-effort terminal process context.
+- **Interact naturally.** Codex can click, drag, scroll, press shortcuts, type
+  text, invoke accessibility actions, and edit supported controls using either
+  semantic elements or coordinates.
+- **Target the right window.** Supported backends can discover compositor
+  windows, focus or claim an exact window, and verify targeted keyboard input.
+- **Work in the background where the desktop allows it.** Hyprland can send
+  input directly to a window, while Plasma and X11 can capture exact windows in
+  the background. When a desktop exposes only one keyboard and pointer, the
+  backend coordinates access and restores the user's state afterward.
+- **Coordinate parallel agents.** The Hyprland, GNOME, Plasma, and X11 backends
+  let each agent reserve a window so agents can work on different apps without
+  racing each other. Actions that use the shared keyboard or pointer stay
+  serialized.
+- **Recover safely.** When an operation must borrow focus, a workspace, or the
+  pointer, the backend records the original state and restores it after the
+  action or an interrupted session.
+- **Reduce round trips.** Short action batches are fully validated, run in
+  order, stop on the first failure, and stay bound to one exact window.
+- **Explain what is available.** The `doctor` command and tool report which
+  screenshot, accessibility, window, and input paths are ready on the current
+  machine.
 
-- report whether screenshots, accessibility, window discovery, and input are
-  ready on the current desktop;
-- list running applications and compositor windows, including focus, bounds,
-  app identity, and best-effort terminal process context;
-- return size-bounded PNG or JPEG screenshots together with AT-SPI
-  accessibility trees;
-- click, drag, scroll, press shortcuts, and type text using semantic elements
-  or coordinates;
-- invoke native accessibility actions and edit supported text/value controls;
-- target keyboard input at a verified window and report which accessibility
-  element received focus; and
-- run short, validated, fail-fast action batches against one exact window to
-  reduce model round trips.
+## Supported desktop backends
 
-All supported desktops can use the core plugin on its own. Install a companion
-only when you want the stronger same-session behavior described below.
-
-## Supported backends
-
-### Core Linux backend
-
-The core backend selects the best window, capture, accessibility, and input
-path exposed by the current session.
-
-| Desktop/session | Window backend | Current support |
-|---|---|---|
-| GNOME Wayland or Xorg | GNOME Shell extension or Shell Introspect | Window discovery and focus, AT-SPI, GNOME/portal screenshots, and guarded input |
-| KDE Plasma 5/6 | Temporary KWin D-Bus scripting | Window discovery and focus, AT-SPI, portal capture/input, and Plasma-aware text entry |
-| Hyprland | `hyprctl` | Window discovery and focus plus the shared screenshot, accessibility, and input paths |
-| Niri | Niri IPC | Window discovery and focus plus the shared screenshot, accessibility, and input paths |
-| COSMIC Wayland | Bundled COSMIC toplevel helper | Window discovery and focus plus the shared screenshot, accessibility, and input paths |
-| i3 | `i3-msg` and optional `xprop` | Window discovery and focus plus X11 accessibility, capture, and input paths |
-| Generic Xorg/EWMH | `wmctrl` and `xprop` | Window discovery on desktops such as Xfce, Cinnamon, MATE, and LXQt/Openbox, with AT-SPI and X11 input |
-
-Real behavior still depends on the session exposing its expected portal,
-accessibility, compositor, and input services. Run the backend's `doctor`
-command, or call its `doctor` tool from Codex, for the authoritative capability
-report on your machine.
-
-### Optional same-session companions
-
-Companion plugins coordinate with the core backend but add their own
-compositor-specific tools and safety boundaries.
-
-| Companion | Declared target | What it adds | Input/interference model |
+| Desktop backend | Same-session capabilities | Background and input behavior | Declared support |
 |---|---|---|---|
-| [Hyprland](./contrib/hyprland-background-computer-use/) | Hyprland 0.55.4 | Exact capture of inactive windows, per-window agent claims, targeted shortcuts, native Wayland and XWayland pointer actions, and recoverable fallback workspaces | Window-local operations avoid the physical pointer; compatibility fallback uses an acknowledged global-seat lease |
-| [GNOME](./contrib/gnome-same-session-computer-use/) | GNOME Shell 45 on Wayland or Xorg | Stable Shell window discovery, per-window claims, focused-window capture, and recoverable focus/workspace restoration | GNOME exposes one global seat, so coordinate and keyboard work is serialized and may visibly change focus |
-| [KDE Plasma](./contrib/plasma-same-session-computer-use/) | Plasma 6/KWin Wayland | Stable KWin IDs, parallel exact compositor capture, cross-process window claims, and owner-bound recovery journals | Capture can remain in the background; input uses one acknowledged global-seat lease and is not claimed as targeted background input |
-| [Generic X11](./contrib/x11-background-computer-use/) | EWMH Xorg desktops | Exact XComposite capture, per-window claims, best-effort no-focus shortcuts, and recoverable XTEST input | Capture can run per window; reliable input is serialized through the shared physical seat |
+| [Hyprland](./contrib/hyprland-background-computer-use/) | Window discovery, exact inactive-window capture, AT-SPI, per-window claims, targeted shortcuts, and native Wayland/XWayland pointer actions | Window-local operations avoid the physical pointer; a recoverable workspace/output lease handles apps that require real focus | Full integration targets Hyprland 0.55.4; native extensions must match the running ABI |
+| [GNOME](./contrib/gnome-same-session-computer-use/) | Shell window discovery, screenshots, AT-SPI, per-window claims, and recoverable focus/workspace restoration | GNOME exposes one global seat, so exact capture and coordinate/keyboard work use serialized, acknowledged focus leases | Full integration targets GNOME Shell 45 on Wayland or Xorg; the shared engine can use GNOME Shell or portal paths on other releases |
+| [KDE Plasma](./contrib/plasma-same-session-computer-use/) | Stable KWin window IDs, AT-SPI, parallel exact capture, cross-process claims, and owner-bound recovery | Capture can stay in the background; keyboard and pointer work use one acknowledged global-seat lease | Full integration targets Plasma 6/KWin Wayland; the shared KWin backend supports window discovery and focus on Plasma 5/6 |
+| [Generic X11/EWMH](./contrib/x11-background-computer-use/) | EWMH discovery, AT-SPI, exact XComposite capture, per-window claims, best-effort no-focus shortcuts, and recoverable XTEST input | Capture can run per window; reliable input is serialized through the shared physical seat | Xorg desktops such as Xfce, Cinnamon, MATE, LXQt/Openbox, and legacy GNOME or KDE |
+| Niri | Niri IPC window discovery and focus plus shared screenshots, AT-SPI, and input | Uses the session's shared capture and input paths; no exact per-window background integration yet | Requires `NIRI_SOCKET` and working `niri msg` access |
+| COSMIC Wayland | COSMIC toplevel discovery and focus plus shared screenshots, AT-SPI, and input | Uses the session's shared capture and input paths | Uses the bundled `computer-use-linux-cosmic` helper |
+| i3 | i3 IPC window discovery and focus, optional process hydration, AT-SPI, capture, and X11 input | Uses the X11 shared seat for reliable input | Requires `i3-msg`; `xprop` adds process details |
 
-There is currently no separate same-session companion for Niri, COSMIC, or
-i3; those desktops use the core backend capabilities in the first table.
+Real behavior depends on the portal, accessibility, compositor, and input
+services exposed by the current session. Call `doctor` for the authoritative
+capability report on your machine.
 
-The companions are experimental. Hyprland native extensions must match the
-running compositor ABI, and the GNOME and Plasma companions intentionally make
-narrower version claims than the generic core backend.
+Some backends are delivered as an additional desktop-integration plugin because
+their compositor-specific code has different build and runtime requirements.
+They are still part of the repository's same-session computer-use feature.
 
 ## Installation
 
 ### Requirements
 
-- Linux running one of the core backends listed above
+- Linux running one of the supported desktop backends listed above
 - a current [Codex CLI](https://developers.openai.com/codex/cli) release with
   `codex plugin` support
 - Rust and `cargo`, because the source plugin is built on the target machine
-- any system dependencies listed by the companion guide you choose
+- any system dependencies listed by the desktop backend guide you choose
 
 The bundled and repository-owned Computer Use plugins expose the same MCP
 server name and must not be enabled together. Remove the bundled plugin first
@@ -95,8 +82,8 @@ codex plugin remove computer-use@openai-bundled
 
 ### Install from the Git marketplace
 
-This fetches only the marketplace metadata, backend, and companion plugins
-instead of cloning the full Codex fork:
+This fetches only the marketplace metadata, shared engine, and desktop backend
+plugins instead of cloning the full Codex fork:
 
 ```shell
 codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
@@ -125,11 +112,14 @@ codex plugin add computer-use-linux@codex-computer-use-linux
 ```
 
 Codex installs a source snapshot rather than a live link. Reinstall the plugin
-after changing the backend or a companion.
+after changing the shared engine or a desktop integration.
 
-### Add a companion plugin
+### Install the desktop integration
 
-Install the companion matching the current desktop session.
+The shared `computer-use-linux` plugin is always required. Hyprland, GNOME,
+Plasma, and generic X11 add a second package containing their compositor-specific
+same-session integration. Niri, COSMIC, and i3 support is already contained in
+the shared plugin.
 
 For Hyprland 0.55.4:
 
@@ -137,7 +127,7 @@ For Hyprland 0.55.4:
 codex plugin add same-session-computer-use@codex-computer-use-linux
 ```
 
-For GNOME Shell 45, install the Shell extension and companion:
+For GNOME Shell 45, install the Shell extension and desktop integration:
 
 ```shell
 ./contrib/gnome-same-session-computer-use/bin/install-gnome-integration
@@ -177,10 +167,10 @@ background capture does not necessarily imply background input: GNOME, Plasma,
 and generic X11 expose a shared seat, while Hyprland provides additional
 window-targeted paths.
 
-When a companion must use shared focus or input, it requires explicit
+When a backend must use shared focus or input, it requires explicit
 acknowledgement and records enough compositor state to restore the original
 window, workspace, focus, minimized/fullscreen state, and pointer where the
-desktop permits. The companions refuse input in unsafe conditions such as a
+desktop permits. The backends refuse input in unsafe conditions such as a
 locked session, active pointer constraints, or a physical button being held.
 
 Computer Use can read private on-screen and accessibility content and can
@@ -189,7 +179,7 @@ bypass authentication surfaces, application security controls, or anti-cheat
 systems. Codex should still ask before actions that submit, delete, send,
 purchase, overwrite, or otherwise commit state.
 
-Read the companion's safety section before enabling it:
+Read the desktop backend's safety section before enabling it:
 [Hyprland](./contrib/hyprland-background-computer-use/README.md#safety-boundary),
 [GNOME](./contrib/gnome-same-session-computer-use/README.md#safety-boundary),
 [Plasma](./contrib/plasma-same-session-computer-use/README.md#safety), or
@@ -290,7 +280,7 @@ explained in the [provenance policy](./computer-use-linux/UPSTREAM.md).
 This repository does not build the graphical Codex Desktop frontend. A desktop
 installation produced by `codex-desktop-linux` must launch the Codex binary
 from this checkout to use a modified agent runtime. This repository owns the
-Computer Use backend and companion plugins; `codex-desktop-linux` remains
+Computer Use backend integrations; `codex-desktop-linux` remains
 responsible for Linux desktop UI packaging and launchers.
 
 ## Project direction
@@ -322,10 +312,10 @@ This repository builds on and periodically pulls from:
   [avifenesh/codex-desktop-linux](https://github.com/avifenesh/codex-desktop-linux);
   and
 - [Gabriel-Kahen/hyprland-codex-background-computer-use](https://github.com/Gabriel-Kahen/hyprland-codex-background-computer-use),
-  the source repository for the Hyprland companion now maintained here.
+  the source repository for the Hyprland integration now maintained here.
 
 Refer to the [official Codex documentation](https://developers.openai.com/codex)
 for general Codex installation, authentication, IDE, app, and cloud usage. The
-Codex fork and companion integrations are licensed under the
+Codex fork and desktop integrations are licensed under the
 [Apache-2.0 License](LICENSE). The imported Linux backend retains its
 [MIT license](computer-use-linux/LICENSE).
