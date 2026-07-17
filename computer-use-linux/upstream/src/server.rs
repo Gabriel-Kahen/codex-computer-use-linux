@@ -314,8 +314,7 @@ impl ComputerUseLinux {
         } else {
             None
         };
-        let include_screenshot =
-            observation_mode.is_some() || params.include_screenshot.unwrap_or(true);
+        let include_screenshot = params.include_screenshot.unwrap_or(true);
         let screenshot_options = params.screenshot_options();
         let screenshot_target_requested = params.window_target().has_target();
         let app_filter = self
@@ -4326,6 +4325,27 @@ mod tests {
         assert_eq!(serialized.matches("AAAA").count(), 1);
         assert_eq!(serialized.matches("BBBB").count(), 1);
         assert_eq!(result.content.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn app_state_observation_modes_respect_screenshot_opt_out() {
+        for observation_mode in [ObservationMode::Adaptive, ObservationMode::Full] {
+            let params = serde_json::from_value(serde_json::json!({
+                "include_screenshot": false,
+                "observation_mode": observation_mode,
+            }))
+            .unwrap();
+            let result = ComputerUseLinux::default()
+                .get_app_state(Parameters(params))
+                .await
+                .unwrap();
+
+            assert_eq!(result.content.len(), 1);
+            assert_eq!(
+                result.structured_content.unwrap()["screenshot"],
+                serde_json::Value::Null
+            );
+        }
     }
 
     fn collect_unsigned_integer_formats(
