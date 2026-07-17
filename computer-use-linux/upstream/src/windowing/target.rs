@@ -1,4 +1,4 @@
-use crate::windowing::registry::{self, WINDOW_PERMISSION_HINT};
+use crate::windowing::registry::{self, WindowListPolicy, WINDOW_PERMISSION_HINT};
 use crate::windowing::types::{WindowFocusResult, WindowInfo, WindowTarget};
 use anyhow::{bail, Result};
 use tokio::time::{sleep, Duration};
@@ -62,7 +62,7 @@ async fn current_focused_window() -> Result<Option<WindowInfo>> {
         return Ok(Some(window));
     }
 
-    Ok(list_windows()
+    Ok(registry::list_windows_with_policy(WindowListPolicy::Fresh)
         .await?
         .into_iter()
         .find(|window| window.focused))
