@@ -13,7 +13,9 @@ integration in explicit layers:
 The engine supports GNOME, Plasma 5/6, Hyprland, Niri, COSMIC, i3, and generic
 X11/EWMH window discovery. It prefers semantic AT-SPI actions, validates modern
 `ydotool` before using it, and falls back through the available desktop capture
-and input paths.
+and input paths. Targeted Hyprland observations use compositor-native exact
+window capture when the running compositor exposes a stable capture ID;
+targeted capture failures return an error instead of unrelated desktop pixels.
 
 ## Build and test
 

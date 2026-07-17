@@ -1,8 +1,10 @@
 pub mod backends;
+mod capture;
 pub mod registry;
 pub mod target;
 pub mod types;
 
+pub(crate) use capture::capture_window_exact;
 #[allow(unused_imports)]
 pub use registry::{
     COSMIC_WAYLAND_BACKEND, GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND,
