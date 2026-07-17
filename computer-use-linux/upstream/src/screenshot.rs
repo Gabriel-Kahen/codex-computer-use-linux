@@ -531,7 +531,7 @@ async fn read_png_as_capture(
     result
 }
 
-fn read_png_as_capture_inner(path: &Path, source: &str) -> Result<RawScreenshotCapture> {
+pub(crate) fn read_png_as_capture_inner(path: &Path, source: &str) -> Result<RawScreenshotCapture> {
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read screenshot file {}", path.display()))?;
     if bytes.is_empty() {
@@ -698,7 +698,7 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-fn temp_png_path(source: &str) -> PathBuf {
+pub(crate) fn temp_png_path(source: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "computer-use-linux-{source}-{}.png",
         unique_suffix()
