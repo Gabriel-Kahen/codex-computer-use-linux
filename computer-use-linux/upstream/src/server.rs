@@ -21,8 +21,8 @@ use crate::remote_desktop::{
     ScrollDirection,
 };
 use crate::screenshot::{
-    capture_screenshot_raw, prepare_screenshot_payload, RawScreenshotCapture, ScreenshotCapture,
-    ScreenshotOutputFormat, ScreenshotPayloadOptions,
+    capture_screenshot_raw, capture_screenshot_raw_recent, prepare_screenshot_payload,
+    RawScreenshotCapture, ScreenshotCapture, ScreenshotOutputFormat, ScreenshotPayloadOptions,
 };
 use crate::windowing::capture_window_exact;
 use crate::windowing::registry;
@@ -322,7 +322,7 @@ impl ComputerUseLinux {
             .resolve_accessibility_app_filter(&params, window_context.as_ref())
             .await;
         let (raw_screenshot, mut screenshot_error) = if include_screenshot {
-            let result = capture_screenshot_raw().await.and_then(|raw| {
+            let result = capture_screenshot_raw_recent().await.and_then(|raw| {
                 if let Some(window) = window_context.as_ref() {
                     let bounds = window.bounds.as_ref().ok_or_else(|| {
                         anyhow::anyhow!(
