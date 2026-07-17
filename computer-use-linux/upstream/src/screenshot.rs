@@ -34,6 +34,7 @@ pub const MIN_SCREENSHOT_JPEG_QUALITY: u8 = 1;
 pub const MAX_SCREENSHOT_JPEG_QUALITY: u8 = 95;
 const MIN_SCREENSHOT_MAX_BYTES: usize = 1024;
 const RECENT_SCREENSHOT_TTL: Duration = Duration::from_millis(16);
+const MAX_RECENT_SCREENSHOT_BYTES: usize = ABSOLUTE_SCREENSHOT_MAX_BYTES * 4;
 
 #[derive(Debug, Clone)]
 pub struct RawScreenshotCapture {
@@ -195,21 +196,46 @@ fn last_healthy_backend() -> &'static Mutex<Option<ScreenshotBackend>> {
     LAST_HEALTHY_BACKEND.get_or_init(|| Mutex::new(None))
 }
 
+fn last_healthy_capture() -> &'static Mutex<Option<(Instant, RawScreenshotCapture)>> {
+    LAST_HEALTHY_CAPTURE.get_or_init(|| Mutex::new(None))
+}
+
 fn recent_healthy_capture() -> Option<RawScreenshotCapture> {
-    LAST_HEALTHY_CAPTURE
-        .get_or_init(|| Mutex::new(None))
+    let mut cached = last_healthy_capture()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cached
         .as_ref()
-        .filter(|(captured_at, _)| captured_at.elapsed() <= RECENT_SCREENSHOT_TTL)
-        .map(|(_, capture)| capture.clone())
+        .is_some_and(|(captured_at, _)| captured_at.elapsed() > RECENT_SCREENSHOT_TTL)
+    {
+        *cached = None;
+    }
+    cached.as_ref().map(|(_, capture)| capture.clone())
 }
 
 fn record_healthy_capture(capture: &RawScreenshotCapture) {
-    *LAST_HEALTHY_CAPTURE
-        .get_or_init(|| Mutex::new(None))
+    let captured_at = Instant::now();
+    let mut cached = last_healthy_capture()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((Instant::now(), capture.clone()));
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if capture.bytes.len() > MAX_RECENT_SCREENSHOT_BYTES {
+        *cached = None;
+        return;
+    }
+    *cached = Some((captured_at, capture.clone()));
+    drop(cached);
+    tokio::spawn(async move {
+        tokio::time::sleep(RECENT_SCREENSHOT_TTL).await;
+        let mut cached = last_healthy_capture()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cached
+            .as_ref()
+            .is_some_and(|(cached_at, _)| *cached_at == captured_at)
+        {
+            *cached = None;
+        }
+    });
 }
 
 fn cached_backend() -> Option<ScreenshotBackend> {
@@ -300,9 +326,16 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
     // claims an allowlisted bus name and works regardless, so it is the final
     // fallback. See issue #20.
     for backend in SCREENSHOT_BACKEND_ORDER {
-        if Some(*backend) == cached {
+        if Some(*backend) == cached
+            && matches!(
+                *backend,
+                ScreenshotBackend::Portal | ScreenshotBackend::GnomeScreenshot
+            )
+        {
             continue;
         }
+        // Retry non-interactive DBus backends after their first failure
+        // invalidates the cached session bus; a reconnect can make them healthy.
         match backend.capture().await {
             Ok(capture) => {
                 record_healthy_backend(*backend);
@@ -839,22 +872,27 @@ mod tests {
         png
     }
 
-    #[test]
-    fn recent_capture_cache_expires_after_one_frame() {
-        let capture = RawScreenshotCapture {
+    #[tokio::test]
+    async fn recent_capture_cache_is_bounded_and_expires_after_one_frame() {
+        let mut capture = RawScreenshotCapture {
             mime_type: "image/png".to_string(),
             bytes: valid_png(2, 1),
             source: "test".to_string(),
             width: 2,
             height: 1,
         };
-        let cache = LAST_HEALTHY_CAPTURE.get_or_init(|| Mutex::new(None));
-        *cache.lock().unwrap() = Some((Instant::now(), capture.clone()));
+        let cache = last_healthy_capture();
+        record_healthy_capture(&capture);
         assert_eq!(recent_healthy_capture().unwrap().bytes, capture.bytes);
+        tokio::time::sleep(RECENT_SCREENSHOT_TTL + RECENT_SCREENSHOT_TTL).await;
+        assert!(cache.lock().unwrap().is_none());
 
-        *cache.lock().unwrap() = Some((Instant::now() - RECENT_SCREENSHOT_TTL, capture));
+        *cache.lock().unwrap() = Some((Instant::now() - RECENT_SCREENSHOT_TTL, capture.clone()));
         assert!(recent_healthy_capture().is_none());
-        *cache.lock().unwrap() = None;
+
+        capture.bytes.resize(MAX_RECENT_SCREENSHOT_BYTES + 1, 0);
+        record_healthy_capture(&capture);
+        assert!(cache.lock().unwrap().is_none());
     }
 
     fn solid_png(width: u32, height: u32) -> Vec<u8> {

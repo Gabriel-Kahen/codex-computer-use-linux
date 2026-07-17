@@ -340,6 +340,13 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<GetAppStateParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let observation_mode = params.observation_mode;
+        let adaptive = observation_mode == Some(ObservationMode::Adaptive);
+        let _adaptive_guard = if adaptive {
+            Some(self.adaptive_observation_lock.lock().await)
+        } else {
+            None
+        };
         let verbose = params.verbose.unwrap_or(false);
         let diagnostics_owner = self.clone();
         let (diagnostics, (window_context, window_error, window_permissions_hint)) = tokio::join!(
@@ -351,13 +358,6 @@ impl ComputerUseLinux {
         })?;
         let max_nodes = params.max_nodes.unwrap_or(120).clamp(1, 500);
         let max_depth = params.max_depth.unwrap_or(12).min(12);
-        let observation_mode = params.observation_mode;
-        let adaptive = observation_mode == Some(ObservationMode::Adaptive);
-        let _adaptive_guard = if adaptive {
-            Some(self.adaptive_observation_lock.lock().await)
-        } else {
-            None
-        };
         let include_screenshot = params.include_screenshot.unwrap_or(true);
         let screenshot_options = params.screenshot_options();
         let screenshot_target_requested = params.window_target().has_target();
@@ -446,7 +446,7 @@ impl ComputerUseLinux {
             self.clear_cached_nodes();
         }
 
-        let (observation, visual_plan) = if adaptive {
+        let (observation, visual_plan, raw_screenshot) = if adaptive {
             let target_key = window_context.as_ref().map_or_else(
                 || {
                     params
@@ -466,29 +466,49 @@ impl ComputerUseLinux {
                     screenshot_options.scale,
                     screenshot_options.format,
                     screenshot_options.quality,
+                    screenshot_origin,
                 )
             );
-            let plan = self
-                .observation_tracker
-                .lock()
-                .map_err(|_| ErrorData::internal_error("observation tracker lock failed", None))?
-                .observe(
+            let tracker = {
+                let mut tracker = self.observation_tracker.lock().map_err(|_| {
+                    ErrorData::internal_error("observation tracker lock failed", None)
+                })?;
+                std::mem::take(&mut *tracker)
+            };
+            let base_checkpoint_id = params.base_checkpoint_id.clone();
+            let checkpoint_interval = params
+                .checkpoint_interval
+                .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL)
+                .clamp(1, 32);
+            let force_checkpoint = params.force_checkpoint.unwrap_or(false);
+            let (tracker, raw_screenshot, plan) = tokio::task::spawn_blocking(move || {
+                let mut tracker = tracker;
+                let plan = tracker.observe(
                     key,
                     raw_screenshot.as_ref(),
-                    params.base_checkpoint_id.as_deref(),
-                    params
-                        .checkpoint_interval
-                        .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL)
-                        .clamp(1, 32),
-                    params.force_checkpoint.unwrap_or(false),
+                    base_checkpoint_id.as_deref(),
+                    checkpoint_interval,
+                    force_checkpoint,
+                );
+                (tracker, raw_screenshot, plan)
+            })
+            .await
+            .map_err(|error| {
+                ErrorData::internal_error(
+                    format!("adaptive observation planning task failed: {error}"),
+                    None,
                 )
-                .map_err(|error| {
-                    ErrorData::internal_error(
-                        format!("adaptive observation planning failed: {error}"),
-                        None,
-                    )
-                })?;
-            (Some(plan.metadata), plan.visual)
+            })?;
+            *self.observation_tracker.lock().map_err(|_| {
+                ErrorData::internal_error("observation tracker lock failed", None)
+            })? = tracker;
+            let plan = plan.map_err(|error| {
+                ErrorData::internal_error(
+                    format!("adaptive observation planning failed: {error}"),
+                    None,
+                )
+            })?;
+            (Some(plan.metadata), plan.visual, raw_screenshot)
         } else {
             (
                 None,
@@ -497,6 +517,7 @@ impl ComputerUseLinux {
                 } else {
                     VisualPlan::None
                 },
+                raw_screenshot,
             )
         };
         let (captures, preparation_error) = if let Some(raw) = raw_screenshot {
@@ -549,13 +570,13 @@ impl ComputerUseLinux {
         let screenshot_regions = if adaptive {
             captures
                 .iter()
-                .map(|(region, capture)| ScreenshotRegionMetadata {
-                    region: *region,
-                    screenshot: ScreenshotMetadata::from_capture(
+                .map(|(region, capture)| {
+                    ScreenshotRegionMetadata::from_capture(
+                        *region,
                         capture,
                         window_context.as_ref(),
                         screenshot_origin,
-                    ),
+                    )
                 })
                 .collect()
         } else {
@@ -2008,6 +2029,24 @@ struct ScreenshotRegionMetadata {
     /// Region coordinates in the current observation frame.
     region: ObservationRegion,
     screenshot: ScreenshotMetadata,
+}
+
+impl ScreenshotRegionMetadata {
+    fn from_capture(
+        region: ObservationRegion,
+        capture: &ScreenshotCapture,
+        window: Option<&WindowInfo>,
+        frame_origin: (u32, u32),
+    ) -> Self {
+        let coordinate_origin = (
+            frame_origin.0.saturating_add(region.x),
+            frame_origin.1.saturating_add(region.y),
+        );
+        Self {
+            region,
+            screenshot: ScreenshotMetadata::from_capture(capture, window, coordinate_origin),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -4476,6 +4515,61 @@ mod tests {
         assert_eq!(serialized.matches("AAAA").count(), 1);
         assert_eq!(serialized.matches("BBBB").count(), 1);
         assert_eq!(result.content.len(), 3);
+    }
+
+    #[test]
+    fn changed_region_metadata_uses_window_local_image_origin() {
+        let capture = ScreenshotCapture {
+            mime_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,AAAA".to_string(),
+            source: "test".to_string(),
+            width: 20,
+            height: 10,
+            coordinate_width: 20,
+            coordinate_height: 10,
+            scale: 1.0,
+            resized: false,
+            bytes: 3,
+            original_bytes: 3,
+            max_bytes: 1024,
+            format: ScreenshotOutputFormat::Png,
+            quality: None,
+        };
+        let window = WindowInfo {
+            window_id: 42,
+            title: None,
+            app_id: None,
+            wm_class: None,
+            pid: None,
+            bounds: None,
+            workspace: None,
+            focused: false,
+            hidden: false,
+            client_type: None,
+            backend: "test".to_string(),
+            terminal: None,
+        };
+        let metadata = ScreenshotRegionMetadata::from_capture(
+            ObservationRegion {
+                x: 30,
+                y: 40,
+                width: 20,
+                height: 10,
+            },
+            &capture,
+            Some(&window),
+            (5, 7),
+        );
+
+        assert_eq!(
+            (
+                metadata.screenshot.coordinate_space.as_str(),
+                metadata.screenshot.coordinate_origin_x,
+                metadata.screenshot.coordinate_origin_y,
+                metadata.screenshot.window_id,
+            ),
+            ("window_local", 35, 47, Some(42)),
+        );
     }
 
     #[tokio::test]
