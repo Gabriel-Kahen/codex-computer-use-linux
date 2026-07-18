@@ -3543,13 +3543,43 @@ fn screenshot_failure(
     error: impl std::fmt::Display,
 ) -> ErrorData {
     let data = target.map(|target| {
+        let mut selector_fields = Vec::new();
+        for (name, present) in [
+            ("tty", target.tty.is_some()),
+            ("terminal_command", target.terminal_command.is_some()),
+            ("terminal_cwd", target.terminal_cwd.is_some()),
+            ("app_id", target.app_id.is_some()),
+            ("wm_class", target.wm_class.is_some()),
+            ("title", target.title.is_some()),
+        ] {
+            if present {
+                selector_fields.push(name);
+            }
+        }
         serde_json::json!({
             "stage": stage,
-            "target": target,
+            "target": {
+                "window_id": target.window_id,
+                "pid": target.pid,
+                "terminal_pid": target.terminal_pid,
+                "selector_fields": selector_fields,
+            },
             "image_returned": false,
         })
     });
+    let error = bounded_screenshot_error(error);
     ErrorData::internal_error(format!("screenshot {stage} failed: {error}"), data)
+}
+
+fn bounded_screenshot_error(error: impl std::fmt::Display) -> String {
+    const MAX_CHARS: usize = 512;
+    let error = error.to_string();
+    let mut chars = error.chars();
+    let mut bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
 }
 
 fn session_is_wayland(session_type: Option<&str>, wayland_display: Option<&str>) -> bool {
@@ -4670,10 +4700,30 @@ mod tests {
             error.data,
             Some(serde_json::json!({
                 "stage": "window_resolution",
-                "target": target,
+                "target": {
+                    "window_id": null,
+                    "pid": null,
+                    "terminal_pid": null,
+                    "selector_fields": ["app_id"],
+                },
                 "image_returned": false,
             }))
         );
+    }
+
+    #[test]
+    fn targeted_screenshot_errors_bound_caller_controlled_details() {
+        let unbounded = "x".repeat(20_000);
+        let target = WindowTarget {
+            title: Some(unbounded.clone()),
+            ..Default::default()
+        };
+
+        let error = screenshot_failure("window_resolution", Some(&target), &unbounded);
+        let serialized = serde_json::to_string(&error).unwrap();
+
+        assert!(serialized.len() < 2_000);
+        assert!(!serialized.contains(&unbounded));
     }
 
     #[test]
