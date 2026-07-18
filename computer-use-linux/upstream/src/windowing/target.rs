@@ -6,42 +6,91 @@ use tokio::time::{sleep, Duration};
 const FOCUS_VERIFY_ATTEMPTS: usize = 21;
 const FOCUS_VERIFY_DELAY: Duration = Duration::from_millis(50);
 
+/// Supplies the window operations used while resolving and focusing a target.
+///
+/// The production implementation delegates to the backend registry, while tests can provide
+/// deterministic window-list responses and observe activation requests.
+trait WindowRegistry {
+    fn list_windows(
+        &self,
+        policy: WindowListPolicy,
+    ) -> impl std::future::Future<Output = Result<Vec<WindowInfo>>> + Send;
+
+    fn activate_window(
+        &self,
+        window: &WindowInfo,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    fn focused_window_override(&self) -> Option<WindowInfo>;
+}
+
+struct BackendRegistry;
+
+impl WindowRegistry for BackendRegistry {
+    async fn list_windows(&self, policy: WindowListPolicy) -> Result<Vec<WindowInfo>> {
+        registry::list_windows_with_policy(policy).await
+    }
+
+    async fn activate_window(&self, window: &WindowInfo) -> Result<()> {
+        registry::activate_window(window).await
+    }
+
+    fn focused_window_override(&self) -> Option<WindowInfo> {
+        registry::focused_window_override()
+    }
+}
+
 pub async fn list_windows() -> Result<Vec<WindowInfo>> {
     registry::list_windows().await
 }
 
 pub async fn focused_window() -> Result<Option<WindowInfo>> {
-    current_focused_window().await
+    current_focused_window(&BackendRegistry).await
 }
 
 pub async fn focus_window_target(target: &WindowTarget) -> Result<WindowFocusResult> {
+    focus_window_target_with_registry(target, &BackendRegistry).await
+}
+
+async fn focus_window_target_with_registry(
+    target: &WindowTarget,
+    window_registry: &impl WindowRegistry,
+) -> Result<WindowFocusResult> {
     if !target.has_target() {
         bail!("Pass window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd to target a window.");
     }
 
-    let windows = list_windows().await?;
+    let windows = window_registry
+        .list_windows(WindowListPolicy::Cached)
+        .await?;
     let requested_window = resolve_window_target(&windows, target)?.clone();
     ensure_backend_can_focus_target(target, &requested_window)?;
 
-    registry::activate_window(&requested_window).await?;
+    let already_focused = if listed_target_appears_focused(&windows, &requested_window) {
+        current_focused_window(window_registry)
+            .await
+            .ok()
+            .flatten()
+            .filter(|focused_window| requested_window.window_id == focused_window.window_id)
+    } else {
+        None
+    };
+    if let Some(focused_window) = already_focused {
+        return Ok(window_focus_result(
+            requested_window,
+            Some(focused_window),
+            "Computer Use verified through a fresh window query that the requested target was already focused, so it skipped window activation.",
+        ));
+    }
 
-    let focused_window = wait_for_focused_window(&requested_window).await;
-    let exact_window_focused = focused_window
-        .as_ref()
-        .is_some_and(|window| window.window_id == requested_window.window_id);
-    let app_focused = focused_window
-        .as_ref()
-        .is_some_and(|window| same_optional_string(&window.app_id, &requested_window.app_id));
+    window_registry.activate_window(&requested_window).await?;
 
-    Ok(WindowFocusResult {
-        backend: requested_window.backend.clone(),
+    let focused_window = wait_for_focused_window(window_registry, &requested_window).await;
+    Ok(window_focus_result(
         requested_window,
         focused_window,
-        exact_window_focused,
-        app_focused,
-        note: "Computer Use activated the requested window through the available window backend, then verified focus through a fresh window query."
-            .to_string(),
-    })
+        "Computer Use activated the requested window through the available window backend, then verified focus through a fresh window query.",
+    ))
 }
 
 pub(crate) fn ensure_backend_can_focus_target(
@@ -57,21 +106,27 @@ pub(crate) fn ensure_backend_can_focus_target(
     Ok(())
 }
 
-async fn current_focused_window() -> Result<Option<WindowInfo>> {
-    if let Some(window) = registry::focused_window_override() {
+async fn current_focused_window(
+    window_registry: &impl WindowRegistry,
+) -> Result<Option<WindowInfo>> {
+    if let Some(window) = window_registry.focused_window_override() {
         return Ok(Some(window));
     }
 
-    Ok(registry::list_windows_with_policy(WindowListPolicy::Fresh)
+    Ok(window_registry
+        .list_windows(WindowListPolicy::Fresh)
         .await?
         .into_iter()
         .find(|window| window.focused))
 }
 
-async fn wait_for_focused_window(requested_window: &WindowInfo) -> Option<WindowInfo> {
+async fn wait_for_focused_window(
+    window_registry: &impl WindowRegistry,
+    requested_window: &WindowInfo,
+) -> Option<WindowInfo> {
     let mut last_focused_window = None;
     for attempt in 0..FOCUS_VERIFY_ATTEMPTS {
-        if let Ok(focused_window) = current_focused_window().await {
+        if let Ok(focused_window) = current_focused_window(window_registry).await {
             if focused_window
                 .as_ref()
                 .is_some_and(|window| window.window_id == requested_window.window_id)
@@ -88,6 +143,34 @@ async fn wait_for_focused_window(requested_window: &WindowInfo) -> Option<Window
         }
     }
     last_focused_window
+}
+
+fn listed_target_appears_focused(windows: &[WindowInfo], requested_window: &WindowInfo) -> bool {
+    windows
+        .iter()
+        .any(|window| window.focused && window.window_id == requested_window.window_id)
+}
+
+fn window_focus_result(
+    requested_window: WindowInfo,
+    focused_window: Option<WindowInfo>,
+    note: &str,
+) -> WindowFocusResult {
+    let exact_window_focused = focused_window
+        .as_ref()
+        .is_some_and(|window| window.window_id == requested_window.window_id);
+    let app_focused = focused_window
+        .as_ref()
+        .is_some_and(|window| same_optional_string(&window.app_id, &requested_window.app_id));
+
+    WindowFocusResult {
+        backend: requested_window.backend.clone(),
+        requested_window,
+        focused_window,
+        exact_window_focused,
+        app_focused,
+        note: note.to_string(),
+    }
 }
 
 pub fn resolve_window_target<'a>(
@@ -375,10 +458,174 @@ fn same_optional_string(left: &Option<String>, right: &Option<String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    type FakeWindowList = std::result::Result<Vec<WindowInfo>, &'static str>;
+
+    struct FakeWindowRegistry {
+        window_lists: Mutex<VecDeque<FakeWindowList>>,
+        list_policies: Mutex<Vec<WindowListPolicy>>,
+        activated_window_ids: Mutex<Vec<u64>>,
+    }
+
+    impl FakeWindowRegistry {
+        fn new(window_lists: Vec<FakeWindowList>) -> Self {
+            Self {
+                window_lists: Mutex::new(window_lists.into()),
+                list_policies: Mutex::new(Vec::new()),
+                activated_window_ids: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WindowRegistry for FakeWindowRegistry {
+        async fn list_windows(&self, policy: WindowListPolicy) -> Result<Vec<WindowInfo>> {
+            self.list_policies.lock().unwrap().push(policy);
+            self.window_lists
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fake registry should have another window-list response")
+                .map_err(anyhow::Error::msg)
+        }
+
+        async fn activate_window(&self, window: &WindowInfo) -> Result<()> {
+            self.activated_window_ids
+                .lock()
+                .unwrap()
+                .push(window.window_id);
+            Ok(())
+        }
+
+        fn focused_window_override(&self) -> Option<WindowInfo> {
+            None
+        }
+    }
+
+    fn window(window_id: u64, app_id: Option<&str>) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            title: None,
+            app_id: app_id.map(ToOwned::to_owned),
+            wm_class: None,
+            pid: None,
+            bounds: None,
+            workspace: None,
+            focused: false,
+            hidden: false,
+            client_type: None,
+            backend: registry::X11_BACKEND.to_string(),
+            terminal: None,
+        }
+    }
+
+    fn focused_test_window(window_id: u64) -> WindowInfo {
+        WindowInfo {
+            focused: true,
+            ..window(window_id, Some("org.example.App"))
+        }
+    }
+
+    fn test_target() -> WindowTarget {
+        WindowTarget {
+            window_id: Some(10),
+            ..WindowTarget::default()
+        }
+    }
 
     #[test]
     fn focus_verification_allows_workspace_transition_latency() {
         let verification_budget = FOCUS_VERIFY_DELAY * (FOCUS_VERIFY_ATTEMPTS - 1) as u32;
         assert!(verification_budget >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn list_gate_requires_the_resolved_window_to_be_marked_focused() {
+        let requested = window(10, Some("org.example.App"));
+        let mut requested_in_list = requested.clone();
+
+        assert!(!listed_target_appears_focused(
+            &[requested_in_list.clone()],
+            &requested
+        ));
+
+        requested_in_list.focused = true;
+        assert!(listed_target_appears_focused(
+            &[requested_in_list],
+            &requested
+        ));
+
+        let mut same_app = window(11, Some("org.example.App"));
+        same_app.focused = true;
+        assert!(!listed_target_appears_focused(&[same_app], &requested));
+    }
+
+    #[tokio::test]
+    async fn exact_fresh_focus_skips_activation() {
+        let requested = focused_test_window(10);
+        let registry = FakeWindowRegistry::new(vec![
+            Ok(vec![requested.clone()]),
+            Ok(vec![requested.clone()]),
+        ]);
+
+        let result = focus_window_target_with_registry(&test_target(), &registry)
+            .await
+            .unwrap();
+
+        assert!(result.exact_window_focused);
+        assert!(result.note.contains("skipped window activation"));
+        assert_eq!(
+            *registry.activated_window_ids.lock().unwrap(),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            *registry.list_policies.lock().unwrap(),
+            vec![WindowListPolicy::Cached, WindowListPolicy::Fresh]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_different_or_failed_fresh_focus_activates_normally() {
+        let mut different = focused_test_window(11);
+        different.app_id = Some("org.example.Other".to_string());
+        let cases: [(&str, FakeWindowList); 3] = [
+            ("stale", Ok(vec![window(10, Some("org.example.App"))])),
+            ("different", Ok(vec![different])),
+            ("failed", Err("fresh focus lookup failed")),
+        ];
+
+        for (case, fresh_focus) in cases {
+            let requested = focused_test_window(10);
+            let registry = FakeWindowRegistry::new(vec![
+                Ok(vec![requested.clone()]),
+                fresh_focus,
+                Ok(vec![requested]),
+            ]);
+
+            let result = focus_window_target_with_registry(&test_target(), &registry)
+                .await
+                .unwrap();
+
+            assert!(result.exact_window_focused, "{case}");
+            assert!(
+                result.note.contains("activated the requested window"),
+                "{case}"
+            );
+            assert_eq!(
+                *registry.activated_window_ids.lock().unwrap(),
+                vec![10],
+                "{case}"
+            );
+            assert_eq!(
+                *registry.list_policies.lock().unwrap(),
+                vec![
+                    WindowListPolicy::Cached,
+                    WindowListPolicy::Fresh,
+                    WindowListPolicy::Fresh,
+                ],
+                "{case}"
+            );
+        }
     }
 }
