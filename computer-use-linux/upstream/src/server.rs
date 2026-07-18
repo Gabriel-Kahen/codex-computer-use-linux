@@ -1,6 +1,6 @@
 use crate::action_batch::{
-    execute_action_batch, ActionBatchOutput, ActionBatchParams, ActionOutput, BatchAction,
-    BatchActionRun, BatchClick, NON_EDITABLE_TEXT_LANDING_WARNING,
+    bounded_action_result_message, execute_action_batch, ActionBatchOutput, ActionBatchParams,
+    ActionOutput, BatchAction, BatchActionRun, BatchClick, NON_EDITABLE_TEXT_LANDING_WARNING,
     NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING,
 };
 use crate::atspi_tree::{
@@ -1117,31 +1117,46 @@ impl ComputerUseLinux {
             return Json(ActionBatchOutput::validation_error(error));
         }
 
-        Json(
-            execute_action_batch(params, |action, window_id| async move {
-                match action {
-                    BatchAction::Click(click) => {
-                        let Json(result) = self
-                            .click(Parameters(click.into_click_params(window_id)))
-                            .await;
-                        BatchActionRun::Completed(result)
-                    }
-                    BatchAction::TypeText { text } => {
-                        let Json(result) = self
-                            .type_text(Parameters(TypeTextParams::for_window(window_id, text)))
-                            .await;
-                        BatchActionRun::text(result)
-                    }
-                    BatchAction::PressKey { key } => {
-                        let Json(result) = self
-                            .press_key(Parameters(PressKeyParams::for_window(window_id, key)))
-                            .await;
-                        BatchActionRun::Completed(result)
-                    }
-                }
-            })
-            .await,
+        Json(self.execute_validated_action_batch_unlocked(params).await)
+    }
+
+    #[tool(
+        name = "run_action_batch_and_observe",
+        description = "Run the same validated, ordered, fail-fast input batch as run_action_batch, then return a window-scoped adaptive observation in the same call. Validation failures do not capture state; once execution starts, post-action state is captured even if an action fails so the caller can recover.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ActionBatchAndObserveOutput>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
         )
+    )]
+    async fn run_action_batch_and_observe(
+        &self,
+        Parameters(params): Parameters<ActionBatchAndObserveParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let _batch_guard = self.action_batch_lock.lock().await;
+        if let Err(error) = self.validate_action_batch(&params.batch) {
+            return action_batch_and_observation_tool_result(
+                ActionBatchOutput::validation_error(error),
+                PostActionObservationResult::NotAttempted,
+            );
+        }
+
+        let window_id = params.batch.window_id;
+        let batch = self
+            .execute_validated_action_batch_unlocked(params.batch)
+            .await;
+        let observation = match self
+            .get_app_state(Parameters(
+                params.observation.into_get_app_state_params(window_id),
+            ))
+            .await
+        {
+            Ok(observation) => PostActionObservationResult::Completed(observation),
+            Err(error) => PostActionObservationResult::Failed(error),
+        };
+        action_batch_and_observation_tool_result(batch, observation)
     }
 
     #[tool(
@@ -1729,6 +1744,54 @@ fn app_state_tool_result(
     Ok(result)
 }
 
+fn action_batch_and_observation_tool_result(
+    batch: ActionBatchOutput,
+    observation_result: PostActionObservationResult,
+) -> Result<CallToolResult, ErrorData> {
+    let (observation, observation_error, images) = match observation_result {
+        PostActionObservationResult::Completed(result) => {
+            let observation = result.structured_content.ok_or_else(|| {
+                ErrorData::internal_error(
+                    "get_app_state returned no structured post-action observation",
+                    None,
+                )
+            })?;
+            let images = result
+                .content
+                .into_iter()
+                .filter(|content| content.raw.as_image().is_some())
+                .collect::<Vec<_>>();
+            (Some(observation), None, images)
+        }
+        PostActionObservationResult::Failed(error) => (
+            None,
+            Some(bounded_action_result_message(error.message.as_ref())),
+            Vec::new(),
+        ),
+        PostActionObservationResult::NotAttempted => (None, None, Vec::new()),
+    };
+    let value = serde_json::to_value(ActionBatchAndObserveOutput {
+        batch,
+        observation,
+        observation_error,
+    })
+    .map_err(|error| {
+        ErrorData::internal_error(
+            format!("failed to serialize batch and observation result: {error}"),
+            None,
+        )
+    })?;
+    let mut result = CallToolResult::structured(value);
+    result.content.extend(images);
+    Ok(result)
+}
+
+enum PostActionObservationResult {
+    NotAttempted,
+    Completed(CallToolResult),
+    Failed(ErrorData),
+}
+
 #[tool_handler(
     router = self.mcp_tool_router(),
     name = "computer-use-linux",
@@ -1737,7 +1800,7 @@ fn app_state_tool_result(
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.5.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id when avoiding model round trips matters; batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -1960,6 +2023,85 @@ impl GetAppStateParams {
             quality: self.quality,
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct PostActionObservationParams {
+    /// Opaque checkpoint ID from the caller's last adaptive observation.
+    #[serde(default)]
+    base_checkpoint_id: Option<String>,
+    /// Adaptive full-checkpoint interval, clamped to 1..=32 (default 8).
+    #[serde(default)]
+    checkpoint_interval: Option<u32>,
+    /// Force the post-action observation to be a full checkpoint.
+    #[serde(default)]
+    force_checkpoint: Option<bool>,
+    #[serde(default)]
+    include_screenshot: Option<bool>,
+    #[serde(default)]
+    max_width: Option<u32>,
+    #[serde(default)]
+    max_height: Option<u32>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    #[serde(default)]
+    scale: Option<f32>,
+    #[serde(default)]
+    format: Option<ScreenshotOutputFormat>,
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 95))]
+    quality: Option<u8>,
+    #[serde(default)]
+    max_nodes: Option<usize>,
+    #[serde(default)]
+    max_depth: Option<u32>,
+}
+
+impl PostActionObservationParams {
+    fn into_get_app_state_params(self, window_id: u64) -> GetAppStateParams {
+        GetAppStateParams {
+            app_name_or_bundle_identifier: None,
+            window_id: Some(window_id),
+            pid: None,
+            tty: None,
+            terminal_pid: None,
+            terminal_command: None,
+            terminal_cwd: None,
+            app_id: None,
+            wm_class: None,
+            title: None,
+            max_nodes: self.max_nodes,
+            max_depth: self.max_depth,
+            include_screenshot: self.include_screenshot,
+            observation_mode: Some(ObservationMode::Adaptive),
+            base_checkpoint_id: self.base_checkpoint_id,
+            checkpoint_interval: self.checkpoint_interval,
+            force_checkpoint: self.force_checkpoint,
+            max_width: self.max_width,
+            max_height: self.max_height,
+            max_bytes: self.max_bytes,
+            scale: self.scale,
+            format: self.format,
+            quality: self.quality,
+            verbose: Some(false),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ActionBatchAndObserveParams {
+    #[serde(flatten)]
+    batch: ActionBatchParams,
+    #[serde(default)]
+    observation: PostActionObservationParams,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct ActionBatchAndObserveOutput {
+    batch: ActionBatchOutput,
+    #[schemars(with = "Option<GetAppStateOutput>")]
+    observation: Option<serde_json::Value>,
+    observation_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -2465,6 +2607,35 @@ impl TypeTextParams {
 }
 
 impl ComputerUseLinux {
+    async fn execute_validated_action_batch_unlocked(
+        &self,
+        params: ActionBatchParams,
+    ) -> ActionBatchOutput {
+        execute_action_batch(params, |action, window_id| async move {
+            match action {
+                BatchAction::Click(click) => {
+                    let Json(result) = self
+                        .click(Parameters(click.into_click_params(window_id)))
+                        .await;
+                    BatchActionRun::Completed(result)
+                }
+                BatchAction::TypeText { text } => {
+                    let Json(result) = self
+                        .type_text(Parameters(TypeTextParams::for_window(window_id, text)))
+                        .await;
+                    BatchActionRun::text(result)
+                }
+                BatchAction::PressKey { key } => {
+                    let Json(result) = self
+                        .press_key(Parameters(PressKeyParams::for_window(window_id, key)))
+                        .await;
+                    BatchActionRun::Completed(result)
+                }
+            }
+        })
+        .await
+    }
+
     fn validate_action_batch(&self, params: &ActionBatchParams) -> Result<(), String> {
         params.validate()?;
         for (index, action) in params.actions.iter().enumerate() {
@@ -4500,6 +4671,166 @@ mod tests {
         assert!(input_schema.contains("base_checkpoint_id"));
         assert!(input_schema.contains("observation_mode"));
         assert!(!schema.contains("data_url"));
+    }
+
+    #[test]
+    fn action_batch_and_observe_schema_exposes_batch_and_adaptive_options() {
+        let tool = ComputerUseLinux::default()
+            .mcp_tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "run_action_batch_and_observe")
+            .unwrap();
+        let input_schema = serde_json::to_string(&tool.input_schema).unwrap();
+        let output_schema = serde_json::to_string(&tool.output_schema).unwrap();
+
+        assert!(tool.output_schema.is_some());
+        assert!(input_schema.contains("window_id"));
+        assert!(input_schema.contains("actions"));
+        assert!(input_schema.contains("observation"));
+        assert!(input_schema.contains("base_checkpoint_id"));
+        assert!(output_schema.contains("batch"));
+        assert!(output_schema.contains("observation"));
+        assert!(output_schema.contains("observation_error"));
+        assert!(output_schema.contains("accessibility_tree"));
+    }
+
+    #[test]
+    fn post_action_observation_is_exact_window_scoped_and_adaptive() {
+        let observation = PostActionObservationParams {
+            base_checkpoint_id: Some("checkpoint-7".to_string()),
+            checkpoint_interval: Some(5),
+            force_checkpoint: Some(true),
+            include_screenshot: Some(false),
+            max_width: Some(800),
+            max_height: Some(600),
+            max_bytes: Some(200_000),
+            scale: Some(0.75),
+            format: Some(ScreenshotOutputFormat::Jpeg),
+            quality: Some(70),
+            max_nodes: Some(80),
+            max_depth: Some(8),
+        };
+
+        assert_eq!(
+            serde_json::to_value(observation.into_get_app_state_params(42)).unwrap(),
+            serde_json::json!({
+                "app_name_or_bundle_identifier": null,
+                "window_id": 42,
+                "pid": null,
+                "tty": null,
+                "terminal_pid": null,
+                "terminal_command": null,
+                "terminal_cwd": null,
+                "app_id": null,
+                "wm_class": null,
+                "title": null,
+                "max_nodes": 80,
+                "max_depth": 8,
+                "include_screenshot": false,
+                "observation_mode": "adaptive",
+                "base_checkpoint_id": "checkpoint-7",
+                "checkpoint_interval": 5,
+                "force_checkpoint": true,
+                "max_width": 800,
+                "max_height": 600,
+                "max_bytes": 200_000,
+                "scale": 0.75,
+                "format": "jpeg",
+                "quality": 70,
+                "verbose": false,
+            })
+        );
+    }
+
+    #[test]
+    fn batch_and_observation_result_carries_observation_images_once() {
+        let batch = ActionBatchOutput {
+            ok: false,
+            completed: 0,
+            failed_at: Some(0),
+            results: Vec::new(),
+            error: Some("Action 0 failed.".to_string()),
+        };
+        let observation = serde_json::json!({"message": "post-action state"});
+        let mut observation_result = CallToolResult::structured(observation.clone());
+        observation_result
+            .content
+            .push(Content::image("AAAA", "image/png"));
+        observation_result
+            .content
+            .push(Content::image("BBBB", "image/png"));
+
+        let result = action_batch_and_observation_tool_result(
+            batch.clone(),
+            PostActionObservationResult::Completed(observation_result),
+        )
+        .unwrap();
+        let expected = serde_json::json!({
+            "batch": batch,
+            "observation": observation,
+            "observation_error": null,
+        });
+        let serialized = serde_json::to_string(&result).unwrap();
+
+        assert_eq!(result.structured_content.as_ref(), Some(&expected));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &result.content[0].raw.as_text().unwrap().text
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(result.content.len(), 3);
+        assert_eq!(serialized.matches("AAAA").count(), 1);
+        assert_eq!(serialized.matches("BBBB").count(), 1);
+    }
+
+    #[test]
+    fn validation_failure_result_has_no_observation_content() {
+        let batch = ActionBatchOutput::validation_error("invalid batch".to_string());
+        let result = action_batch_and_observation_tool_result(
+            batch.clone(),
+            PostActionObservationResult::NotAttempted,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({
+                "batch": batch,
+                "observation": null,
+                "observation_error": null,
+            }))
+        );
+        assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn observation_failure_preserves_batch_and_bounds_the_error() {
+        let batch = ActionBatchOutput {
+            ok: false,
+            completed: 0,
+            failed_at: Some(0),
+            results: Vec::new(),
+            error: Some("Action 0 failed.".to_string()),
+        };
+        let observation_error =
+            ErrorData::internal_error(format!("post-action failure\n{}", "x".repeat(600)), None);
+        let result = action_batch_and_observation_tool_result(
+            batch.clone(),
+            PostActionObservationResult::Failed(observation_error),
+        )
+        .unwrap();
+        let structured = result.structured_content.unwrap();
+        let error = structured["observation_error"].as_str().unwrap();
+
+        assert_eq!(structured["batch"], serde_json::to_value(batch).unwrap());
+        assert_eq!(structured["observation"], serde_json::Value::Null);
+        assert!(error.len() <= 512);
+        assert!(error.ends_with("... [truncated]"));
+        assert!(!error.contains('\n'));
+        assert_eq!(result.content.len(), 1);
     }
 
     #[test]

@@ -31,6 +31,7 @@ EXPECTED_TOOLS = {
     "press_key",
     "type_text",
     "run_action_batch",
+    "run_action_batch_and_observe",
     "perform_action",
     "set_value",
 }
@@ -97,6 +98,7 @@ DESTRUCTIVE_MUTATING_TOOLS = {
     "press_key",
     "type_text",
     "run_action_batch",
+    "run_action_batch_and_observe",
     "perform_action",
     "set_value",
 }
@@ -303,6 +305,12 @@ def main() -> int:
             if name == "click" and not SEMANTIC_SELECTORS <= props:
                 raise AssertionError(f"{name} is missing semantic element selectors: {sorted(SEMANTIC_SELECTORS - props)}")
             if name == "run_action_batch" and props != {"window_id", "actions"}:
+                raise AssertionError(f"{name} exposes unexpected parameters: {sorted(props)}")
+            if name == "run_action_batch_and_observe" and props != {
+                "window_id",
+                "actions",
+                "observation",
+            }:
                 raise AssertionError(f"{name} exposes unexpected parameters: {sorted(props)}")
             if name in {"perform_action", "set_value"} and not OBJECT_REF_SELECTORS <= props:
                 raise AssertionError(f"{name} is missing object/semantic element selectors: {sorted(OBJECT_REF_SELECTORS - props)}")

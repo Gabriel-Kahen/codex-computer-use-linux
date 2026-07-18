@@ -6,7 +6,7 @@ pub(crate) const MAX_BATCH_ACTIONS: usize = 8;
 pub(crate) const MAX_BATCH_TEXT_CHARS: usize = 4096;
 const MAX_BATCH_SELECTOR_CHARS: usize = 256;
 const MAX_BATCH_STATES: usize = 16;
-const MAX_BATCH_MESSAGE_BYTES: usize = 512;
+const MAX_ACTION_RESULT_MESSAGE_BYTES: usize = 512;
 pub(crate) const NON_EDITABLE_TEXT_LANDING_WARNING: &str = "the typed text likely went nowhere";
 pub(crate) const NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING: &str =
     "the input may have landed nowhere";
@@ -102,7 +102,7 @@ impl ActionBatchOutput {
             completed: 0,
             failed_at: None,
             results: Vec::new(),
-            error: Some(bounded_batch_message(&error)),
+            error: Some(bounded_action_result_message(&error)),
         }
     }
 }
@@ -129,7 +129,7 @@ where
         };
         result.ok &= !text_landing_warning;
         result.action = action_name.to_string();
-        result.message = bounded_batch_message(&result.message);
+        result.message = bounded_action_result_message(&result.message);
         result.received = None;
         let ok = result.ok;
         results.push(result);
@@ -160,12 +160,12 @@ where
     }
 }
 
-fn bounded_batch_message(message: &str) -> String {
+pub(crate) fn bounded_action_result_message(message: &str) -> String {
     const SUFFIX: &str = "... [truncated]";
 
-    let truncated = message.len() > MAX_BATCH_MESSAGE_BYTES;
+    let truncated = message.len() > MAX_ACTION_RESULT_MESSAGE_BYTES;
     let mut end = if truncated {
-        MAX_BATCH_MESSAGE_BYTES - SUFFIX.len()
+        MAX_ACTION_RESULT_MESSAGE_BYTES - SUFFIX.len()
     } else {
         message.len()
     };
