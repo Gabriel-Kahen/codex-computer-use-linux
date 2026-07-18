@@ -122,7 +122,6 @@ fn target_ttl_expires_snapshots_only_after_the_boundary() {
         &[node(":1.20/button")],
         start + Duration::from_millis(500),
     );
-
     assert_eq!(
         store.resolve_at(&expiring_id, start + ttl).unwrap().nodes()[0].object_ref,
         ":1.10/button"
