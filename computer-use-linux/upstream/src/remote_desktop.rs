@@ -196,8 +196,9 @@ pub async fn drag(
     end_x: i32,
     end_y: i32,
 ) -> Result<()> {
-    let proxy = remote_desktop_proxy(&session.connection).await?;
     let (start_stream, start_x, start_y) = session.map_absolute_point(start_x, start_y)?;
+    let (end_stream, end_x, end_y) = session.map_absolute_point(end_x, end_y)?;
+    let proxy = remote_desktop_proxy(&session.connection).await?;
     notify_pointer_motion_absolute(
         &proxy,
         &session.session_handle,
@@ -206,25 +207,38 @@ pub async fn drag(
         start_y,
     )
     .await?;
-    notify_pointer_button(
+    if let Err(error) = notify_pointer_button(
         &proxy,
         &session.session_handle,
         BTN_LEFT,
         POINTER_BUTTON_PRESSED,
     )
-    .await?;
+    .await
+    {
+        best_effort_release_left_button(&proxy, &session.session_handle).await;
+        return Err(error);
+    }
     tokio::time::sleep(Duration::from_millis(35)).await;
-    let (end_stream, end_x, end_y) = session.map_absolute_point(end_x, end_y)?;
-    notify_pointer_motion_absolute(&proxy, &session.session_handle, end_stream, end_x, end_y)
-        .await?;
+    if let Err(error) =
+        notify_pointer_motion_absolute(&proxy, &session.session_handle, end_stream, end_x, end_y)
+            .await
+    {
+        best_effort_release_left_button(&proxy, &session.session_handle).await;
+        return Err(error);
+    }
     tokio::time::sleep(Duration::from_millis(35)).await;
-    notify_pointer_button(
+    if let Err(error) = notify_pointer_button(
         &proxy,
         &session.session_handle,
         BTN_LEFT,
         POINTER_BUTTON_RELEASED,
     )
     .await
+    {
+        best_effort_release_left_button(&proxy, &session.session_handle).await;
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub async fn type_text_with_keysyms(
@@ -261,19 +275,19 @@ pub async fn press_keycode_chord(
 
 impl PortalPointerSession {
     fn map_absolute_point(&self, x: i32, y: i32) -> Result<(u32, f64, f64)> {
-        if let Some(stream) = self
-            .streams
-            .iter()
-            .find(|stream| stream.contains_global_point(x, y))
-        {
-            return Ok(stream.relative_point(x, y));
-        }
-
-        self.streams
-            .first()
-            .map(|stream| stream.relative_point(x, y))
-            .context("remote desktop portal session had no usable streams")
+        map_absolute_point(&self.streams, x, y)
     }
+}
+
+fn map_absolute_point(streams: &[PortalStream], x: i32, y: i32) -> Result<(u32, f64, f64)> {
+    streams
+        .iter()
+        .find(|stream| stream.contains_global_point(x, y))
+        .map(|stream| stream.relative_point(x, y))
+        .transpose()?
+        .with_context(|| {
+            format!("coordinate {x},{y} is outside every addressable remote-desktop stream")
+        })
 }
 
 impl PortalStream {
@@ -284,15 +298,32 @@ impl PortalStream {
         let Some((width, height)) = self.size else {
             return false;
         };
-        x >= stream_x && y >= stream_y && x < stream_x + width && y < stream_y + height
+        width > 0
+            && height > 0
+            && x >= stream_x
+            && y >= stream_y
+            && x < stream_x.saturating_add(width)
+            && y < stream_y.saturating_add(height)
     }
 
-    fn relative_point(&self, x: i32, y: i32) -> (u32, f64, f64) {
-        let (stream_x, stream_y) = self.position.unwrap_or((0, 0));
-        let (width, height) = self.size.unwrap_or((i32::MAX, i32::MAX));
-        let rel_x = (x - stream_x).clamp(0, width.saturating_sub(1)) as f64;
-        let rel_y = (y - stream_y).clamp(0, height.saturating_sub(1)) as f64;
-        (self.node_id, rel_x, rel_y)
+    fn relative_point(&self, x: i32, y: i32) -> Result<(u32, f64, f64)> {
+        let (stream_x, stream_y) = self
+            .position
+            .context("remote-desktop stream did not report its desktop position")?;
+        let (width, height) = self
+            .size
+            .context("remote-desktop stream did not report its dimensions")?;
+        if !self.contains_global_point(x, y) {
+            bail!(
+                "coordinate {x},{y} is outside remote-desktop stream {} at {stream_x},{stream_y} {width}x{height}",
+                self.node_id
+            );
+        }
+        Ok((
+            self.node_id,
+            f64::from(x - stream_x),
+            f64::from(y - stream_y),
+        ))
     }
 }
 
@@ -401,6 +432,8 @@ async fn select_monitor_sources(connection: &Connection, session: &OwnedObjectPa
         Value::from(last_path_component(&request_path)),
     );
     options.insert("types", Value::from(SOURCE_MONITOR));
+    // Portal coordinates cannot be matched safely across monitor streams
+    // without a shared pixel-space transform.
     options.insert("multiple", Value::from(false));
     options.insert("cursor_mode", Value::from(CURSOR_MODE_HIDDEN));
 
@@ -480,6 +513,10 @@ async fn notify_pointer_button(
         .await
         .context("RemoteDesktop NotifyPointerButton failed")?;
     Ok(())
+}
+
+async fn best_effort_release_left_button(proxy: &Proxy<'_>, session: &OwnedObjectPath) {
+    let _ = notify_pointer_button(proxy, session, BTN_LEFT, POINTER_BUTTON_RELEASED).await;
 }
 
 async fn notify_pointer_axis_discrete(
@@ -712,5 +749,55 @@ mod tests {
             .to_string();
 
         assert!(error.contains("U+FDD0"));
+    }
+
+    #[test]
+    fn absolute_points_require_a_matching_portal_stream() {
+        let streams = vec![
+            PortalStream {
+                node_id: 10,
+                position: Some((-1280, 0)),
+                size: Some((1280, 1024)),
+            },
+            PortalStream {
+                node_id: 11,
+                position: Some((0, 0)),
+                size: Some((1920, 1080)),
+            },
+        ];
+
+        assert_eq!(
+            map_absolute_point(&streams, -1, 10).unwrap(),
+            (10, 1279.0, 10.0)
+        );
+        assert_eq!(
+            map_absolute_point(&streams, 0, 10).unwrap(),
+            (11, 0.0, 10.0)
+        );
+        assert!(map_absolute_point(&streams, 1920, 10).is_err());
+    }
+
+    #[test]
+    fn absolute_points_reject_monitor_gaps_and_incomplete_stream_metadata() {
+        let streams = vec![
+            PortalStream {
+                node_id: 10,
+                position: Some((0, 0)),
+                size: Some((100, 100)),
+            },
+            PortalStream {
+                node_id: 11,
+                position: Some((200, 0)),
+                size: Some((100, 100)),
+            },
+            PortalStream {
+                node_id: 12,
+                position: None,
+                size: Some((1920, 1080)),
+            },
+        ];
+
+        assert!(map_absolute_point(&streams, 150, 50).is_err());
+        assert!(map_absolute_point(&streams, -1, -1).is_err());
     }
 }

@@ -966,6 +966,15 @@ impl ComputerUseLinux {
         let ClickTarget::Coordinates(x, y) = target else {
             unreachable!("click target must resolve to coordinates or an AT-SPI action");
         };
+        if let Err(message) = self.validate_capture_space_point(x, y).await {
+            return Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "click".to_string(),
+                message,
+                received,
+            });
+        }
         let button = mouse_button_code(params.button.as_deref());
         let click_count = params.click_count.unwrap_or(1).clamp(1, 10).to_string();
         // Preferred backend: the uinput absolute pointer. Unlike ydotool's
@@ -973,9 +982,6 @@ impl ComputerUseLinux {
         // move, which acceleration + fractional scaling distort) and unlike the
         // portal (per-monitor coordinate scaling + an approval dialog), the
         // absolute pointer lands exactly at the screenshot pixel.
-        // Off-screen coordinates "succeed" at the uinput layer while landing on
-        // no visible pixel — surface that instead of a silent no-op.
-        let off_screen_note = self.off_screen_note_for_point(x, y).await;
         if self
             .try_abs_click(
                 x,
@@ -986,16 +992,13 @@ impl ComputerUseLinux {
             .await
             == Some(true)
         {
-            return Json(with_notes(
-                ActionOutput {
-                    ok: true,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message: "Action sent through the uinput absolute pointer.".to_string(),
-                    received,
-                },
-                off_screen_note.clone(),
-            ));
+            return Json(ActionOutput {
+                ok: true,
+                implemented: true,
+                action: "click".to_string(),
+                message: "Action sent through the uinput absolute pointer.".to_string(),
+                received,
+            });
         }
         if let Some(session) = self.cached_portal_pointer_session() {
             match portal_click(
@@ -1008,16 +1011,13 @@ impl ComputerUseLinux {
             .await
             {
                 Ok(()) => {
-                    return Json(with_notes(
-                        ActionOutput {
-                            ok: true,
-                            implemented: true,
-                            action: "click".to_string(),
-                            message: "Action sent through the remote desktop portal.".to_string(),
-                            received,
-                        },
-                        off_screen_note.clone(),
-                    ));
+                    return Json(ActionOutput {
+                        ok: true,
+                        implemented: true,
+                        action: "click".to_string(),
+                        message: "Action sent through the remote desktop portal.".to_string(),
+                        received,
+                    });
                 }
                 Err(_) => self.clear_portal_pointer_session(),
             }
@@ -1033,17 +1033,13 @@ impl ComputerUseLinux {
                 .await
                 {
                     Ok(()) => {
-                        return Json(with_notes(
-                            ActionOutput {
-                                ok: true,
-                                implemented: true,
-                                action: "click".to_string(),
-                                message: "Action sent through the remote desktop portal."
-                                    .to_string(),
-                                received,
-                            },
-                            off_screen_note.clone(),
-                        ));
+                        return Json(ActionOutput {
+                            ok: true,
+                            implemented: true,
+                            action: "click".to_string(),
+                            message: "Action sent through the remote desktop portal.".to_string(),
+                            received,
+                        });
                     }
                     Err(_) => self.clear_portal_pointer_session(),
                 },
@@ -1061,10 +1057,7 @@ impl ComputerUseLinux {
             ],
         ])
         .await;
-        Json(with_notes(
-            action_result("click", result, received),
-            off_screen_note,
-        ))
+        Json(action_result("click", result, received))
     }
 
     #[tool(
@@ -1305,24 +1298,30 @@ impl ComputerUseLinux {
                 });
             }
         };
-        let off_screen_note = match target_point {
-            Some((x, y)) => self.off_screen_note_for_point(x, y).await,
+        let coordinate_error = match target_point {
+            Some((x, y)) => self.validate_capture_space_point(x, y).await.err(),
             None => None,
         };
+        if let Some(message) = coordinate_error {
+            return Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "scroll".to_string(),
+                message,
+                received,
+            });
+        }
 
         if let Some(session) = self.cached_portal_pointer_session() {
             match portal_scroll(&session, target_point, direction, units).await {
                 Ok(()) => {
-                    return Json(with_notes(
-                        ActionOutput {
-                            ok: true,
-                            implemented: true,
-                            action: "scroll".to_string(),
-                            message: "Action sent through the remote desktop portal.".to_string(),
-                            received,
-                        },
-                        off_screen_note.clone(),
-                    ));
+                    return Json(ActionOutput {
+                        ok: true,
+                        implemented: true,
+                        action: "scroll".to_string(),
+                        message: "Action sent through the remote desktop portal.".to_string(),
+                        received,
+                    });
                 }
                 Err(_) => self.clear_portal_pointer_session(),
             }
@@ -1331,17 +1330,14 @@ impl ComputerUseLinux {
                 Ok(Some(session)) => {
                     match portal_scroll(&session, target_point, direction, units).await {
                         Ok(()) => {
-                            return Json(with_notes(
-                                ActionOutput {
-                                    ok: true,
-                                    implemented: true,
-                                    action: "scroll".to_string(),
-                                    message: "Action sent through the remote desktop portal."
-                                        .to_string(),
-                                    received,
-                                },
-                                off_screen_note.clone(),
-                            ));
+                            return Json(ActionOutput {
+                                ok: true,
+                                implemented: true,
+                                action: "scroll".to_string(),
+                                message: "Action sent through the remote desktop portal."
+                                    .to_string(),
+                                received,
+                            });
                         }
                         Err(_) => self.clear_portal_pointer_session(),
                     }
@@ -1372,10 +1368,7 @@ impl ComputerUseLinux {
         }
         sequence.push(wheel_mousemove_args(dx, dy));
         let result = run_ydotool_sequence(&sequence).await;
-        Json(with_notes(
-            action_result("scroll", result, received),
-            off_screen_note,
-        ))
+        Json(action_result("scroll", result, received))
     }
 
     #[tool(
@@ -1390,6 +1383,20 @@ impl ComputerUseLinux {
     )]
     async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params));
+        for (label, x, y) in [
+            ("start", params.start_x, params.start_y),
+            ("end", params.end_x, params.end_y),
+        ] {
+            if let Err(message) = self.validate_capture_space_point(x, y).await {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "drag".to_string(),
+                    message: format!("Invalid drag {label} point: {message}"),
+                    received,
+                });
+            }
+        }
         // Preferred backend: the uinput absolute pointer (accurate landing).
         if self.ensure_abs_pointer().await {
             let abs_pointer = Arc::clone(&self.abs_pointer);
@@ -1699,7 +1706,7 @@ fn app_state_tool_result(
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.5.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id when avoiding model round trips matters; batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id when avoiding model round trips matters; batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot results warn when a target window is partially or fully off-screen, and coordinate input outside the captured desktop bounds is rejected; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -2729,19 +2736,25 @@ impl ComputerUseLinux {
         ))
     }
 
-    /// Warn when a click/scroll coordinate is outside the captured desktop.
-    /// Click coordinates are physical capture-space pixels, so compare ONLY
-    /// against the capture rect — the extension's logical layout is a
-    /// different space on scaled displays and would false-positive.
-    async fn off_screen_note_for_point(&self, x: i32, y: i32) -> Option<String> {
-        let (mx, my, mw, mh) = self.capture_space_rect().await?;
+    /// Refuse coordinate input unless the point is inside the captured desktop.
+    /// Coordinates are physical capture-space pixels, so compare only against
+    /// the capture rectangle, never logical compositor bounds.
+    async fn validate_capture_space_point(
+        &self,
+        x: i32,
+        y: i32,
+    ) -> std::result::Result<(), String> {
+        let (mx, my, mw, mh) = self.capture_space_rect().await.ok_or_else(|| {
+            "Could not establish the addressable desktop bounds; refusing coordinate input."
+                .to_string()
+        })?;
         let visible = x >= mx && y >= my && x < mx.saturating_add(mw) && y < my.saturating_add(mh);
-        if visible {
-            return None;
+        if !visible {
+            return Err(format!(
+                "Coordinate {x},{y} is outside the addressable desktop ({mw}x{mh}); no input was sent."
+            ));
         }
-        Some(format!(
-            "WARNING: coordinate {x},{y} is outside the captured desktop ({mw}x{mh}); the input landed on no visible pixel."
-        ))
+        Ok(())
     }
 
     /// Post-input feedback: which AT-SPI element holds keyboard focus in the
@@ -5458,6 +5471,44 @@ mod tests {
                 "930".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn coordinate_validation_rejects_edges_and_negative_points() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_desktop_size(1920, 1080);
+
+        assert!(backend.validate_capture_space_point(0, 0).await.is_ok());
+        assert!(backend
+            .validate_capture_space_point(1919, 1079)
+            .await
+            .is_ok());
+        for point in [(-1, 0), (0, -1), (1920, 0), (0, 1080)] {
+            let error = backend
+                .validate_capture_space_point(point.0, point.1)
+                .await
+                .unwrap_err();
+            assert!(error.contains("no input was sent"));
+        }
+    }
+
+    #[tokio::test]
+    async fn drag_rejects_an_invalid_endpoint_before_selecting_an_input_backend() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_desktop_size(100, 80);
+
+        let Json(output) = backend
+            .drag(Parameters(DragParams {
+                start_x: 20,
+                start_y: 20,
+                end_x: 100,
+                end_y: 40,
+            }))
+            .await;
+
+        assert!(!output.ok);
+        assert!(output.message.contains("Invalid drag end point"));
+        assert!(output.message.contains("no input was sent"));
     }
 
     #[test]
