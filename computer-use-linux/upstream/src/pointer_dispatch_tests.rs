@@ -228,6 +228,42 @@ async fn observed_pointer_verification_rejects_stale_or_changed_targets() {
 }
 
 #[tokio::test]
+async fn stale_observation_is_rejected_before_live_object_probe() {
+    let verification = PointerDispatchVerification {
+        exact_window_id: 42,
+        expected_pid: Some(4242),
+        observed_element: Some(ObservedElementPointer {
+            observation_id: "stale".to_string(),
+            object_ref: ":1.42/untrusted".to_string(),
+            point: (70, 80),
+        }),
+    };
+    let focused = window_info(42, Some(4242));
+    let live_probe_called = std::cell::Cell::new(false);
+
+    let result = verify_pointer_dispatch_with(
+        Some(&verification),
+        |_| Err("stale observation".to_string()),
+        |_| {
+            live_probe_called.set(true);
+            async {
+                Ok::<_, anyhow::Error>(Bounds {
+                    x: 50,
+                    y: 60,
+                    width: 40,
+                    height: 40,
+                })
+            }
+        },
+        move || async move { Ok::<_, anyhow::Error>(Some(focused)) },
+    )
+    .await;
+
+    assert_eq!(result, Err("stale observation".to_string()));
+    assert!(!live_probe_called.get());
+}
+
+#[tokio::test]
 async fn failed_verification_blocks_every_pointer_dispatch_boundary() {
     for boundary in [
         PointerDispatchBoundary::AbsolutePointer,

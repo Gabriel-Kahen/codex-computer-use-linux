@@ -97,19 +97,14 @@ where
     let Some(verification) = verification else {
         return Ok(());
     };
-    let live_bounds = match &verification.observed_element {
-        Some(observed) => Some(
-            live_bounds(observed.object_ref.clone())
-                .await
-                .map_err(|error| format!("Could not verify live element bounds: {error:#}"))?,
-        ),
-        None => None,
-    };
     let focused = focus()
         .await
         .map_err(|error| format!("Could not re-verify target-window focus: {error:#}"))?;
     verify_pointer_dispatch_snapshot_state(verification, focused.as_ref(), snapshot)?;
-    if let (Some(observed), Some(bounds)) = (&verification.observed_element, live_bounds) {
+    if let Some(observed) = &verification.observed_element {
+        let bounds = live_bounds(observed.object_ref.clone())
+            .await
+            .map_err(|error| format!("Could not verify live element bounds: {error:#}"))?;
         ensure_element_point_in_live_bounds(observed.point, &bounds)?;
     }
     Ok(())
