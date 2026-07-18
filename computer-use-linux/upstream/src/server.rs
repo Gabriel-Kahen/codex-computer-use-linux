@@ -1748,7 +1748,7 @@ fn action_batch_and_observation_tool_result(
     batch: ActionBatchOutput,
     observation_result: PostActionObservationResult,
 ) -> Result<CallToolResult, ErrorData> {
-    let (observation, observation_error, images) = match observation_result {
+    let (mut observation, observation_error, mut images) = match observation_result {
         PostActionObservationResult::Completed(result) => {
             let observation = result.structured_content.ok_or_else(|| {
                 ErrorData::internal_error(
@@ -1770,7 +1770,10 @@ fn action_batch_and_observation_tool_result(
         ),
         PostActionObservationResult::NotAttempted => (None, None, Vec::new()),
     };
-    let value = serde_json::to_value(ActionBatchAndObserveOutput {
+    if let Some(observation) = observation.as_mut() {
+        bound_model_visible_json_strings(observation);
+    }
+    let mut value = serde_json::to_value(ActionBatchAndObserveOutput {
         batch,
         observation,
         observation_error,
@@ -1781,9 +1784,55 @@ fn action_batch_and_observation_tool_result(
             None,
         )
     })?;
+    const MAX_STRUCTURED_BYTES: usize = 8 * 1024;
+    let mut tree_truncated = false;
+    loop {
+        if tree_truncated {
+            value["observation_error"] = serde_json::Value::String(
+                "The post-action accessibility tree was truncated to keep the combined result bounded. Call get_app_state if more nodes are needed."
+                    .to_string(),
+            );
+        }
+        if serde_json::to_vec(&value)
+            .is_ok_and(|serialized| serialized.len() <= MAX_STRUCTURED_BYTES)
+        {
+            break;
+        }
+        let Some(tree) = value
+            .get_mut("observation")
+            .and_then(|observation| observation.get_mut("accessibility_tree"))
+            .and_then(serde_json::Value::as_array_mut)
+            .filter(|tree| !tree.is_empty())
+        else {
+            value["observation"] = serde_json::Value::Null;
+            value["observation_error"] = serde_json::Value::String(
+                "The post-action observation exceeded the combined result limit. Call get_app_state to retrieve current state."
+                    .to_string(),
+            );
+            images.clear();
+            break;
+        };
+        tree.truncate(tree.len() / 2);
+        tree_truncated = true;
+    }
     let mut result = CallToolResult::structured(value);
     result.content.extend(images);
     Ok(result)
+}
+
+fn bound_model_visible_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = bounded_action_result_message(text),
+        serde_json::Value::Array(values) => {
+            values.iter_mut().for_each(bound_model_visible_json_strings);
+        }
+        serde_json::Value::Object(values) => {
+            values
+                .values_mut()
+                .for_each(bound_model_visible_json_strings);
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
 }
 
 enum PostActionObservationResult {
@@ -4784,6 +4833,49 @@ mod tests {
         assert_eq!(result.content.len(), 3);
         assert_eq!(serialized.matches("AAAA").count(), 1);
         assert_eq!(serialized.matches("BBBB").count(), 1);
+    }
+
+    #[test]
+    fn batch_and_observation_result_compacts_oversized_model_context() {
+        let batch = ActionBatchOutput {
+            ok: true,
+            completed: 0,
+            failed_at: None,
+            results: Vec::new(),
+            error: None,
+        };
+        let nodes = (0..128)
+            .map(|index| serde_json::json!({"index": index, "name": "x".repeat(1_000)}))
+            .collect::<Vec<_>>();
+        let mut observation_result = CallToolResult::structured(serde_json::json!({
+            "accessibility_tree": nodes,
+            "message": "post-action state",
+        }));
+        observation_result
+            .content
+            .push(Content::image("AAAA", "image/png"));
+
+        let result = action_batch_and_observation_tool_result(
+            batch,
+            PostActionObservationResult::Completed(observation_result),
+        )
+        .unwrap();
+        let structured = result.structured_content.as_ref().unwrap();
+        let retained_nodes = structured["observation"]["accessibility_tree"]
+            .as_array()
+            .unwrap();
+
+        assert!(serde_json::to_vec(structured).unwrap().len() <= 8 * 1024);
+        assert!(!retained_nodes.is_empty());
+        assert!(retained_nodes.len() < 128);
+        assert!(retained_nodes
+            .iter()
+            .all(|node| node["name"].as_str().unwrap().len() <= 512));
+        assert!(structured["observation_error"]
+            .as_str()
+            .unwrap()
+            .contains("truncated"));
+        assert_eq!(result.content.len(), 2);
     }
 
     #[test]
