@@ -1282,7 +1282,7 @@ impl ComputerUseLinux {
     async fn set_value_unlocked(&self, params: SetValueParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let object_ref = match self.resolve_object_ref(
-            params.observation_id.as_deref(),
+            Some(params.observation_id.as_str()),
             params.element_index,
             params.element_identifier.as_deref(),
             &params.selector(),
@@ -2517,8 +2517,7 @@ impl BatchClick {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ActionParams {
     /// Opaque ID returned by get_app_state for the selected element.
-    #[serde(default)]
-    observation_id: Option<String>,
+    observation_id: String,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -2549,8 +2548,7 @@ impl ActionParams {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct SetValueParams {
     /// Opaque ID returned by get_app_state for the selected element.
-    #[serde(default)]
-    observation_id: Option<String>,
+    observation_id: String,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -3452,7 +3450,7 @@ impl ComputerUseLinux {
     async fn perform_element_action(&self, params: &ActionParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let node = match self.resolve_observed_node(
-            params.observation_id.as_deref(),
+            Some(params.observation_id.as_str()),
             params.element_index,
             params.element_identifier.as_deref(),
             &params.selector(),
@@ -5146,13 +5144,14 @@ mod tests {
     }
 
     #[test]
-    fn semantic_action_schemas_accept_observation_ids() {
+    fn semantic_action_schemas_require_observation_ids() {
         let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
         for name in ["perform_action", "set_value"] {
             let tool = tools.iter().find(|tool| tool.name == name).unwrap();
-            assert!(serde_json::to_string(&tool.input_schema)
-                .unwrap()
-                .contains("observation_id"));
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            assert!(schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "observation_id")));
         }
     }
 

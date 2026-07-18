@@ -86,29 +86,57 @@ fn window_generation_ignores_pid_metadata_changes() {
 }
 
 #[test]
-fn target_capacity_and_ttl_bound_snapshots() {
+fn target_capacity_evicts_the_oldest_snapshot() {
     let start = Instant::now();
     let mut store = AccessibilitySnapshotStore {
-        max_targets: 1,
-        ttl: Duration::from_secs(1),
+        max_targets: 2,
         ..Default::default()
     };
     let evicted_id = store.record_at(window(10), &[node(":1.10/button")], start);
-    let current_id = store.record_at(window(20), &[node(":1.20/button")], start);
+    let retained_id = store.record_at(window(20), &[node(":1.20/button")], start);
+    let newest_id = store.record_at(window(30), &[node(":1.30/button")], start);
 
-    assert_eq!(store.snapshots.len(), 1);
-    assert_eq!(store.snapshots[0].id, current_id);
-    assert!(store.resolve(&evicted_id).unwrap_err().contains("stale"));
-
-    store.record_at(
-        window(30),
-        &[node(":1.30/button")],
-        start + Duration::from_secs(2),
+    assert_eq!(
+        store
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![retained_id.as_str(), newest_id.as_str()]
     );
-    assert_eq!(store.snapshots.len(), 1);
-    assert_eq!(store.snapshots[0].target, window(30));
+    assert!(store.resolve(&evicted_id).unwrap_err().contains("stale"));
+}
+
+#[test]
+fn target_ttl_expires_snapshots_only_after_the_boundary() {
+    let start = Instant::now();
+    let ttl = Duration::from_secs(1);
+    let mut store = AccessibilitySnapshotStore {
+        max_targets: 4,
+        ttl,
+        ..Default::default()
+    };
+    let expiring_id = store.record_at(window(10), &[node(":1.10/button")], start);
+    let control_id = store.record_at(
+        window(20),
+        &[node(":1.20/button")],
+        start + Duration::from_millis(500),
+    );
+
+    assert_eq!(
+        store.resolve_at(&expiring_id, start + ttl).unwrap().nodes()[0].object_ref,
+        ":1.10/button"
+    );
     assert!(store
-        .resolve_at(&current_id, start + Duration::from_secs(2))
+        .resolve_at(&expiring_id, start + ttl + Duration::from_nanos(1))
         .unwrap_err()
         .contains("expired"));
+    assert_eq!(
+        store
+            .resolve_at(&control_id, start + ttl + Duration::from_nanos(1))
+            .unwrap()
+            .nodes()[0]
+            .object_ref,
+        ":1.20/button"
+    );
 }
