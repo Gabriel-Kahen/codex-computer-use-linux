@@ -33,9 +33,14 @@ fn snapshots_are_isolated_by_target() {
     let second_id = store.record(window(20), &[node(":1.20/button")]);
 
     assert_ne!(first_id, second_id);
-    assert_eq!(store.snapshots.len(), 2);
-    assert_eq!(store.snapshots[0].nodes[0].object_ref, ":1.10/button");
-    assert_eq!(store.snapshots[1].nodes[0].object_ref, ":1.20/button");
+    assert_eq!(
+        store.resolve(&first_id).unwrap().nodes()[0].object_ref,
+        ":1.10/button"
+    );
+    assert_eq!(
+        store.resolve(&second_id).unwrap().nodes()[0].object_ref,
+        ":1.20/button"
+    );
 }
 
 #[test]
@@ -46,8 +51,11 @@ fn recording_a_target_replaces_its_previous_generation() {
 
     assert_eq!(store.snapshots.len(), 1);
     assert_ne!(stale_id, current_id);
-    assert_eq!(store.snapshots[0].id, current_id);
-    assert_eq!(store.snapshots[0].nodes[0].object_ref, ":1.10/new");
+    assert!(store.resolve(&stale_id).unwrap_err().contains("stale"));
+    assert_eq!(
+        store.resolve(&current_id).unwrap().nodes()[0].object_ref,
+        ":1.10/new"
+    );
 }
 
 #[test]
@@ -90,7 +98,7 @@ fn target_capacity_and_ttl_bound_snapshots() {
 
     assert_eq!(store.snapshots.len(), 1);
     assert_eq!(store.snapshots[0].id, current_id);
-    assert_ne!(store.snapshots[0].id, evicted_id);
+    assert!(store.resolve(&evicted_id).unwrap_err().contains("stale"));
 
     store.record_at(
         window(30),
@@ -99,4 +107,8 @@ fn target_capacity_and_ttl_bound_snapshots() {
     );
     assert_eq!(store.snapshots.len(), 1);
     assert_eq!(store.snapshots[0].target, window(30));
+    assert!(store
+        .resolve_at(&current_id, start + Duration::from_secs(2))
+        .unwrap_err()
+        .contains("expired"));
 }

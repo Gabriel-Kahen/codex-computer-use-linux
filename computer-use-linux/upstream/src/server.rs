@@ -1,4 +1,6 @@
-use crate::accessibility_snapshot::{AccessibilitySnapshotStore, AccessibilitySnapshotTarget};
+use crate::accessibility_snapshot::{
+    AccessibilitySnapshot, AccessibilitySnapshotStore, AccessibilitySnapshotTarget,
+};
 use crate::action_batch::{
     bounded_action_result_message, execute_action_batch, ActionBatchOutput, ActionBatchParams,
     ActionOutput, BatchAction, BatchActionRun, BatchClick, NON_EDITABLE_TEXT_LANDING_WARNING,
@@ -6,8 +8,9 @@ use crate::action_batch::{
 };
 use crate::atspi_tree::{
     focused_element_summary, list_accessible_apps, perform_action as invoke_accessibility_action,
-    set_element_value, snapshot_compact_tree, AccessibilityAction, AccessibilityNode,
-    AccessibleAppSummary, Bounds, FocusedElementSummary, ValueSetInvocation,
+    perform_action_by_identity, set_element_value, snapshot_compact_tree, AccessibilityAction,
+    AccessibilityNode, AccessibleAppSummary, ActionFingerprint, Bounds, FocusedElementSummary,
+    ValueSetInvocation,
 };
 use crate::desktop_transaction::DesktopTransaction;
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
@@ -1234,7 +1237,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "perform_action",
-        description = "Invoke an accessibility action exposed by an element selected by index, identifier, or semantic selector. Defaults to the primary action unless action is provided.",
+        description = "Invoke an accessibility action exposed by an element selected by index, identifier, or semantic selector from a specific get_app_state observation_id. The action is also resolved from that observation and invoked by a field-preserving name/description fingerprint. Defaults to the first observed action unless action is provided.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1253,14 +1256,12 @@ impl ComputerUseLinux {
     }
 
     async fn perform_action_unlocked(&self, params: ActionParams) -> Json<ActionOutput> {
-        let requested_action = requested_or_primary_action(params.action.as_deref());
-        self.perform_element_action(&params, Some(requested_action))
-            .await
+        self.perform_element_action(&params).await
     }
 
     #[tool(
         name = "set_value",
-        description = "Set the value of a settable accessibility element selected by index, identifier, or semantic selector.",
+        description = "Set the value of a settable accessibility element selected by index, identifier, or semantic selector from a specific get_app_state observation_id.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1281,6 +1282,7 @@ impl ComputerUseLinux {
     async fn set_value_unlocked(&self, params: SetValueParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let object_ref = match self.resolve_object_ref(
+            params.observation_id.as_deref(),
             params.element_index,
             params.element_identifier.as_deref(),
             &params.selector(),
@@ -1932,7 +1934,7 @@ enum PostActionObservationResult {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.5.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For perform_action and set_value, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; click still accepts element_index or semantic role/name/text/states selectors from the latest get_app_state result. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -2514,6 +2516,9 @@ impl BatchClick {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ActionParams {
+    /// Opaque ID returned by get_app_state for the selected element.
+    #[serde(default)]
+    observation_id: Option<String>,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -2543,6 +2548,9 @@ impl ActionParams {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct SetValueParams {
+    /// Opaque ID returned by get_app_state for the selected element.
+    #[serde(default)]
+    observation_id: Option<String>,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -3256,6 +3264,26 @@ impl ComputerUseLinux {
             .invalidate(target);
     }
 
+    fn accessibility_snapshot(
+        &self,
+        observation_id: Option<&str>,
+    ) -> std::result::Result<AccessibilitySnapshot, String> {
+        let observation_id = observation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "observation_id is required for direct accessibility actions. Call get_app_state and pass the returned observation_id."
+                    .to_string()
+            })?;
+        self.accessibility_snapshots
+            .lock()
+            .map_err(|_| {
+                "Could not read accessibility observations. Call get_app_state and retry."
+                    .to_string()
+            })?
+            .resolve(observation_id)
+    }
+
     fn resolve_optional_target_point(
         &self,
         x: Option<i32>,
@@ -3323,20 +3351,70 @@ impl ComputerUseLinux {
 
     fn resolve_object_ref(
         &self,
+        observation_id: Option<&str>,
         element_index: Option<u32>,
         element_identifier: Option<&str>,
         selector: &ElementSelector<'_>,
         purpose: ElementResolvePurpose,
     ) -> std::result::Result<String, String> {
+        self.resolve_observed_node(
+            observation_id,
+            element_index,
+            element_identifier,
+            selector,
+            purpose,
+        )
+        .map(|node| node.object_ref)
+    }
+
+    fn resolve_observed_node(
+        &self,
+        observation_id: Option<&str>,
+        element_index: Option<u32>,
+        element_identifier: Option<&str>,
+        selector: &ElementSelector<'_>,
+        purpose: ElementResolvePurpose,
+    ) -> std::result::Result<AccessibilityNode, String> {
+        let snapshot = self.accessibility_snapshot(observation_id)?;
+        let nodes = snapshot.nodes();
         if let Some(element_identifier) = element_identifier
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            return Ok(element_identifier.to_string());
+            let node = nodes
+                .iter()
+                .find(|node| node.object_ref == element_identifier)
+                .cloned()
+                .ok_or_else(|| {
+                    "element_identifier does not belong to the supplied accessibility observation. Call get_app_state again and use an object_ref from that result."
+                        .to_string()
+                })?;
+            if element_index.is_some_and(|element_index| element_index != node.index) {
+                return Err(
+                    "element_index and element_identifier select different nodes in the supplied accessibility observation."
+                        .to_string(),
+                );
+            }
+            return Ok(node);
         }
-
-        self.resolve_cached_node(element_index, selector, purpose)
-            .map(|node| node.object_ref)
+        if let Some(element_index) = element_index {
+            return nodes
+                .iter()
+                .find(|node| node.index == element_index)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "No accessibility node for element_index {element_index} exists in the supplied observation. Call get_app_state again."
+                    )
+                });
+        }
+        if selector.is_empty() {
+            return Err(
+                "Pass element_index, element_identifier, or a semantic selector such as role/name/text/states from the supplied get_app_state result."
+                    .to_string(),
+            );
+        }
+        resolve_semantic_node(nodes, selector, purpose)
     }
 
     fn resolve_cached_node(
@@ -3371,19 +3449,16 @@ impl ComputerUseLinux {
         resolve_semantic_node(cached.as_slice(), selector, purpose)
     }
 
-    async fn perform_element_action(
-        &self,
-        params: &ActionParams,
-        requested_action: Option<&str>,
-    ) -> Json<ActionOutput> {
+    async fn perform_element_action(&self, params: &ActionParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        let object_ref = match self.resolve_object_ref(
+        let node = match self.resolve_observed_node(
+            params.observation_id.as_deref(),
             params.element_index,
             params.element_identifier.as_deref(),
             &params.selector(),
             ElementResolvePurpose::Action,
         ) {
-            Ok(object_ref) => object_ref,
+            Ok(node) => node,
             Err(message) => {
                 return Json(ActionOutput {
                     ok: false,
@@ -3394,8 +3469,21 @@ impl ComputerUseLinux {
                 });
             }
         };
+        let action_identity =
+            match snapshot_action_identity(&node.actions, params.action.as_deref()) {
+                Ok(action_identity) => action_identity,
+                Err(message) => {
+                    return Json(ActionOutput {
+                        ok: false,
+                        implemented: true,
+                        action: "perform_action".to_string(),
+                        message,
+                        received,
+                    });
+                }
+            };
 
-        match invoke_accessibility_action(&object_ref, requested_action).await {
+        match perform_action_by_identity(&node.object_ref, &action_identity).await {
             Ok(invocation) => Json(ActionOutput {
                 ok: invocation.ok,
                 implemented: true,
@@ -3648,11 +3736,47 @@ fn is_plain_left_click(button: Option<&str>, click_count: Option<u32>) -> bool {
     matches!(button.to_ascii_lowercase().as_str(), "left" | "primary") && click_count == 1
 }
 
-fn requested_or_primary_action(action: Option<&str>) -> &str {
-    match action.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(action) => action,
-        None => "0",
+fn snapshot_action_identity(
+    actions: &[AccessibilityAction],
+    requested_action: Option<&str>,
+) -> std::result::Result<ActionFingerprint, String> {
+    let requested_action = requested_action
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let action = match requested_action {
+        None => actions.first(),
+        Some(requested_action) => {
+            let mut text_matches = actions.iter().filter(|action| {
+                action.name.trim().eq_ignore_ascii_case(requested_action)
+                    || action
+                        .description
+                        .trim()
+                        .eq_ignore_ascii_case(requested_action)
+            });
+            let text_match = text_matches.next();
+            if text_matches.next().is_some() {
+                return Err(
+                    "The requested AT-SPI action is ambiguous in the supplied accessibility observation."
+                        .to_string(),
+                );
+            }
+            text_match.or_else(|| {
+                requested_action
+                    .parse::<i32>()
+                    .ok()
+                    .and_then(|index| actions.iter().find(|action| action.index == index))
+            })
+        }
     }
+    .ok_or_else(|| {
+        "The requested AT-SPI action was not present in the supplied accessibility observation. Call get_app_state again."
+            .to_string()
+    })?;
+
+    ActionFingerprint::new(&action.name, &action.description).ok_or_else(|| {
+        "The selected AT-SPI action has no stable textual identity, so it cannot be invoked safely."
+            .to_string()
+    })
 }
 
 fn primary_action(actions: &[AccessibilityAction]) -> Option<&AccessibilityAction> {
@@ -4814,6 +4938,19 @@ mod tests {
     use crate::atspi_tree::{AccessibilityAction, Bounds};
     use crate::windows::{WindowBounds, GNOME_SHELL_EXTENSION_BACKEND};
 
+    fn cache_observation(backend: &ComputerUseLinux, nodes: &[AccessibilityNode]) -> String {
+        backend.record_accessibility_snapshot(AccessibilitySnapshotTarget::Desktop, nodes)
+    }
+
+    fn action(index: i32, name: &str, description: &str) -> AccessibilityAction {
+        AccessibilityAction {
+            index,
+            name: name.to_string(),
+            description: description.to_string(),
+            keybinding: String::new(),
+        }
+    }
+
     #[test]
     fn exported_tool_schemas_omit_unsigned_integer_formats() {
         let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
@@ -5006,6 +5143,17 @@ mod tests {
         assert!(error.ends_with("... [truncated]"));
         assert!(!error.contains('\n'));
         assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn semantic_action_schemas_accept_observation_ids() {
+        let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
+        for name in ["perform_action", "set_value"] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            assert!(serde_json::to_string(&tool.input_schema)
+                .unwrap()
+                .contains("observation_id"));
+        }
     }
 
     #[test]
@@ -6328,13 +6476,53 @@ mod tests {
     }
 
     #[test]
-    fn perform_action_defaults_to_primary_action_index() {
-        assert_eq!(requested_or_primary_action(None), "0");
-        assert_eq!(requested_or_primary_action(Some("   ")), "0");
+    fn perform_action_defaults_to_first_snapshot_action() {
+        let actions = [
+            action(4, " open ", " Open item "),
+            action(0, "delete", "Delete item"),
+        ];
+        let expected = ActionFingerprint::new("open", "Open item").unwrap();
+
         assert_eq!(
-            requested_or_primary_action(Some(" show-menu ")),
-            "show-menu"
+            snapshot_action_identity(&actions, None),
+            Ok(expected.clone())
         );
+        assert_eq!(
+            snapshot_action_identity(&actions, Some("   ")),
+            Ok(expected)
+        );
+    }
+
+    #[test]
+    fn text_action_precedes_snapshot_index_fallback() {
+        let actions = [action(0, "delete", ""), action(7, "0", "literal")];
+        let expected = ActionFingerprint::new("0", "literal").unwrap();
+
+        assert_eq!(
+            snapshot_action_identity(&actions, Some("0")),
+            Ok(expected.clone())
+        );
+        assert_eq!(snapshot_action_identity(&actions, Some("7")), Ok(expected));
+        assert!(snapshot_action_identity(&actions, Some("2")).is_err());
+    }
+
+    #[test]
+    fn perform_action_rejects_ambiguous_or_unstable_snapshot_actions() {
+        let duplicate = [
+            action(0, "delete", "remove"),
+            action(1, "archive", "remove"),
+        ];
+        assert!(snapshot_action_identity(&duplicate, Some("remove"))
+            .unwrap_err()
+            .contains("ambiguous"));
+
+        let unnamed = [action(0, "", "")];
+        assert!(snapshot_action_identity(&unnamed, None)
+            .unwrap_err()
+            .contains("no stable textual identity"));
+        assert!(snapshot_action_identity(&unnamed, Some("missing"))
+            .unwrap_err()
+            .contains("not present"));
     }
 
     #[test]
@@ -6354,29 +6542,31 @@ mod tests {
     }
 
     #[test]
-    fn element_identifier_overrides_cached_object_ref() {
+    fn element_identifier_must_belong_to_the_observation() {
         let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(7, None)]);
+        let observation_id = cache_observation(&backend, &[node(7, None)]);
 
-        let object_ref = backend
+        let error = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 Some(7),
                 Some(":1.99/org/a11y/atspi/accessible/3"),
                 &ElementSelector::default(),
                 ElementResolvePurpose::Action,
             )
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(object_ref, ":1.99/org/a11y/atspi/accessible/3");
+        assert!(error.contains("does not belong to the supplied accessibility observation"));
     }
 
     #[test]
     fn element_index_resolves_to_cached_object_ref() {
         let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(7, None)]);
+        let observation_id = cache_observation(&backend, &[node(7, None)]);
 
         let object_ref = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 Some(7),
                 None,
                 &ElementSelector::default(),
@@ -6385,6 +6575,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
+        assert!(backend
+            .resolve_object_ref(
+                None,
+                Some(7),
+                None,
+                &ElementSelector::default(),
+                ElementResolvePurpose::Action,
+            )
+            .unwrap_err()
+            .contains("observation_id is required"));
     }
 
     #[test]
@@ -6394,10 +6594,11 @@ mod tests {
         search_entry.role = "entry".to_string();
         search_entry.name = Some("Search files".to_string());
         search_entry.supports_editable_text = true;
-        backend.cache_nodes(&[search_entry]);
+        let observation_id = cache_observation(&backend, &[search_entry]);
 
         let object_ref = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 None,
                 None,
                 &ElementSelector {
@@ -6421,10 +6622,11 @@ mod tests {
         let mut button = node_with_actions(7, None, vec![click_action()]);
         button.role = "push button".to_string();
         button.name = Some("Close".to_string());
-        backend.cache_nodes(&[label, button]);
+        let observation_id = cache_observation(&backend, &[label, button]);
 
         let object_ref = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 None,
                 None,
                 &ElementSelector {
@@ -6448,10 +6650,11 @@ mod tests {
         entry.role = "entry".to_string();
         entry.name = Some("Search".to_string());
         entry.supports_editable_text = true;
-        backend.cache_nodes(&[label, entry]);
+        let observation_id = cache_observation(&backend, &[label, entry]);
 
         let object_ref = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 None,
                 None,
                 &ElementSelector {
@@ -6472,10 +6675,11 @@ mod tests {
         first.name = Some("Close".to_string());
         let mut second = node_with_actions(9, None, vec![click_action()]);
         second.name = Some("Close".to_string());
-        backend.cache_nodes(&[first, second]);
+        let observation_id = cache_observation(&backend, &[first, second]);
 
         let error = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 None,
                 None,
                 &ElementSelector {

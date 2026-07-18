@@ -102,6 +102,35 @@ pub struct ActionInvocation {
     pub ok: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActionFingerprint {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+impl ActionFingerprint {
+    pub(crate) fn new(name: &str, description: &str) -> Option<Self> {
+        let trimmed = |value: &str| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        };
+        let fingerprint = Self {
+            name: trimmed(name),
+            description: trimmed(description),
+        };
+        (fingerprint.name.is_some() || fingerprint.description.is_some()).then_some(fingerprint)
+    }
+
+    fn matches(&self, action: &atspi::Action) -> bool {
+        self.name
+            .as_deref()
+            .is_none_or(|name| action.name.trim().eq_ignore_ascii_case(name))
+            && self.description.as_deref().is_none_or(|description| {
+                action.description.trim().eq_ignore_ascii_case(description)
+            })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ValueSetInvocation {
     Numeric { value: f64 },
@@ -270,6 +299,29 @@ pub async fn perform_action(
     object_ref_id: &str,
     requested_action: Option<&str>,
 ) -> Result<ActionInvocation> {
+    perform_selected_action(object_ref_id, ActionSelection::Flexible(requested_action)).await
+}
+
+pub async fn perform_action_by_identity(
+    object_ref_id: &str,
+    action_identity: &ActionFingerprint,
+) -> Result<ActionInvocation> {
+    perform_selected_action(
+        object_ref_id,
+        ActionSelection::StableIdentity(action_identity),
+    )
+    .await
+}
+
+enum ActionSelection<'a> {
+    Flexible(Option<&'a str>),
+    StableIdentity(&'a ActionFingerprint),
+}
+
+async fn perform_selected_action(
+    object_ref_id: &str,
+    selection: ActionSelection<'_>,
+) -> Result<ActionInvocation> {
     let conn = connect().await?;
     let object_ref = object_ref_from_id(object_ref_id)?;
     let proxy = open_accessible(&conn, &object_ref)
@@ -282,7 +334,14 @@ pub async fn perform_action(
         .await
         .context("element does not expose the AT-SPI Action interface")?;
     let actions = action.get_actions().await.unwrap_or_default();
-    let action_index = select_action_index(&actions, requested_action)?;
+    let action_index = match selection {
+        ActionSelection::Flexible(requested_action) => {
+            select_action_index(&actions, requested_action)?
+        }
+        ActionSelection::StableIdentity(action_identity) => {
+            select_stable_action_index(&actions, action_identity)?
+        }
+    };
     let action_name = actions
         .get(action_index as usize)
         .map(|action| action.name.clone());
@@ -296,6 +355,28 @@ pub async fn perform_action(
         action_name,
         ok,
     })
+}
+
+fn select_stable_action_index(
+    actions: &[atspi::Action],
+    action_identity: &ActionFingerprint,
+) -> Result<i32> {
+    let mut matching_indices = actions
+        .iter()
+        .enumerate()
+        .filter(|(_, action)| action_identity.matches(action))
+        .map(|(index, _)| index);
+    let Some(index) = matching_indices.next() else {
+        return Err(anyhow!(
+            "snapshot AT-SPI action identity is no longer present on the live element"
+        ));
+    };
+    if matching_indices.next().is_some() {
+        return Err(anyhow!(
+            "snapshot AT-SPI action identity is ambiguous on the live element"
+        ));
+    }
+    Ok(index as i32)
 }
 
 pub async fn set_element_value(object_ref_id: &str, value: &str) -> Result<ValueSetInvocation> {
@@ -933,6 +1014,33 @@ mod tests {
         ];
 
         assert_eq!(select_action_index(&actions, None).unwrap(), 1);
+    }
+
+    fn action(name: &str, description: &str) -> atspi::Action {
+        atspi::Action {
+            name: name.to_string(),
+            description: description.to_string(),
+            keybinding: String::new(),
+        }
+    }
+
+    #[test]
+    fn stable_action_identity_survives_live_reordering() {
+        let actions = [action("delete", "Deletes"), action("open", "Opens")];
+        let identity = ActionFingerprint::new(" open ", " Opens ").unwrap();
+
+        assert_eq!(select_stable_action_index(&actions, &identity).unwrap(), 1);
+    }
+
+    #[test]
+    fn stable_action_identity_requires_unique_same_field_match() {
+        let description_only = ActionFingerprint::new("", "remove").unwrap();
+        let cross_field_collision = [action("remove", "different")];
+        assert!(select_stable_action_index(&cross_field_collision, &description_only).is_err());
+
+        let identity = ActionFingerprint::new("open", "Opens").unwrap();
+        let duplicate = [action("open", "Opens"), action("open", "Opens")];
+        assert!(select_stable_action_index(&duplicate, &identity).is_err());
     }
 
     #[test]
