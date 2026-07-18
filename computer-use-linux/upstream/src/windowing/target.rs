@@ -23,25 +23,31 @@ pub async fn focus_window_target(target: &WindowTarget) -> Result<WindowFocusRes
     let requested_window = resolve_window_target(&windows, target)?.clone();
     ensure_backend_can_focus_target(target, &requested_window)?;
 
+    let already_focused = if listed_target_appears_focused(&windows, &requested_window) {
+        current_focused_window()
+            .await
+            .ok()
+            .flatten()
+            .filter(|focused_window| requested_window.window_id == focused_window.window_id)
+    } else {
+        None
+    };
+    if let Some(focused_window) = already_focused {
+        return Ok(window_focus_result(
+            requested_window,
+            Some(focused_window),
+            "Computer Use verified through a fresh window query that the requested target was already focused, so it skipped window activation.",
+        ));
+    }
+
     registry::activate_window(&requested_window).await?;
 
     let focused_window = wait_for_focused_window(&requested_window).await;
-    let exact_window_focused = focused_window
-        .as_ref()
-        .is_some_and(|window| window.window_id == requested_window.window_id);
-    let app_focused = focused_window
-        .as_ref()
-        .is_some_and(|window| same_optional_string(&window.app_id, &requested_window.app_id));
-
-    Ok(WindowFocusResult {
-        backend: requested_window.backend.clone(),
+    Ok(window_focus_result(
         requested_window,
         focused_window,
-        exact_window_focused,
-        app_focused,
-        note: "Computer Use activated the requested window through the available window backend, then verified focus through a fresh window query."
-            .to_string(),
-    })
+        "Computer Use activated the requested window through the available window backend, then verified focus through a fresh window query.",
+    ))
 }
 
 pub(crate) fn ensure_backend_can_focus_target(
@@ -88,6 +94,34 @@ async fn wait_for_focused_window(requested_window: &WindowInfo) -> Option<Window
         }
     }
     last_focused_window
+}
+
+fn listed_target_appears_focused(windows: &[WindowInfo], requested_window: &WindowInfo) -> bool {
+    windows
+        .iter()
+        .any(|window| window.focused && window.window_id == requested_window.window_id)
+}
+
+fn window_focus_result(
+    requested_window: WindowInfo,
+    focused_window: Option<WindowInfo>,
+    note: &str,
+) -> WindowFocusResult {
+    let exact_window_focused = focused_window
+        .as_ref()
+        .is_some_and(|window| window.window_id == requested_window.window_id);
+    let app_focused = focused_window
+        .as_ref()
+        .is_some_and(|window| same_optional_string(&window.app_id, &requested_window.app_id));
+
+    WindowFocusResult {
+        backend: requested_window.backend.clone(),
+        requested_window,
+        focused_window,
+        exact_window_focused,
+        app_focused,
+        note: note.to_string(),
+    }
 }
 
 pub fn resolve_window_target<'a>(
@@ -376,9 +410,47 @@ fn same_optional_string(left: &Option<String>, right: &Option<String>) -> bool {
 mod tests {
     use super::*;
 
+    fn window(window_id: u64, app_id: Option<&str>) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            title: None,
+            app_id: app_id.map(ToOwned::to_owned),
+            wm_class: None,
+            pid: None,
+            bounds: None,
+            workspace: None,
+            focused: false,
+            hidden: false,
+            client_type: None,
+            backend: "test".to_string(),
+            terminal: None,
+        }
+    }
+
     #[test]
     fn focus_verification_allows_workspace_transition_latency() {
         let verification_budget = FOCUS_VERIFY_DELAY * (FOCUS_VERIFY_ATTEMPTS - 1) as u32;
         assert!(verification_budget >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn list_gate_requires_the_resolved_window_to_be_marked_focused() {
+        let requested = window(10, Some("org.example.App"));
+        let mut requested_in_list = requested.clone();
+
+        assert!(!listed_target_appears_focused(
+            &[requested_in_list.clone()],
+            &requested
+        ));
+
+        requested_in_list.focused = true;
+        assert!(listed_target_appears_focused(
+            &[requested_in_list],
+            &requested
+        ));
+
+        let mut same_app = window(11, Some("org.example.App"));
+        same_app.focused = true;
+        assert!(!listed_target_appears_focused(&[same_app], &requested));
     }
 }
