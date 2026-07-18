@@ -8,6 +8,7 @@ use crate::atspi_tree::{
     set_element_value, snapshot_compact_tree, AccessibilityAction, AccessibilityNode,
     AccessibleAppSummary, Bounds, FocusedElementSummary, ValueSetInvocation,
 };
+use crate::desktop_transaction::DesktopTransaction;
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
 use crate::observation::{
@@ -81,7 +82,7 @@ pub struct ComputerUseLinux {
     abs_pointer: Arc<Mutex<Option<crate::abs_pointer::AbsPointer>>>,
     portal_keyboard_init_lock: Arc<tokio::sync::Mutex<()>>,
     kde_clipboard_lock: Arc<tokio::sync::Mutex<()>>,
-    action_batch_lock: Arc<tokio::sync::Mutex<()>>,
+    desktop_transaction: DesktopTransaction,
     /// Cached logical desktop size (union of monitors) from the most recent
     /// full-frame capture; used for off-screen window/coordinate warnings.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
@@ -295,6 +296,16 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<ActivateWindowParams>,
     ) -> Json<ActivateWindowOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.activate_window_unlocked(params).await })
+            .await
+    }
+
+    async fn activate_window_unlocked(
+        &self,
+        params: ActivateWindowParams,
+    ) -> Json<ActivateWindowOutput> {
         let target = params.into_target();
         let received = Some(serde_json::json!(target.clone()));
         match focus_window_target(&target).await {
@@ -339,6 +350,16 @@ impl ComputerUseLinux {
     async fn get_app_state(
         &self,
         Parameters(params): Parameters<GetAppStateParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.get_app_state_unlocked(params).await })
+            .await
+    }
+
+    async fn get_app_state_unlocked(
+        &self,
+        params: GetAppStateParams,
     ) -> Result<CallToolResult, ErrorData> {
         let observation_mode = params.observation_mode;
         let adaptive = observation_mode == Some(ObservationMode::Adaptive);
@@ -697,6 +718,20 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if params.window_target().is_some() {
+            let owner = self.clone();
+            self.desktop_transaction
+                .run(move || async move { owner.screenshot_unlocked(params).await })
+                .await
+        } else {
+            self.screenshot_unlocked(params).await
+        }
+    }
+
+    async fn screenshot_unlocked(
+        &self,
+        params: ScreenshotParams,
+    ) -> Result<CallToolResult, ErrorData> {
         let target = params.window_target();
         let full_screen = params.full_screen.unwrap_or(false);
         let raise_window = params.raise_window.unwrap_or(true);
@@ -888,7 +923,14 @@ impl ComputerUseLinux {
             open_world_hint = true
         )
     )]
-    async fn click(&self, Parameters(mut params): Parameters<ClickParams>) -> Json<ActionOutput> {
+    async fn click(&self, Parameters(params): Parameters<ClickParams>) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.click_unlocked(params).await })
+            .await
+    }
+
+    async fn click_unlocked(&self, mut params: ClickParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         // Raise the target window first (if specified) so the click lands on the
         // intended app rather than whatever is stacked on top at that pixel.
@@ -1112,7 +1154,16 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<ActionBatchParams>,
     ) -> Json<ActionBatchOutput> {
-        let _batch_guard = self.action_batch_lock.lock().await;
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.run_action_batch_unlocked(params).await })
+            .await
+    }
+
+    async fn run_action_batch_unlocked(
+        &self,
+        params: ActionBatchParams,
+    ) -> Json<ActionBatchOutput> {
         if let Err(error) = self.validate_action_batch(&params) {
             return Json(ActionBatchOutput::validation_error(error));
         }
@@ -1135,7 +1186,16 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<ActionBatchAndObserveParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let _batch_guard = self.action_batch_lock.lock().await;
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.run_action_batch_and_observe_unlocked(params).await })
+            .await
+    }
+
+    async fn run_action_batch_and_observe_unlocked(
+        &self,
+        params: ActionBatchAndObserveParams,
+    ) -> Result<CallToolResult, ErrorData> {
         if let Err(error) = self.validate_action_batch(&params.batch) {
             return action_batch_and_observation_tool_result(
                 ActionBatchOutput::validation_error(error),
@@ -1173,6 +1233,13 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<ActionParams>,
     ) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.perform_action_unlocked(params).await })
+            .await
+    }
+
+    async fn perform_action_unlocked(&self, params: ActionParams) -> Json<ActionOutput> {
         let requested_action = requested_or_primary_action(params.action.as_deref());
         self.perform_element_action(&params, Some(requested_action))
             .await
@@ -1192,6 +1259,13 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<SetValueParams>,
     ) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.set_value_unlocked(params).await })
+            .await
+    }
+
+    async fn set_value_unlocked(&self, params: SetValueParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let object_ref = match self.resolve_object_ref(
             params.element_index,
@@ -1246,7 +1320,14 @@ impl ComputerUseLinux {
             open_world_hint = true
         )
     )]
-    async fn scroll(&self, Parameters(mut params): Parameters<ScrollParams>) -> Json<ActionOutput> {
+    async fn scroll(&self, Parameters(params): Parameters<ScrollParams>) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.scroll_unlocked(params).await })
+            .await
+    }
+
+    async fn scroll_unlocked(&self, mut params: ScrollParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
         // Raise/focus the target window first (parity with click) so wheel
@@ -1435,6 +1516,13 @@ impl ComputerUseLinux {
         )
     )]
     async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.drag_unlocked(params).await })
+            .await
+    }
+
+    async fn drag_unlocked(&self, params: DragParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params));
         // Preferred backend: the uinput absolute pointer (accurate landing).
         if self.ensure_abs_pointer().await {
@@ -1537,6 +1625,13 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<PressKeyParams>,
     ) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.press_key_unlocked(params).await })
+            .await
+    }
+
+    async fn press_key_unlocked(&self, params: PressKeyParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let focus = match self.focus_target_for_input(&params.window_target()).await {
             Ok(focus) => focus,
@@ -1584,6 +1679,13 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<TypeTextParams>,
     ) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.type_text_unlocked(params).await })
+            .await
+    }
+
+    async fn type_text_unlocked(&self, params: TypeTextParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let focus = match self.focus_target_for_input(&params.window_target()).await {
             Ok(focus) => focus,
@@ -1689,6 +1791,13 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<MoveWindowParams>,
     ) -> Json<WindowGeometryOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.move_window_unlocked(params).await })
+            .await
+    }
+
+    async fn move_window_unlocked(&self, params: MoveWindowParams) -> Json<WindowGeometryOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let target = params.target.clone().into_target();
         self.window_geometry_op(received, &target, |window| async move {
@@ -1710,6 +1819,16 @@ impl ComputerUseLinux {
     async fn resize_window(
         &self,
         Parameters(params): Parameters<ResizeWindowParams>,
+    ) -> Json<WindowGeometryOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.resize_window_unlocked(params).await })
+            .await
+    }
+
+    async fn resize_window_unlocked(
+        &self,
+        params: ResizeWindowParams,
     ) -> Json<WindowGeometryOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let target = params.target.clone().into_target();

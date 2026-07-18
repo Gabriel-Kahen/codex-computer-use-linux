@@ -4,6 +4,7 @@ mod action_batch;
 mod atspi_tree_impl;
 mod cli;
 mod cosmic_helper;
+mod desktop_transaction;
 #[path = "diagnostics.rs"]
 mod diagnostics_impl;
 mod gnome_extension;
