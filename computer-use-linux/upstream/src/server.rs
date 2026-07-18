@@ -17,8 +17,8 @@ use crate::observation::{
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_keycode_chord,
     scroll as portal_scroll, start_portal_keyboard_session, start_portal_pointer_session,
-    type_text_with_keysyms, PointerButton, PortalKeyboardSession, PortalPointerSession,
-    ScrollDirection,
+    type_text_with_keysyms, PointerButton, PortalActionError, PortalKeyboardSession,
+    PortalPointerSession, ScrollDirection,
 };
 use crate::screenshot::{
     capture_screenshot_raw, capture_screenshot_raw_recent, prepare_screenshot_payload,
@@ -1001,15 +1001,15 @@ impl ComputerUseLinux {
             });
         }
         if let Some(session) = self.portal_pointer_session_for_action().await {
-            match portal_click(
-                &session,
-                x,
-                y,
-                PointerButton::from_name(params.button.as_deref()),
-                params.click_count.unwrap_or(1).clamp(1, 10),
-            )
-            .await
-            {
+            let button = PointerButton::from_name(params.button.as_deref());
+            let click_count = params.click_count.unwrap_or(1).clamp(1, 10);
+            let session = session.clone();
+            let result = self
+                .run_portal_pointer_action(async move {
+                    portal_click(&session, x, y, button, click_count).await
+                })
+                .await;
+            match result {
                 Ok(()) => {
                     return Json(ActionOutput {
                         ok: true,
@@ -1019,7 +1019,10 @@ impl ComputerUseLinux {
                         received,
                     });
                 }
-                Err(_) => self.clear_portal_pointer_session(),
+                Err(error) if error.can_fallback_to_ydotool() => {}
+                Err(error) => {
+                    return Json(portal_action_delivery_failure("click", &error, received));
+                }
             }
         }
         let result = run_ydotool_sequence(&[
@@ -1288,7 +1291,13 @@ impl ComputerUseLinux {
         }
 
         if let Some(session) = self.portal_pointer_session_for_action().await {
-            match portal_scroll(&session, target_point, direction, units).await {
+            let session = session.clone();
+            let result = self
+                .run_portal_pointer_action(async move {
+                    portal_scroll(&session, target_point, direction, units).await
+                })
+                .await;
+            match result {
                 Ok(()) => {
                     return Json(ActionOutput {
                         ok: true,
@@ -1298,7 +1307,10 @@ impl ComputerUseLinux {
                         received,
                     });
                 }
-                Err(_) => self.clear_portal_pointer_session(),
+                Err(error) if error.can_fallback_to_ydotool() => {}
+                Err(error) => {
+                    return Json(portal_action_delivery_failure("scroll", &error, received));
+                }
             }
         }
         let (dx, dy) = match params.direction.to_ascii_lowercase().as_str() {
@@ -1383,15 +1395,15 @@ impl ComputerUseLinux {
             }
         }
         if let Some(session) = self.portal_pointer_session_for_action().await {
-            match portal_drag(
-                &session,
-                params.start_x,
-                params.start_y,
-                params.end_x,
-                params.end_y,
-            )
-            .await
-            {
+            let session = session.clone();
+            let (start_x, start_y) = (params.start_x, params.start_y);
+            let (end_x, end_y) = (params.end_x, params.end_y);
+            let result = self
+                .run_portal_pointer_action(async move {
+                    portal_drag(&session, start_x, start_y, end_x, end_y).await
+                })
+                .await;
+            match result {
                 Ok(()) => {
                     return Json(ActionOutput {
                         ok: true,
@@ -1401,7 +1413,10 @@ impl ComputerUseLinux {
                         received,
                     });
                 }
-                Err(_) => self.clear_portal_pointer_session(),
+                Err(error) if error.can_fallback_to_ydotool() => {}
+                Err(error) => {
+                    return Json(portal_action_delivery_failure("drag", &error, received));
+                }
             }
         }
         let result = run_ydotool_sequence(&[
@@ -2452,6 +2467,34 @@ impl ComputerUseLinux {
             return None;
         }
         self.ensure_portal_pointer_session().await.ok().flatten()
+    }
+
+    async fn run_portal_pointer_action<F>(
+        &self,
+        action: F,
+    ) -> std::result::Result<(), PortalActionError>
+    where
+        F: Future<Output = std::result::Result<(), PortalActionError>> + Send + 'static,
+    {
+        let cached_session = Arc::clone(&self.portal_pointer_session);
+        let task = tokio::spawn(async move {
+            let result = action.await;
+            if result.is_err() {
+                if let Ok(mut cached) = cached_session.lock() {
+                    *cached = None;
+                }
+            }
+            result
+        });
+        match task.await {
+            Ok(result) => result,
+            Err(error) => {
+                self.clear_portal_pointer_session();
+                Err(PortalActionError::MayHaveDelivered(anyhow::anyhow!(
+                    "portal pointer action task failed: {error}"
+                )))
+            }
+        }
     }
 
     fn clear_portal_pointer_session(&self) {
@@ -3672,6 +3715,22 @@ fn action_result(
             message,
             received,
         },
+    }
+}
+
+fn portal_action_delivery_failure(
+    action: &str,
+    error: &PortalActionError,
+    received: Option<serde_json::Value>,
+) -> ActionOutput {
+    ActionOutput {
+        ok: false,
+        implemented: true,
+        action: action.to_string(),
+        message: format!(
+            "Remote desktop portal {action} failed after the action attempt began. It may have been partially delivered, so it was not replayed through ydotool: {error:#}"
+        ),
+        received,
     }
 }
 
@@ -5480,6 +5539,76 @@ mod tests {
             false,
             ydotool_backend_available_from(true, false)
         ));
+    }
+
+    #[test]
+    fn portal_delivery_failure_is_explicitly_not_replayed() {
+        let received = Some(serde_json::json!({"x": 10, "y": 20}));
+        assert_eq!(
+            portal_action_delivery_failure(
+                "click",
+                &PortalActionError::MayHaveDelivered(anyhow::anyhow!("D-Bus reply was lost")),
+                received.clone(),
+            ),
+            ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "click".to_string(),
+                message: "Remote desktop portal click failed after the action attempt began. It may have been partially delivered, so it was not replayed through ydotool: D-Bus reply was lost".to_string(),
+                received,
+            }
+        );
+    }
+
+    #[test]
+    fn portal_action_phase_controls_ydotool_fallback() {
+        let cases = [
+            (
+                PortalActionError::PreDispatch(anyhow::anyhow!("proxy setup failed")),
+                true,
+            ),
+            (
+                PortalActionError::MayHaveDelivered(anyhow::anyhow!("D-Bus reply was lost")),
+                false,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.can_fallback_to_ydotool(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn portal_action_task_finishes_release_after_waiter_cancellation() {
+        let backend = ComputerUseLinux::default();
+        let pressed = Arc::new(tokio::sync::Notify::new());
+        let continue_action = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter_backend = backend.clone();
+        let waiter_pressed = Arc::clone(&pressed);
+        let waiter_continue = Arc::clone(&continue_action);
+        let waiter_released = Arc::clone(&released);
+        let waiter = tokio::spawn(async move {
+            waiter_backend
+                .run_portal_pointer_action(async move {
+                    waiter_pressed.notify_one();
+                    waiter_continue.notified().await;
+                    waiter_released.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        });
+
+        pressed.notified().await;
+        waiter.abort();
+        let _ = waiter.await;
+        continue_action.notify_one();
+        let completion = tokio::time::timeout(Duration::from_secs(1), async {
+            while !released.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(completion.is_ok(), "detached portal action did not finish");
     }
 
     #[test]

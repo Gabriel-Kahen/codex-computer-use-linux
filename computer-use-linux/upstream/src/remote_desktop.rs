@@ -58,6 +58,28 @@ struct PortalStream {
     size: Option<(i32, i32)>,
 }
 
+#[derive(Debug)]
+pub(crate) enum PortalActionError {
+    PreDispatch(anyhow::Error),
+    MayHaveDelivered(anyhow::Error),
+}
+
+impl PortalActionError {
+    pub(crate) fn can_fallback_to_ydotool(&self) -> bool {
+        matches!(self, Self::PreDispatch(_))
+    }
+}
+
+impl std::fmt::Display for PortalActionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreDispatch(error) | Self::MayHaveDelivered(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for PortalActionError {}
+
 #[derive(Debug, Clone, Copy)]
 pub enum PointerButton {
     Left,
@@ -143,26 +165,41 @@ pub async fn click(
     y: i32,
     button: PointerButton,
     click_count: u32,
-) -> Result<()> {
-    let proxy = remote_desktop_proxy(&session.connection).await?;
-    let (stream_id, x, y) = session.map_absolute_point(x, y)?;
-    notify_pointer_motion_absolute(&proxy, &session.session_handle, stream_id, x, y).await?;
+) -> std::result::Result<(), PortalActionError> {
+    let proxy = remote_desktop_proxy(&session.connection)
+        .await
+        .map_err(PortalActionError::PreDispatch)?;
+    let (stream_id, x, y) = session
+        .map_absolute_point(x, y)
+        .map_err(PortalActionError::PreDispatch)?;
+    notify_pointer_motion_absolute(&proxy, &session.session_handle, stream_id, x, y)
+        .await
+        .map_err(PortalActionError::MayHaveDelivered)?;
+    let button = button.evdev_code();
     for _ in 0..click_count.max(1) {
-        notify_pointer_button(
+        if let Err(error) = notify_pointer_button(
             &proxy,
             &session.session_handle,
-            button.evdev_code(),
+            button,
             POINTER_BUTTON_PRESSED,
         )
-        .await?;
+        .await
+        {
+            best_effort_release_button(&proxy, &session.session_handle, button).await;
+            return Err(PortalActionError::MayHaveDelivered(error));
+        }
         tokio::time::sleep(Duration::from_millis(35)).await;
-        notify_pointer_button(
+        if let Err(error) = notify_pointer_button(
             &proxy,
             &session.session_handle,
-            button.evdev_code(),
+            button,
             POINTER_BUTTON_RELEASED,
         )
-        .await?;
+        .await
+        {
+            best_effort_release_button(&proxy, &session.session_handle, button).await;
+            return Err(PortalActionError::MayHaveDelivered(error));
+        }
     }
     Ok(())
 }
@@ -172,11 +209,17 @@ pub async fn scroll(
     target_point: Option<(i32, i32)>,
     direction: ScrollDirection,
     steps: i32,
-) -> Result<()> {
-    let proxy = remote_desktop_proxy(&session.connection).await?;
+) -> std::result::Result<(), PortalActionError> {
+    let proxy = remote_desktop_proxy(&session.connection)
+        .await
+        .map_err(PortalActionError::PreDispatch)?;
     if let Some((x, y)) = target_point {
-        let (stream_id, x, y) = session.map_absolute_point(x, y)?;
-        notify_pointer_motion_absolute(&proxy, &session.session_handle, stream_id, x, y).await?;
+        let (stream_id, x, y) = session
+            .map_absolute_point(x, y)
+            .map_err(PortalActionError::PreDispatch)?;
+        notify_pointer_motion_absolute(&proxy, &session.session_handle, stream_id, x, y)
+            .await
+            .map_err(PortalActionError::MayHaveDelivered)?;
     }
 
     let (axis, steps) = match direction {
@@ -186,7 +229,9 @@ pub async fn scroll(
         ScrollDirection::Right => (AXIS_HORIZONTAL, -steps.max(1)),
     };
 
-    notify_pointer_axis_discrete(&proxy, &session.session_handle, axis, steps).await
+    notify_pointer_axis_discrete(&proxy, &session.session_handle, axis, steps)
+        .await
+        .map_err(PortalActionError::MayHaveDelivered)
 }
 
 pub async fn drag(
@@ -195,10 +240,16 @@ pub async fn drag(
     start_y: i32,
     end_x: i32,
     end_y: i32,
-) -> Result<()> {
-    let (start_stream, start_x, start_y) = session.map_absolute_point(start_x, start_y)?;
-    let (end_stream, end_x, end_y) = session.map_absolute_point(end_x, end_y)?;
-    let proxy = remote_desktop_proxy(&session.connection).await?;
+) -> std::result::Result<(), PortalActionError> {
+    let (start_stream, start_x, start_y) = session
+        .map_absolute_point(start_x, start_y)
+        .map_err(PortalActionError::PreDispatch)?;
+    let (end_stream, end_x, end_y) = session
+        .map_absolute_point(end_x, end_y)
+        .map_err(PortalActionError::PreDispatch)?;
+    let proxy = remote_desktop_proxy(&session.connection)
+        .await
+        .map_err(PortalActionError::PreDispatch)?;
     notify_pointer_motion_absolute(
         &proxy,
         &session.session_handle,
@@ -206,7 +257,8 @@ pub async fn drag(
         start_x,
         start_y,
     )
-    .await?;
+    .await
+    .map_err(PortalActionError::MayHaveDelivered)?;
     if let Err(error) = notify_pointer_button(
         &proxy,
         &session.session_handle,
@@ -215,16 +267,16 @@ pub async fn drag(
     )
     .await
     {
-        best_effort_release_left_button(&proxy, &session.session_handle).await;
-        return Err(error);
+        best_effort_release_button(&proxy, &session.session_handle, BTN_LEFT).await;
+        return Err(PortalActionError::MayHaveDelivered(error));
     }
     tokio::time::sleep(Duration::from_millis(35)).await;
     if let Err(error) =
         notify_pointer_motion_absolute(&proxy, &session.session_handle, end_stream, end_x, end_y)
             .await
     {
-        best_effort_release_left_button(&proxy, &session.session_handle).await;
-        return Err(error);
+        best_effort_release_button(&proxy, &session.session_handle, BTN_LEFT).await;
+        return Err(PortalActionError::MayHaveDelivered(error));
     }
     tokio::time::sleep(Duration::from_millis(35)).await;
     if let Err(error) = notify_pointer_button(
@@ -235,8 +287,8 @@ pub async fn drag(
     )
     .await
     {
-        best_effort_release_left_button(&proxy, &session.session_handle).await;
-        return Err(error);
+        best_effort_release_button(&proxy, &session.session_handle, BTN_LEFT).await;
+        return Err(PortalActionError::MayHaveDelivered(error));
     }
     Ok(())
 }
@@ -515,8 +567,8 @@ async fn notify_pointer_button(
     Ok(())
 }
 
-async fn best_effort_release_left_button(proxy: &Proxy<'_>, session: &OwnedObjectPath) {
-    let _ = notify_pointer_button(proxy, session, BTN_LEFT, POINTER_BUTTON_RELEASED).await;
+async fn best_effort_release_button(proxy: &Proxy<'_>, session: &OwnedObjectPath, button: i32) {
+    let _ = notify_pointer_button(proxy, session, button, POINTER_BUTTON_RELEASED).await;
 }
 
 async fn notify_pointer_axis_discrete(
