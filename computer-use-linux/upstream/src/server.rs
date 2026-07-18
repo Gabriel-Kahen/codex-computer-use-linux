@@ -1000,7 +1000,7 @@ impl ComputerUseLinux {
                 received,
             });
         }
-        if let Some(session) = self.cached_portal_pointer_session() {
+        if let Some(session) = self.portal_pointer_session_for_action().await {
             match portal_click(
                 &session,
                 x,
@@ -1020,31 +1020,6 @@ impl ComputerUseLinux {
                     });
                 }
                 Err(_) => self.clear_portal_pointer_session(),
-            }
-        } else if self.should_prefer_portal_pointer_backend() {
-            match self.ensure_portal_pointer_session().await {
-                Ok(Some(session)) => match portal_click(
-                    &session,
-                    x,
-                    y,
-                    PointerButton::from_name(params.button.as_deref()),
-                    params.click_count.unwrap_or(1).clamp(1, 10),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        return Json(ActionOutput {
-                            ok: true,
-                            implemented: true,
-                            action: "click".to_string(),
-                            message: "Action sent through the remote desktop portal.".to_string(),
-                            received,
-                        });
-                    }
-                    Err(_) => self.clear_portal_pointer_session(),
-                },
-                Ok(None) => {}
-                Err(_) => {}
             }
         }
         let result = run_ydotool_sequence(&[
@@ -1312,7 +1287,7 @@ impl ComputerUseLinux {
             });
         }
 
-        if let Some(session) = self.cached_portal_pointer_session() {
+        if let Some(session) = self.portal_pointer_session_for_action().await {
             match portal_scroll(&session, target_point, direction, units).await {
                 Ok(()) => {
                     return Json(ActionOutput {
@@ -1324,26 +1299,6 @@ impl ComputerUseLinux {
                     });
                 }
                 Err(_) => self.clear_portal_pointer_session(),
-            }
-        } else if self.should_prefer_portal_pointer_backend() {
-            match self.ensure_portal_pointer_session().await {
-                Ok(Some(session)) => {
-                    match portal_scroll(&session, target_point, direction, units).await {
-                        Ok(()) => {
-                            return Json(ActionOutput {
-                                ok: true,
-                                implemented: true,
-                                action: "scroll".to_string(),
-                                message: "Action sent through the remote desktop portal."
-                                    .to_string(),
-                                received,
-                            });
-                        }
-                        Err(_) => self.clear_portal_pointer_session(),
-                    }
-                }
-                Ok(None) => {}
-                Err(_) => {}
             }
         }
         let (dx, dy) = match params.direction.to_ascii_lowercase().as_str() {
@@ -1427,7 +1382,7 @@ impl ComputerUseLinux {
                 });
             }
         }
-        if let Some(session) = self.cached_portal_pointer_session() {
+        if let Some(session) = self.portal_pointer_session_for_action().await {
             match portal_drag(
                 &session,
                 params.start_x,
@@ -1447,31 +1402,6 @@ impl ComputerUseLinux {
                     });
                 }
                 Err(_) => self.clear_portal_pointer_session(),
-            }
-        } else if self.should_prefer_portal_pointer_backend() {
-            match self.ensure_portal_pointer_session().await {
-                Ok(Some(session)) => match portal_drag(
-                    &session,
-                    params.start_x,
-                    params.start_y,
-                    params.end_x,
-                    params.end_y,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        return Json(ActionOutput {
-                            ok: true,
-                            implemented: true,
-                            action: "drag".to_string(),
-                            message: "Action sent through the remote desktop portal.".to_string(),
-                            received,
-                        });
-                    }
-                    Err(_) => self.clear_portal_pointer_session(),
-                },
-                Ok(None) => {}
-                Err(_) => {}
             }
         }
         let result = run_ydotool_sequence(&[
@@ -2512,6 +2442,16 @@ impl ComputerUseLinux {
             .lock()
             .ok()
             .and_then(|cached| cached.clone())
+    }
+
+    async fn portal_pointer_session_for_action(&self) -> Option<PortalPointerSession> {
+        if let Some(session) = self.cached_portal_pointer_session() {
+            return Some(session);
+        }
+        if !self.should_prefer_portal_pointer_backend() {
+            return None;
+        }
+        self.ensure_portal_pointer_session().await.ok().flatten()
     }
 
     fn clear_portal_pointer_session(&self) {
