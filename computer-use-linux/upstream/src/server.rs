@@ -849,7 +849,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "click",
-        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata.",
+        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata. A plain untargeted element click uses a native AT-SPI action only when that action is explicitly named Click; elements without usable pointer bounds retain the native-action fallback. Targeted elements with bounds, explicit coordinates, other action names, and non-primary clicks use pointer input.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -859,8 +859,6 @@ impl ComputerUseLinux {
     )]
     async fn click(&self, Parameters(mut params): Parameters<ClickParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        // Raise the target window first (if specified) so the click lands on the
-        // intended app rather than whatever is stacked on top at that pixel.
         let window_target = params.window_target();
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
@@ -871,8 +869,15 @@ impl ComputerUseLinux {
                 received,
             });
         }
-        if let Some(target) = window_target {
-            let focus = match self.focus_target_for_input(&target).await {
+
+        // Window-relative coordinates must be translated before target
+        // resolution. Other targets resolve first so only pointer input waits
+        // for the window stack to settle after optional focus verification.
+        if params.relative == Some(true) {
+            let target = window_target
+                .as_ref()
+                .expect("relative clicks require a window target");
+            let focus = match self.focus_target_for_input(target).await {
                 Ok(focus) => focus,
                 Err(message) => {
                     return Json(ActionOutput {
@@ -885,28 +890,24 @@ impl ComputerUseLinux {
                 }
             };
             tokio::time::sleep(Duration::from_millis(120)).await;
-            // Window-relative coordinates: translate by the window's top-left so
-            // the agent can click the pixel it saw in a window-cropped screenshot.
-            if params.relative == Some(true) {
-                let Some(focus) = focus.as_ref() else {
-                    return Json(ActionOutput {
-                        ok: false,
-                        implemented: true,
-                        action: "click".to_string(),
-                        message: "Relative coordinate clicks require verified target-window focus."
-                            .to_string(),
-                        received,
-                    });
-                };
-                if let Err(message) = apply_window_relative_click_coordinates(&mut params, focus) {
-                    return Json(ActionOutput {
-                        ok: false,
-                        implemented: true,
-                        action: "click".to_string(),
-                        message,
-                        received,
-                    });
-                }
+            let Some(focus) = focus.as_ref() else {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message: "Relative coordinate clicks require verified target-window focus."
+                        .to_string(),
+                    received,
+                });
+            };
+            if let Err(message) = apply_window_relative_click_coordinates(&mut params, focus) {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message,
+                    received,
+                });
             }
         }
         let target = match self.resolve_click_target(&params) {
@@ -921,21 +922,44 @@ impl ComputerUseLinux {
                 });
             }
         };
+        // Respect an explicit target for every click route. AT-SPI addresses the
+        // element directly and needs no pointer-settle delay after focus.
+        let focus_policy = click_focus_policy(&target, &params);
+        match focus_policy {
+            ClickFocusPolicy::None => {}
+            ClickFocusPolicy::VerifyTarget | ClickFocusPolicy::VerifyTargetAndSettlePointer => {
+                let Some(window_target) = window_target.as_ref() else {
+                    unreachable!("focus policy requires a window target");
+                };
+                if let Err(message) = self.focus_target_for_input(window_target).await {
+                    return Json(ActionOutput {
+                        ok: false,
+                        implemented: true,
+                        action: "click".to_string(),
+                        message,
+                        received,
+                    });
+                }
+            }
+        }
+        if focus_policy == ClickFocusPolicy::VerifyTargetAndSettlePointer {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
         if let ClickTarget::PrimaryAction {
             object_ref,
             action_name,
             action_index,
         } = target
         {
-            let action_index = action_index.to_string();
-            return match invoke_accessibility_action(&object_ref, Some(&action_index)).await {
+            let action_selector = cached_action_selector(action_name.as_deref(), action_index);
+            return match invoke_accessibility_action(&object_ref, Some(&action_selector)).await {
                 Ok(invocation) => Json(ActionOutput {
                     ok: invocation.ok,
                     implemented: true,
                     action: "click".to_string(),
                     message: if invocation.ok {
                         format!(
-                            "No clickable bounds were cached, so I invoked the primary AT-SPI action{}.",
+                            "Invoked the primary AT-SPI action{}. Semantic dispatch is limited to explicitly named untargeted Click actions or elements without usable pointer bounds.",
                             action_name
                                 .as_deref()
                                 .filter(|name| !name.is_empty())
@@ -1018,7 +1042,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "run_action_batch",
-        description = "Run a validated, ordered, fail-fast batch of common input actions against one exact window_id. Supports up to eight press_key/type_text actions and, optionally, one leading click. The complete batch is validated before any input is sent, and exact target focus is re-verified before every action.",
+        description = "Run a validated, ordered, fail-fast batch of common input actions against one exact window_id. Supports up to eight press_key/type_text actions and, optionally, one leading click. The complete batch is validated before any input is sent. Every action re-verifies exact target focus immediately before input; bounds-free semantic fallback clicks invoke AT-SPI directly, while pointer clicks wait for the window stack to settle.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2038,9 +2062,8 @@ struct ClickParams {
     button: Option<String>,
     #[serde(default)]
     click_count: Option<u32>,
-    // Optional window target: when set, the window is raised/focused before the
-    // click so a coordinate click reliably lands on the intended app rather than
-    // whatever window happens to be stacked on top at that pixel.
+    // Optional window target: every click route verifies it before acting;
+    // coordinate clicks additionally wait for the window stack to settle.
     #[serde(default)]
     window_id: Option<u64>,
     #[serde(default)]
@@ -2896,29 +2919,33 @@ impl ComputerUseLinux {
             &selector,
             ElementResolvePurpose::Click,
         )?;
+        let target_point = node.bounds.as_ref().and_then(bounds_center);
 
-        if let Some((x, y)) = node.bounds.as_ref().and_then(bounds_center) {
-            return Ok(ClickTarget::Coordinates(x, y));
+        if let Some(action) = primary_action(node.actions.as_slice())
+            .filter(|action| semantic_action_matches_click(params, action, target_point.is_some()))
+        {
+            return Ok(ClickTarget::PrimaryAction {
+                object_ref: node.object_ref.clone(),
+                action_name: Some(action.name.clone()),
+                action_index: action.index,
+            });
         }
 
-        if !is_plain_left_click(params.button.as_deref(), params.click_count) {
-            return Err(format!(
-                "No clickable bounds cached for element_index {}. Call get_app_state first and choose a node with positive width and height.",
-                node.index
-            ));
-        }
-
-        let Some(action) = primary_action(node.actions.as_slice()) else {
-            return Err(format!(
-                "No clickable bounds cached for element_index {}, and the element exposes no primary AT-SPI action.",
-                node.index
-            ));
-        };
-        Ok(ClickTarget::PrimaryAction {
-            object_ref: node.object_ref.clone(),
-            action_name: Some(action.name.clone()),
-            action_index: action.index,
-        })
+        target_point
+            .map(|(x, y)| ClickTarget::Coordinates(x, y))
+            .ok_or_else(|| {
+                if is_plain_left_click(params.button.as_deref(), params.click_count) {
+                    format!(
+                        "No clickable bounds cached for element_index {}, and the element exposes no primary AT-SPI action.",
+                        node.index
+                    )
+                } else {
+                    format!(
+                        "No clickable bounds cached for element_index {}. Call get_app_state first and choose a node with positive width and height.",
+                        node.index
+                    )
+                }
+            })
     }
 
     fn center_for_cached_node(&self, element_index: u32) -> Option<(i32, i32)> {
@@ -3040,7 +3067,7 @@ impl ComputerUseLinux {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum ClickTarget {
     Coordinates(i32, i32),
     PrimaryAction {
@@ -3048,6 +3075,23 @@ enum ClickTarget {
         action_name: Option<String>,
         action_index: i32,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickFocusPolicy {
+    None,
+    VerifyTarget,
+    VerifyTargetAndSettlePointer,
+}
+
+fn click_focus_policy(target: &ClickTarget, params: &ClickParams) -> ClickFocusPolicy {
+    if params.relative == Some(true) || params.window_target().is_none() {
+        ClickFocusPolicy::None
+    } else if matches!(target, ClickTarget::Coordinates(_, _)) {
+        ClickFocusPolicy::VerifyTargetAndSettlePointer
+    } else {
+        ClickFocusPolicy::VerifyTarget
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3252,6 +3296,25 @@ fn is_plain_left_click(button: Option<&str>, click_count: Option<u32>) -> bool {
     let button = button.unwrap_or("left");
     let click_count = click_count.unwrap_or(1);
     matches!(button.to_ascii_lowercase().as_str(), "left" | "primary") && click_count == 1
+}
+
+fn semantic_action_matches_click(
+    params: &ClickParams,
+    action: &AccessibilityAction,
+    has_usable_bounds: bool,
+) -> bool {
+    is_plain_left_click(params.button.as_deref(), params.click_count)
+        && (!has_usable_bounds
+            || (params.window_target().is_none()
+                && action.name.trim().eq_ignore_ascii_case("click")))
+}
+
+fn cached_action_selector(action_name: Option<&str>, action_index: i32) -> String {
+    action_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| action_index.to_string())
 }
 
 fn requested_or_primary_action(action: Option<&str>) -> &str {
@@ -5337,15 +5400,15 @@ mod tests {
     }
 
     #[test]
-    fn click_target_falls_back_to_primary_action_without_bounds() {
+    fn bounds_free_plain_click_preserves_primary_action_fallback() {
         let backend = ComputerUseLinux::default();
         backend.cache_nodes(&[node_with_actions(
             7,
             None,
             vec![AccessibilityAction {
                 index: 0,
-                name: "Click".to_string(),
-                description: "Clicks the button".to_string(),
+                name: "activate".to_string(),
+                description: "Activates the element".to_string(),
                 keybinding: String::new(),
             }],
         )]);
@@ -5357,24 +5420,18 @@ mod tests {
             })
             .unwrap();
 
-        match target {
+        assert_eq!(
+            target,
             ClickTarget::PrimaryAction {
-                object_ref,
-                action_name,
-                action_index,
-            } => {
-                assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
-                assert_eq!(action_name.as_deref(), Some("Click"));
-                assert_eq!(action_index, 0);
+                object_ref: ":1.7/org/a11y/atspi/accessible/7".to_string(),
+                action_name: Some("activate".to_string()),
+                action_index: 0,
             }
-            ClickTarget::Coordinates(_, _) => {
-                panic!("expected AT-SPI primary-action fallback")
-            }
-        }
+        );
     }
 
     #[test]
-    fn click_target_falls_back_to_primary_action_with_sentinel_bounds() {
+    fn plain_element_click_uses_primary_action_with_sentinel_bounds() {
         let backend = ComputerUseLinux::default();
         backend.cache_nodes(&[node_with_actions(
             7,
@@ -5384,10 +5441,99 @@ mod tests {
                 width: 1,
                 height: 1,
             }),
+            vec![click_action()],
+        )]);
+
+        let target = backend
+            .resolve_click_target(&ClickParams {
+                element_index: Some(7),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(
+            target,
+            ClickTarget::PrimaryAction {
+                object_ref: ":1.7/org/a11y/atspi/accessible/7".to_string(),
+                action_name: Some("Click".to_string()),
+                action_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn untargeted_plain_click_uses_explicit_click_action_when_bounds_exist() {
+        let backend = ComputerUseLinux::default();
+        let mut action = click_action();
+        action.name = "cLiCk".to_string();
+        backend.cache_nodes(&[node_with_actions(
+            7,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 40,
+            }),
+            vec![action],
+        )]);
+
+        let target = backend
+            .resolve_click_target(&ClickParams {
+                element_index: Some(7),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(
+            target,
+            ClickTarget::PrimaryAction {
+                object_ref: ":1.7/org/a11y/atspi/accessible/7".to_string(),
+                action_name: Some("cLiCk".to_string()),
+                action_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn targeted_element_with_bounds_uses_coordinates_even_for_click_action() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node_with_actions(
+            7,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 40,
+            }),
+            vec![click_action()],
+        )]);
+
+        let target = backend
+            .resolve_click_target(&ClickParams {
+                element_index: Some(7),
+                window_id: Some(42),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(target, ClickTarget::Coordinates(60, 40));
+    }
+
+    #[test]
+    fn non_click_action_with_bounds_uses_coordinates() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node_with_actions(
+            7,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 40,
+            }),
             vec![AccessibilityAction {
                 index: 0,
-                name: "Click".to_string(),
-                description: "Clicks the button".to_string(),
+                name: "activate".to_string(),
+                description: "Activates the element".to_string(),
                 keybinding: String::new(),
             }],
         )]);
@@ -5399,19 +5545,88 @@ mod tests {
             })
             .unwrap();
 
-        match target {
-            ClickTarget::PrimaryAction {
-                object_ref,
-                action_name,
-                action_index,
-            } => {
-                assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
-                assert_eq!(action_name.as_deref(), Some("Click"));
-                assert_eq!(action_index, 0);
-            }
-            ClickTarget::Coordinates(_, _) => {
-                panic!("expected AT-SPI primary-action fallback")
-            }
+        assert_eq!(target, ClickTarget::Coordinates(60, 40));
+    }
+
+    #[test]
+    fn cached_action_selector_prefers_name_across_index_reordering() {
+        assert_eq!(cached_action_selector(Some("Click"), 0), "Click");
+        assert_eq!(cached_action_selector(Some("Click"), 7), "Click");
+        assert_eq!(cached_action_selector(Some("  "), 7), "7");
+        assert_eq!(cached_action_selector(None, 7), "7");
+    }
+
+    #[test]
+    fn semantic_click_focus_policy_verifies_only_explicit_target_without_pointer_settle() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node_with_actions(7, None, vec![click_action()])]);
+        let untargeted_params = ClickParams {
+            element_index: Some(7),
+            ..Default::default()
+        };
+        let target = backend.resolve_click_target(&untargeted_params).unwrap();
+
+        assert_eq!(
+            click_focus_policy(&target, &untargeted_params),
+            ClickFocusPolicy::None
+        );
+
+        let targeted_params = ClickParams {
+            window_id: Some(42),
+            ..untargeted_params
+        };
+        assert_eq!(
+            click_focus_policy(&target, &targeted_params),
+            ClickFocusPolicy::VerifyTarget
+        );
+        assert_eq!(
+            click_focus_policy(&ClickTarget::Coordinates(10, 20), &targeted_params),
+            ClickFocusPolicy::VerifyTargetAndSettlePointer
+        );
+    }
+
+    #[test]
+    fn explicit_coordinates_override_element_primary_action() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node_with_actions(7, None, vec![click_action()])]);
+
+        let target = backend
+            .resolve_click_target(&ClickParams {
+                element_index: Some(7),
+                x: Some(300),
+                y: Some(400),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(target, ClickTarget::Coordinates(300, 400));
+    }
+
+    #[test]
+    fn non_primary_element_clicks_use_coordinates() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node_with_actions(
+            7,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 40,
+            }),
+            vec![click_action()],
+        )]);
+
+        for (button, click_count) in [("right", 1), ("middle", 1), ("left", 2)] {
+            let target = backend
+                .resolve_click_target(&ClickParams {
+                    element_index: Some(7),
+                    button: Some(button.to_string()),
+                    click_count: Some(click_count),
+                    ..Default::default()
+                })
+                .unwrap();
+
+            assert_eq!(target, ClickTarget::Coordinates(60, 40));
         }
     }
 
@@ -5904,7 +6119,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_click_selector_resolves_coordinates() {
+    fn semantic_click_selector_resolves_primary_action() {
         let backend = ComputerUseLinux::default();
         let mut button = node_with_actions(
             7,
@@ -5927,7 +6142,14 @@ mod tests {
             })
             .unwrap();
 
-        assert!(matches!(target, ClickTarget::Coordinates(60, 40)));
+        assert_eq!(
+            target,
+            ClickTarget::PrimaryAction {
+                object_ref: ":1.7/org/a11y/atspi/accessible/7".to_string(),
+                action_name: Some("Click".to_string()),
+                action_index: 0,
+            }
+        );
     }
 
     #[test]
