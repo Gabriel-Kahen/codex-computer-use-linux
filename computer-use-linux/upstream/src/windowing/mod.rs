@@ -345,6 +345,103 @@ mod tests {
     }
 
     #[test]
+    fn app_id_target_reports_missing_match() {
+        let windows = vec![window(1, "Codex", "codex.desktop", "Codex")];
+
+        let error = resolve_window_target(
+            &windows,
+            &WindowTarget {
+                app_id: Some("missing.desktop".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("No window matched app_id missing.desktop"));
+    }
+
+    #[test]
+    fn app_id_target_reports_ambiguous_matches() {
+        let windows = vec![
+            window(1, "First document", "org.example.Editor", "Editor"),
+            window(2, "Second document", "org.example.Editor", "Editor"),
+        ];
+
+        let error = resolve_window_target(
+            &windows,
+            &WindowTarget {
+                app_id: Some("org.example.editor".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("app_id org.example.editor matched multiple windows (1, 2)"));
+    }
+
+    #[test]
+    fn secondary_selector_disambiguates_app_target() {
+        let windows = vec![
+            window(1, "First document", "org.example.Editor", "Editor"),
+            window(2, "Second document", "org.example.Editor", "Editor"),
+        ];
+
+        let matched = resolve_window_target(
+            &windows,
+            &WindowTarget {
+                app_id: Some("org.example.editor".to_string()),
+                title: Some("Second".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(matched.window_id, 2);
+    }
+
+    #[test]
+    fn wm_class_target_reports_ambiguous_matches() {
+        let windows = vec![
+            window(1, "First document", "editor-one", "SharedEditor"),
+            window(2, "Second document", "editor-two", "SharedEditor"),
+        ];
+
+        let error = resolve_window_target(
+            &windows,
+            &WindowTarget {
+                wm_class: Some("sharededitor".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("wm_class sharededitor matched multiple windows (1, 2)"));
+    }
+
+    #[test]
+    fn title_target_reports_ambiguous_matches() {
+        let windows = vec![
+            window(1, "Project - Editor", "org.example.Editor", "Editor"),
+            window(2, "Settings - Editor", "org.example.Editor", "Editor"),
+        ];
+
+        let error = resolve_window_target(
+            &windows,
+            &WindowTarget {
+                title: Some("Editor".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("window title containing Editor matched multiple windows (1, 2)"));
+    }
+
+    #[test]
     fn resolves_target_by_title_substring_case_insensitive() {
         let windows = vec![window(
             2,

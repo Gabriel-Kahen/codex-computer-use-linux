@@ -366,27 +366,47 @@ impl ComputerUseLinux {
                 return (None, None);
             }
 
+            if screenshot_target_requested && window_context.is_none() {
+                let error = window_error
+                    .as_deref()
+                    .unwrap_or("the requested target window could not be resolved");
+                return (
+                    None,
+                    Some(format!(
+                        "targeted screenshot window resolution failed: {error}; refusing to capture the full desktop"
+                    )),
+                );
+            }
+
             let exact_capture = match window_context.as_ref() {
                 Some(window) => match capture_window_exact(window).await {
                     Ok(capture) => capture,
-                    Err(error) => return (None, Some(format!("{error:#}"))),
+                    Err(error) => {
+                        return (
+                            None,
+                            Some(format!(
+                                "targeted exact window capture failed: {error:#}; refusing to capture the full desktop"
+                            )),
+                        );
+                    }
                 },
                 None => None,
             };
             let use_exact_capture = exact_capture.is_some();
+            let bounds = if screenshot_target_requested && !use_exact_capture {
+                match validated_target_bounds(window_context.as_ref()) {
+                    Ok(bounds) => Some(bounds),
+                    Err(error) => return (None, Some(format!("{error:#}"))),
+                }
+            } else {
+                None
+            };
             let raw_capture = match exact_capture {
                 Some(capture) => capture,
                 None => match capture_screenshot_raw_recent().await {
                     Ok(capture) => capture,
                     Err(error) => return (None, Some(format!("{error:#}"))),
                 },
-            };
-            let bounds = if use_exact_capture {
-                None
-            } else {
-                window_context
-                    .as_ref()
-                    .and_then(|window| window.bounds.clone())
             };
             let prepared = tokio::task::spawn_blocking(move || {
                 crop_raw_screenshot(
@@ -681,20 +701,35 @@ impl ComputerUseLinux {
         let full_screen = params.full_screen.unwrap_or(false);
         let raise_window = params.raise_window.unwrap_or(true);
         if let Some(target) = target.as_ref().filter(|_| raise_window) {
-            let _ = focus_window_target(target).await;
+            let focus = focus_window_target(target)
+                .await
+                .map_err(|error| screenshot_failure("focus", Some(target), format!("{error:#}")))?;
+            if !focus_satisfies_target(&focus, target) {
+                return Err(screenshot_failure(
+                    "focus_verification",
+                    Some(target),
+                    format!(
+                        "requested window_id {}, focused window_id {:?}",
+                        focus.requested_window.window_id,
+                        focus.focused_window.as_ref().map(|window| window.window_id)
+                    ),
+                ));
+            }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        let window = if let Some(target) = target.as_ref().filter(|_| !full_screen) {
-            let windows = list_windows().await.map_err(|error| {
-                ErrorData::internal_error(format!("window resolution failed: {error:#}"), None)
+        let window = if let Some(target) = target.as_ref() {
+            let windows = if raise_window {
+                registry::list_windows_with_policy(registry::WindowListPolicy::Fresh).await
+            } else {
+                list_windows().await
+            }
+            .map_err(|error| {
+                screenshot_failure("window_resolution", Some(target), format!("{error:#}"))
             })?;
             Some(
                 resolve_window_target(&windows, target)
                     .map_err(|error| {
-                        ErrorData::internal_error(
-                            format!("window resolution failed: {error:#}"),
-                            None,
-                        )
+                        screenshot_failure("window_resolution", Some(target), format!("{error:#}"))
                     })?
                     .clone(),
             )
@@ -705,36 +740,28 @@ impl ComputerUseLinux {
             None
         } else if let Some(window) = window.as_ref() {
             capture_window_exact(window).await.map_err(|error| {
-                ErrorData::internal_error(format!("screenshot failed: {error:#}"), None)
+                screenshot_failure("exact_capture", target.as_ref(), format!("{error:#}"))
             })?
         } else {
             None
         };
         let exact = exact_capture.is_some();
+        let crop = if target.is_none() || full_screen || exact {
+            None
+        } else {
+            Some(validated_target_bounds(window.as_ref()).map_err(|error| {
+                screenshot_failure("window_bounds", target.as_ref(), format!("{error:#}"))
+            })?)
+        };
         let raw_capture = match exact_capture {
             Some(capture) => capture,
             None => capture_screenshot_raw().await.map_err(|error| {
-                ErrorData::internal_error(format!("screenshot failed: {error:#}"), None)
+                screenshot_failure("capture", target.as_ref(), format!("{error:#}"))
             })?,
         };
         if !exact {
             self.cache_desktop_size(raw_capture.width, raw_capture.height);
         }
-        let crop = if full_screen || exact {
-            None
-        } else {
-            Some(
-                window
-                    .as_ref()
-                    .and_then(|window| window.bounds.clone())
-                    .ok_or_else(|| {
-                        ErrorData::internal_error(
-                            "targeted screenshot requires usable window bounds",
-                            None,
-                        )
-                    })?,
-            )
-        };
         let off_screen_note = match crop.as_ref() {
             Some(bounds) => self.off_screen_note_for_bounds(bounds).await,
             None => None,
@@ -751,10 +778,14 @@ impl ComputerUseLinux {
         })
         .await
         .map_err(|error| {
-            ErrorData::internal_error(format!("screenshot preparation task failed: {error}"), None)
+            screenshot_failure(
+                "preparation",
+                target.as_ref(),
+                format!("screenshot preparation task failed: {error}"),
+            )
         })?
         .map_err(|error| {
-            ErrorData::internal_error(format!("screenshot preparation failed: {error}"), None)
+            screenshot_failure("preparation", target.as_ref(), format!("{error:#}"))
         })?;
 
         let mut caption = serde_json::json!({
@@ -1675,18 +1706,25 @@ impl ComputerUseLinux {
 }
 
 fn app_state_tool_result(
-    output: GetAppStateOutput,
+    mut output: GetAppStateOutput,
     screenshots: &[&ScreenshotCapture],
 ) -> Result<CallToolResult, ErrorData> {
+    let screenshot_failed = output.screenshot_error.is_some();
+    if screenshot_failed {
+        output.screenshot = None;
+        output.screenshot_regions.clear();
+    }
     let value = serde_json::to_value(output).map_err(|error| {
         ErrorData::internal_error(format!("failed to serialize app state: {error}"), None)
     })?;
     let mut result = CallToolResult::structured(value);
-    for screenshot in screenshots {
-        result.content.push(Content::image(
-            data_url_payload(&screenshot.data_url),
-            screenshot.mime_type.clone(),
-        ));
+    if !screenshot_failed {
+        for screenshot in screenshots {
+            result.content.push(Content::image(
+                data_url_payload(&screenshot.data_url),
+                screenshot.mime_type.clone(),
+            ));
+        }
     }
     Ok(result)
 }
@@ -3499,11 +3537,42 @@ fn data_url_payload(data_url: &str) -> String {
         .to_string()
 }
 
+fn screenshot_failure(
+    stage: &'static str,
+    target: Option<&WindowTarget>,
+    error: impl std::fmt::Display,
+) -> ErrorData {
+    let data = target.map(|target| {
+        serde_json::json!({
+            "stage": stage,
+            "target": target,
+            "image_returned": false,
+        })
+    });
+    ErrorData::internal_error(format!("screenshot {stage} failed: {error}"), data)
+}
+
 fn session_is_wayland(session_type: Option<&str>, wayland_display: Option<&str>) -> bool {
     match session_type {
         Some(value) => value.eq_ignore_ascii_case("wayland"),
         None => wayland_display.is_some_and(|value| !value.is_empty()),
     }
+}
+
+fn validated_target_bounds(window: Option<&WindowInfo>) -> Result<crate::windowing::WindowBounds> {
+    let bounds = window
+        .and_then(|window| window.bounds.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "targeted screenshot requires resolved window bounds; refusing to capture the full desktop"
+            )
+        })?;
+    window_crop_rect(&bounds).ok_or_else(|| {
+        anyhow::anyhow!(
+            "targeted screenshot has unusable window bounds; refusing to capture the full desktop"
+        )
+    })?;
+    Ok(bounds)
 }
 
 fn crop_raw_screenshot(
@@ -4518,6 +4587,96 @@ mod tests {
     }
 
     #[test]
+    fn failed_app_state_screenshot_cannot_leak_image_content() {
+        let capture = ScreenshotCapture {
+            mime_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,DESKTOP_PIXELS".to_string(),
+            source: "test".to_string(),
+            width: 2,
+            height: 1,
+            coordinate_width: 2,
+            coordinate_height: 1,
+            scale: 1.0,
+            resized: false,
+            bytes: 14,
+            original_bytes: 14,
+            max_bytes: 1024,
+            format: ScreenshotOutputFormat::Png,
+            quality: None,
+        };
+        let diagnostics = doctor_report();
+        let output = GetAppStateOutput {
+            app_name_or_bundle_identifier: None,
+            window_context: None,
+            window_error: None,
+            window_permissions_hint: None,
+            backend: "linux-atspi".to_string(),
+            screenshot: Some(ScreenshotMetadata::from_capture(&capture, None, (0, 0))),
+            screenshot_regions: vec![ScreenshotRegionMetadata::from_capture(
+                ObservationRegion {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 1,
+                },
+                &capture,
+                None,
+                (0, 0),
+            )],
+            screenshot_error: Some(
+                "targeted exact window capture failed; refusing to capture the full desktop"
+                    .to_string(),
+            ),
+            accessibility_tree: Vec::new(),
+            accessibility_tree_raw_count: 0,
+            accessibility_coordinate_space: "desktop".to_string(),
+            accessibility_error: None,
+            readiness: diagnostics.readiness,
+            diagnostics: None,
+            observation: None,
+            message: "Targeted screenshot failed.".to_string(),
+        };
+
+        let result = app_state_tool_result(output, &[&capture]).unwrap();
+        let serialized = serde_json::to_string(&result).unwrap();
+
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["screenshot"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["screenshot_regions"],
+            serde_json::json!([])
+        );
+        assert!(!serialized.contains("DESKTOP_PIXELS"));
+    }
+
+    #[test]
+    fn targeted_screenshot_errors_include_fail_closed_metadata() {
+        let target = WindowTarget {
+            app_id: Some("org.example.Editor".to_string()),
+            ..Default::default()
+        };
+
+        let error = screenshot_failure(
+            "window_resolution",
+            Some(&target),
+            "app_id matched multiple windows",
+        );
+
+        assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "stage": "window_resolution",
+                "target": target,
+                "image_returned": false,
+            }))
+        );
+    }
+
+    #[test]
     fn changed_region_metadata_uses_window_local_image_origin() {
         let capture = ScreenshotCapture {
             mime_type: "image/png".to_string(),
@@ -4748,6 +4907,74 @@ mod tests {
         let error = crop_raw_screenshot(raw, None, true).unwrap_err();
 
         assert!(error.to_string().contains("requires a resolved window"));
+    }
+
+    #[test]
+    fn targeted_screenshot_requires_bounds_before_desktop_capture() {
+        let mut window = window_info(
+            42,
+            Some("Editor"),
+            Some("org.example.Editor"),
+            Some("Editor"),
+            Some(1234),
+        );
+        window.bounds = None;
+
+        let error = validated_target_bounds(Some(&window)).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires resolved window bounds"));
+        assert!(error
+            .to_string()
+            .contains("refusing to capture the full desktop"));
+    }
+
+    #[test]
+    fn targeted_screenshot_rejects_unusable_bounds_before_desktop_capture() {
+        let mut window = window_info(
+            42,
+            Some("Editor"),
+            Some("org.example.Editor"),
+            Some("Editor"),
+            Some(1234),
+        );
+        window.bounds = Some(WindowBounds {
+            x: Some(10),
+            y: Some(20),
+            width: 0,
+            height: 100,
+        });
+
+        let error = validated_target_bounds(Some(&window)).unwrap_err();
+
+        assert!(error.to_string().contains("unusable window bounds"));
+        assert!(error
+            .to_string()
+            .contains("refusing to capture the full desktop"));
+    }
+
+    #[test]
+    fn targeted_crop_failure_never_returns_the_source_capture() {
+        let raw = RawScreenshotCapture {
+            mime_type: "image/png".to_string(),
+            bytes: b"not a png".to_vec(),
+            source: "desktop-test".to_string(),
+            width: 400,
+            height: 200,
+        };
+        let bounds = WindowBounds {
+            x: Some(50),
+            y: Some(20),
+            width: 200,
+            height: 100,
+        };
+
+        let error = crop_raw_screenshot(raw, Some(&bounds), true).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("targeted screenshot crop failed"));
     }
 
     #[test]
