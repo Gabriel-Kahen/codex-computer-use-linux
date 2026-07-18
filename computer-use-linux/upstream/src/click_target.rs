@@ -9,6 +9,13 @@ pub(super) struct ObservedClickTarget {
     pub(super) pid: Option<u32>,
 }
 
+#[derive(Debug)]
+pub(super) struct ObservedClickAction {
+    pub(super) observation_id: String,
+    pub(super) object_ref: String,
+    pub(super) action_identity: ActionFingerprint,
+}
+
 impl ComputerUseLinux {
     pub(super) fn resolve_observed_click_target(
         &self,
@@ -17,9 +24,6 @@ impl ComputerUseLinux {
         let selector = params.selector();
         let has_element_target = params.element_index.is_some() || !selector.is_empty();
         match (params.x, params.y) {
-            (Some(_), Some(_)) if has_element_target => {
-                return Err("Do not combine click coordinates with an element target.".to_string());
-            }
             (Some(_), Some(_)) => return self.resolve_click_target(params),
             (Some(_), None) | (None, Some(_)) => {
                 return Err("Coordinate clicks require both x and y.".to_string());
@@ -59,13 +63,20 @@ impl ComputerUseLinux {
                 "No clickable bounds in the accessibility observation for element_index {index}. Call get_app_state again, or use perform_action with the same observation_id for a stable AT-SPI action."
             )
         };
+        let semantic_fast_path = is_plain_left_click(params.button.as_deref(), params.click_count)
+            && params.window_target().is_none();
+        let purpose = if semantic_fast_path {
+            ElementResolvePurpose::ObservedSemanticClick
+        } else {
+            ElementResolvePurpose::ObservedClick
+        };
         let node = self
             .resolve_observed_node(
                 Some(observation_id),
                 params.element_index,
                 None,
                 &selector,
-                ElementResolvePurpose::ObservedClick,
+                purpose,
             )
             .map_err(|error| {
                 match self.resolve_observed_node(
@@ -81,6 +92,18 @@ impl ComputerUseLinux {
                     _ => error,
                 }
             })?;
+        let action_identity = node
+            .actions
+            .first()
+            .filter(|action| semantic_fast_path && action.name.trim().eq_ignore_ascii_case("click"))
+            .and_then(|action| ActionFingerprint::new(&action.name, &action.description));
+        if let Some(action_identity) = action_identity {
+            return Ok(ClickTarget::ObservedAction(ObservedClickAction {
+                observation_id: observation_id.to_string(),
+                object_ref: node.object_ref,
+                action_identity,
+            }));
+        }
         let Some(point) = node.bounds.as_ref().and_then(bounds_center) else {
             return Err(bounds_error(node.index));
         };
@@ -91,6 +114,14 @@ impl ComputerUseLinux {
             window_id,
             pid,
         }))
+    }
+
+    pub(super) fn verify_observed_click_action_freshness(
+        &self,
+        observed: &ObservedClickAction,
+    ) -> std::result::Result<(), String> {
+        self.accessibility_snapshot(Some(&observed.observation_id))
+            .map(drop)
     }
 
     pub(super) async fn prepare_observed_click_target(

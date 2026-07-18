@@ -48,15 +48,6 @@ fn observed_clicks_reject_ambiguous_or_unbound_input() {
     for (params, message) in [
         (
             ClickParams {
-                role: Some("button".to_string()),
-                x: Some(10),
-                y: Some(20),
-                ..Default::default()
-            },
-            "Do not combine click coordinates",
-        ),
-        (
-            ClickParams {
                 x: Some(10),
                 ..Default::default()
             },
@@ -82,6 +73,8 @@ fn observed_clicks_reject_ambiguous_or_unbound_input() {
             .resolve_observed_click_target(&ClickParams {
                 x: Some(10),
                 y: Some(20),
+                element_index: Some(999),
+                role: Some("stale element metadata".to_string()),
                 ..Default::default()
             })
             .unwrap(),
@@ -117,7 +110,10 @@ fn observed_clicks_require_exact_window_scope_and_pid() {
         node(bounds),
     );
     let ClickTarget::ObservedCoordinates(target) = backend
-        .resolve_observed_click_target(&params(Some(observation_id.clone())))
+        .resolve_observed_click_target(&ClickParams {
+            window_id: Some(42),
+            ..params(Some(observation_id.clone()))
+        })
         .unwrap()
     else {
         panic!("expected observed coordinates");
@@ -136,7 +132,161 @@ fn observed_clicks_require_exact_window_scope_and_pid() {
 }
 
 #[test]
-fn observed_clicks_fail_closed_without_usable_bounds() {
+fn observed_plain_click_uses_stable_explicit_click_action() {
+    let backend = ComputerUseLinux::default();
+    let mut observed_node = node(Some(Bounds {
+        x: 10,
+        y: 20,
+        width: 100,
+        height: 40,
+    }));
+    observed_node.actions[0].index = 7;
+    observed_node.actions[0].name = "cLiCk".to_string();
+    observed_node.actions[0].description = "Press the button".to_string();
+    let observation_id = record(
+        &backend,
+        AccessibilitySnapshotTarget::Window {
+            window_id: 42,
+            pid: Some(4242),
+        },
+        observed_node,
+    );
+
+    let ClickTarget::ObservedAction(target) = backend
+        .resolve_observed_click_target(&params(Some(observation_id.clone())))
+        .unwrap()
+    else {
+        panic!("expected an observation-bound AT-SPI action");
+    };
+    assert_eq!(target.observation_id, observation_id);
+    assert_eq!(target.object_ref, ":1.7/org/a11y/atspi/accessible/7");
+    assert_eq!(
+        target.action_identity,
+        ActionFingerprint::new("cLiCk", "Press the button").unwrap()
+    );
+}
+
+#[test]
+fn bounds_free_named_click_uses_stable_observation_bound_action() {
+    let backend = ComputerUseLinux::default();
+    let observation_id = record(
+        &backend,
+        AccessibilitySnapshotTarget::Window {
+            window_id: 42,
+            pid: Some(4242),
+        },
+        node(None),
+    );
+
+    assert!(matches!(
+        backend
+            .resolve_observed_click_target(&params(Some(observation_id)))
+            .unwrap(),
+        ClickTarget::ObservedAction(_)
+    ));
+}
+
+#[test]
+fn targeted_non_primary_and_non_click_actions_use_observed_coordinates() {
+    let backend = ComputerUseLinux::default();
+    let bounds = Some(Bounds {
+        x: 10,
+        y: 20,
+        width: 100,
+        height: 40,
+    });
+    let observation_id = record(
+        &backend,
+        AccessibilitySnapshotTarget::Window {
+            window_id: 42,
+            pid: Some(4242),
+        },
+        node(bounds.clone()),
+    );
+    for input in [
+        ClickParams {
+            window_id: Some(42),
+            ..params(Some(observation_id.clone()))
+        },
+        ClickParams {
+            button: Some("right".to_string()),
+            ..params(Some(observation_id.clone()))
+        },
+        ClickParams {
+            click_count: Some(2),
+            ..params(Some(observation_id.clone()))
+        },
+    ] {
+        assert!(matches!(
+            backend.resolve_observed_click_target(&input).unwrap(),
+            ClickTarget::ObservedCoordinates(_)
+        ));
+    }
+
+    let mut activate = node(bounds);
+    activate.actions[0].name = "activate".to_string();
+    let observation_id = record(
+        &backend,
+        AccessibilitySnapshotTarget::Window {
+            window_id: 42,
+            pid: Some(4242),
+        },
+        activate,
+    );
+    assert!(matches!(
+        backend
+            .resolve_observed_click_target(&params(Some(observation_id)))
+            .unwrap(),
+        ClickTarget::ObservedCoordinates(_)
+    ));
+}
+
+#[test]
+fn invalidated_observed_click_action_is_rejected_before_dispatch() {
+    let backend = ComputerUseLinux::default();
+    let target = AccessibilitySnapshotTarget::Window {
+        window_id: 42,
+        pid: Some(4242),
+    };
+    let observation_id = record(
+        &backend,
+        target.clone(),
+        node(Some(Bounds {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 40,
+        })),
+    );
+    let ClickTarget::ObservedAction(action) = backend
+        .resolve_observed_click_target(&params(Some(observation_id)))
+        .unwrap()
+    else {
+        panic!("expected an observation-bound AT-SPI action");
+    };
+    backend
+        .verify_observed_click_action_freshness(&action)
+        .unwrap();
+
+    record(
+        &backend,
+        target,
+        node(Some(Bounds {
+            x: 20,
+            y: 30,
+            width: 100,
+            height: 40,
+        })),
+    );
+
+    assert!(backend
+        .verify_observed_click_action_freshness(&action)
+        .unwrap_err()
+        .contains("stale"));
+}
+
+#[test]
+fn bounds_free_non_click_actions_fail_closed() {
     let backend = ComputerUseLinux::default();
     for bounds in [
         None,
@@ -147,13 +297,15 @@ fn observed_clicks_fail_closed_without_usable_bounds() {
             height: 1,
         }),
     ] {
+        let mut observed_node = node(bounds);
+        observed_node.actions[0].name = "activate".to_string();
         let observation_id = record(
             &backend,
             AccessibilitySnapshotTarget::Window {
                 window_id: 42,
                 pid: Some(4242),
             },
-            node(bounds),
+            observed_node,
         );
         let error = backend
             .resolve_observed_click_target(&ClickParams {
