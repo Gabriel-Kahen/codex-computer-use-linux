@@ -11,6 +11,7 @@ mod diagnostics_impl;
 mod gnome_extension;
 mod identity;
 mod observation;
+mod pointer_dispatch;
 mod remote_desktop;
 #[path = "screenshot.rs"]
 mod screenshot_impl;

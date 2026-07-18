@@ -19,6 +19,9 @@ use crate::observation::{
     prepare_visual_captures, AdaptiveObservationMetadata, ObservationMode, ObservationRegion,
     ObservationTracker, VisualObservationKind, VisualPlan, DEFAULT_CHECKPOINT_INTERVAL,
 };
+use crate::pointer_dispatch::{
+    pointer_dispatch_verification, verify_pointer_dispatch, PointerDispatchVerification,
+};
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_keycode_chord,
     scroll as portal_scroll, start_portal_keyboard_session, start_portal_pointer_session,
@@ -913,20 +916,22 @@ impl ComputerUseLinux {
         y: i32,
         button: Option<&str>,
         count: u32,
-    ) -> Option<bool> {
+        verification: Option<&PointerDispatchVerification>,
+    ) -> std::result::Result<Option<bool>, String> {
         if !self.ensure_abs_pointer().await {
-            return None;
+            return Ok(None);
         }
+        verify_pointer_dispatch(verification).await?;
         let btn = crate::abs_pointer::PointerButton::from_name(button);
         let abs_pointer = Arc::clone(&self.abs_pointer);
-        tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || {
             let mut guard = abs_pointer.lock().ok()?;
             let pointer = guard.as_mut()?;
             Some(pointer.click(x, y, btn, count).is_ok())
         })
         .await
         .ok()
-        .flatten()
+        .flatten())
     }
 
     #[tool(
@@ -948,9 +953,19 @@ impl ComputerUseLinux {
 
     async fn click_unlocked(&self, mut params: ClickParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
+        let click_error = |message| {
+            Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "click".to_string(),
+                message,
+                received: received.clone(),
+            })
+        };
         // Raise the target window first (if specified) so the click lands on the
         // intended app rather than whatever is stacked on top at that pixel.
         let window_target = params.window_target();
+        let mut pointer_verification = None;
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
                 ok: false,
@@ -973,6 +988,8 @@ impl ComputerUseLinux {
                     });
                 }
             };
+            pointer_verification =
+                pointer_dispatch_verification(&target, params.relative, focus.as_ref());
             tokio::time::sleep(Duration::from_millis(120)).await;
             // Window-relative coordinates: translate by the window's top-left so
             // the agent can click the pixel it saw in a window-cropped screenshot.
@@ -1065,28 +1082,35 @@ impl ComputerUseLinux {
         // Off-screen coordinates "succeed" at the uinput layer while landing on
         // no visible pixel — surface that instead of a silent no-op.
         let off_screen_note = self.off_screen_note_for_point(x, y).await;
-        if self
+        match self
             .try_abs_click(
                 x,
                 y,
                 params.button.as_deref(),
                 params.click_count.unwrap_or(1).clamp(1, 10),
+                pointer_verification.as_ref(),
             )
             .await
-            == Some(true)
         {
-            return Json(with_notes(
-                ActionOutput {
-                    ok: true,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message: "Action sent through the uinput absolute pointer.".to_string(),
-                    received,
-                },
-                off_screen_note.clone(),
-            ));
+            Ok(Some(true)) => {
+                return Json(with_notes(
+                    ActionOutput {
+                        ok: true,
+                        implemented: true,
+                        action: "click".to_string(),
+                        message: "Action sent through the uinput absolute pointer.".to_string(),
+                        received,
+                    },
+                    off_screen_note.clone(),
+                ));
+            }
+            Err(message) => return click_error(message),
+            Ok(Some(false) | None) => {}
         }
         if let Some(session) = self.cached_portal_pointer_session() {
+            if let Err(message) = verify_pointer_dispatch(pointer_verification.as_ref()).await {
+                return click_error(message);
+            }
             match portal_click(
                 &session,
                 x,
@@ -1112,33 +1136,43 @@ impl ComputerUseLinux {
             }
         } else if self.should_prefer_portal_pointer_backend() {
             match self.ensure_portal_pointer_session().await {
-                Ok(Some(session)) => match portal_click(
-                    &session,
-                    x,
-                    y,
-                    PointerButton::from_name(params.button.as_deref()),
-                    params.click_count.unwrap_or(1).clamp(1, 10),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        return Json(with_notes(
-                            ActionOutput {
-                                ok: true,
-                                implemented: true,
-                                action: "click".to_string(),
-                                message: "Action sent through the remote desktop portal."
-                                    .to_string(),
-                                received,
-                            },
-                            off_screen_note.clone(),
-                        ));
+                Ok(Some(session)) => {
+                    if let Err(message) =
+                        verify_pointer_dispatch(pointer_verification.as_ref()).await
+                    {
+                        return click_error(message);
                     }
-                    Err(_) => self.clear_portal_pointer_session(),
-                },
+                    match portal_click(
+                        &session,
+                        x,
+                        y,
+                        PointerButton::from_name(params.button.as_deref()),
+                        params.click_count.unwrap_or(1).clamp(1, 10),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            return Json(with_notes(
+                                ActionOutput {
+                                    ok: true,
+                                    implemented: true,
+                                    action: "click".to_string(),
+                                    message: "Action sent through the remote desktop portal."
+                                        .to_string(),
+                                    received,
+                                },
+                                off_screen_note.clone(),
+                            ));
+                        }
+                        Err(_) => self.clear_portal_pointer_session(),
+                    }
+                }
                 Ok(None) => {}
                 Err(_) => {}
             }
+        }
+        if let Err(message) = verify_pointer_dispatch(pointer_verification.as_ref()).await {
+            return click_error(message);
         }
         let result = run_ydotool_sequence(&[
             absolute_mousemove_args(x, y),
