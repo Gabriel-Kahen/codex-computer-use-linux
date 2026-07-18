@@ -45,12 +45,25 @@ struct StoredSnapshot {
 
 #[derive(Clone, Debug)]
 pub(crate) struct AccessibilitySnapshot {
+    target: AccessibilitySnapshotTarget,
     nodes: Arc<[AccessibilityNode]>,
 }
 
 impl AccessibilitySnapshot {
     pub(crate) fn nodes(&self) -> &[AccessibilityNode] {
         &self.nodes
+    }
+
+    pub(crate) fn pointer_target(&self) -> Result<(u64, Option<u32>), String> {
+        match &self.target {
+            AccessibilitySnapshotTarget::Window { window_id, pid } => Ok((*window_id, *pid)),
+            AccessibilitySnapshotTarget::Process(_)
+            | AccessibilitySnapshotTarget::Application(_)
+            | AccessibilitySnapshotTarget::Desktop => Err(
+                "Pointer-derived element actions require a window-scoped observation. Call get_app_state for the exact window and use its observation_id."
+                    .to_string(),
+            ),
+        }
     }
 }
 
@@ -142,6 +155,7 @@ impl AccessibilitySnapshotStore {
             .iter()
             .find(|snapshot| snapshot.id == observation_id)
             .map(|snapshot| AccessibilitySnapshot {
+                target: snapshot.target.clone(),
                 nodes: Arc::clone(&snapshot.nodes),
             })
             .ok_or_else(|| {

@@ -20,7 +20,8 @@ use crate::observation::{
     ObservationTracker, VisualObservationKind, VisualPlan, DEFAULT_CHECKPOINT_INTERVAL,
 };
 use crate::pointer_dispatch::{
-    pointer_dispatch_verification, verify_pointer_dispatch, PointerDispatchVerification,
+    pointer_dispatch_verification, run_verified_pointer_dispatch, verify_pointer_dispatch,
+    PointerDispatchBoundary, PointerDispatchVerification,
 };
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_keycode_chord,
@@ -921,17 +922,23 @@ impl ComputerUseLinux {
         if !self.ensure_abs_pointer().await {
             return Ok(None);
         }
-        verify_pointer_dispatch(verification).await?;
         let btn = crate::abs_pointer::PointerButton::from_name(button);
         let abs_pointer = Arc::clone(&self.abs_pointer);
-        Ok(tokio::task::spawn_blocking(move || {
-            let mut guard = abs_pointer.lock().ok()?;
-            let pointer = guard.as_mut()?;
-            Some(pointer.click(x, y, btn, count).is_ok())
-        })
+        run_verified_pointer_dispatch(
+            PointerDispatchBoundary::AbsolutePointer,
+            verify_pointer_dispatch(verification, &self.accessibility_snapshots),
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = abs_pointer.lock().ok()?;
+                    let pointer = guard.as_mut()?;
+                    Some(pointer.click(x, y, btn, count).is_ok())
+                })
+                .await
+                .ok()
+                .flatten()
+            },
+        )
         .await
-        .ok()
-        .flatten())
     }
 
     #[tool(
@@ -1108,19 +1115,23 @@ impl ComputerUseLinux {
             Ok(Some(false) | None) => {}
         }
         if let Some(session) = self.cached_portal_pointer_session() {
-            if let Err(message) = verify_pointer_dispatch(pointer_verification.as_ref()).await {
-                return click_error(message);
-            }
-            match portal_click(
-                &session,
-                x,
-                y,
-                PointerButton::from_name(params.button.as_deref()),
-                params.click_count.unwrap_or(1).clamp(1, 10),
+            match run_verified_pointer_dispatch(
+                PointerDispatchBoundary::CachedPortal,
+                verify_pointer_dispatch(
+                    pointer_verification.as_ref(),
+                    &self.accessibility_snapshots,
+                ),
+                portal_click(
+                    &session,
+                    x,
+                    y,
+                    PointerButton::from_name(params.button.as_deref()),
+                    params.click_count.unwrap_or(1).clamp(1, 10),
+                ),
             )
             .await
             {
-                Ok(()) => {
+                Ok(Ok(())) => {
                     return Json(with_notes(
                         ActionOutput {
                             ok: true,
@@ -1132,26 +1143,29 @@ impl ComputerUseLinux {
                         off_screen_note.clone(),
                     ));
                 }
-                Err(_) => self.clear_portal_pointer_session(),
+                Ok(Err(_)) => self.clear_portal_pointer_session(),
+                Err(message) => return click_error(message),
             }
         } else if self.should_prefer_portal_pointer_backend() {
             match self.ensure_portal_pointer_session().await {
                 Ok(Some(session)) => {
-                    if let Err(message) =
-                        verify_pointer_dispatch(pointer_verification.as_ref()).await
-                    {
-                        return click_error(message);
-                    }
-                    match portal_click(
-                        &session,
-                        x,
-                        y,
-                        PointerButton::from_name(params.button.as_deref()),
-                        params.click_count.unwrap_or(1).clamp(1, 10),
+                    match run_verified_pointer_dispatch(
+                        PointerDispatchBoundary::NewPortal,
+                        verify_pointer_dispatch(
+                            pointer_verification.as_ref(),
+                            &self.accessibility_snapshots,
+                        ),
+                        portal_click(
+                            &session,
+                            x,
+                            y,
+                            PointerButton::from_name(params.button.as_deref()),
+                            params.click_count.unwrap_or(1).clamp(1, 10),
+                        ),
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(Ok(())) => {
                             return Json(with_notes(
                                 ActionOutput {
                                     ok: true,
@@ -1164,17 +1178,15 @@ impl ComputerUseLinux {
                                 off_screen_note.clone(),
                             ));
                         }
-                        Err(_) => self.clear_portal_pointer_session(),
+                        Ok(Err(_)) => self.clear_portal_pointer_session(),
+                        Err(message) => return click_error(message),
                     }
                 }
                 Ok(None) => {}
                 Err(_) => {}
             }
         }
-        if let Err(message) = verify_pointer_dispatch(pointer_verification.as_ref()).await {
-            return click_error(message);
-        }
-        let result = run_ydotool_sequence(&[
+        let sequence = [
             absolute_mousemove_args(x, y),
             vec![
                 "click".to_string(),
@@ -1182,8 +1194,17 @@ impl ComputerUseLinux {
                 click_count,
                 button,
             ],
-        ])
-        .await;
+        ];
+        let result = match run_verified_pointer_dispatch(
+            PointerDispatchBoundary::Ydotool,
+            verify_pointer_dispatch(pointer_verification.as_ref(), &self.accessibility_snapshots),
+            run_ydotool_sequence(&sequence),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => return click_error(message),
+        };
         Json(with_notes(
             action_result("click", result, received),
             off_screen_note,

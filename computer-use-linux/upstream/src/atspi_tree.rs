@@ -313,6 +313,17 @@ pub async fn perform_action_by_identity(
     .await
 }
 
+pub async fn live_bounds(object_ref_id: &str) -> Result<Bounds> {
+    let conn = connect().await?;
+    let object_ref = object_ref_from_id(object_ref_id)?;
+    let proxy = open_accessible(&conn, &object_ref)
+        .await
+        .with_context(|| format!("failed to open AT-SPI object {object_ref_id}"))?;
+    bounds(&proxy)
+        .await
+        .ok_or_else(|| anyhow!("AT-SPI object {object_ref_id} has no live screen bounds"))
+}
+
 enum ActionSelection<'a> {
     Flexible(Option<&'a str>),
     StableIdentity(&'a ActionFingerprint),
