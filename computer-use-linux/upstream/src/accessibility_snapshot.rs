@@ -43,6 +43,30 @@ struct StoredSnapshot {
     nodes: Arc<[AccessibilityNode]>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AccessibilitySnapshot {
+    target: AccessibilitySnapshotTarget,
+    nodes: Arc<[AccessibilityNode]>,
+}
+
+impl AccessibilitySnapshot {
+    pub(crate) fn nodes(&self) -> &[AccessibilityNode] {
+        &self.nodes
+    }
+
+    pub(crate) fn pointer_target(&self) -> Result<(u64, Option<u32>), String> {
+        match &self.target {
+            AccessibilitySnapshotTarget::Window { window_id, pid } => Ok((*window_id, *pid)),
+            AccessibilitySnapshotTarget::Process(_)
+            | AccessibilitySnapshotTarget::Application(_)
+            | AccessibilitySnapshotTarget::Desktop => Err(
+                "Pointer-derived element actions require a window-scoped observation. Call get_app_state for the exact window and use its observation_id."
+                    .to_string(),
+            ),
+        }
+    }
+}
+
 pub(crate) struct AccessibilitySnapshotStore {
     snapshots: VecDeque<StoredSnapshot>,
     max_targets: usize,
@@ -81,6 +105,13 @@ impl AccessibilitySnapshotStore {
             .retain(|snapshot| !snapshot.target.same_scope(target));
     }
 
+    pub(crate) fn resolve(
+        &mut self,
+        observation_id: &str,
+    ) -> Result<AccessibilitySnapshot, String> {
+        self.resolve_at(observation_id, Instant::now())
+    }
+
     fn record_at(
         &mut self,
         target: AccessibilitySnapshotTarget,
@@ -112,6 +143,25 @@ impl AccessibilitySnapshotStore {
             now.checked_duration_since(snapshot.captured_at)
                 .is_none_or(|age| age <= self.ttl)
         });
+    }
+
+    fn resolve_at(
+        &mut self,
+        observation_id: &str,
+        now: Instant,
+    ) -> Result<AccessibilitySnapshot, String> {
+        self.purge_expired(now);
+        self.snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == observation_id)
+            .map(|snapshot| AccessibilitySnapshot {
+                target: snapshot.target.clone(),
+                nodes: Arc::clone(&snapshot.nodes),
+            })
+            .ok_or_else(|| {
+                "The accessibility observation_id is missing, stale, or expired. Call get_app_state again and use the new observation_id."
+                    .to_string()
+            })
     }
 }
 

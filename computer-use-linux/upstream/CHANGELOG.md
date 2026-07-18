@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** Element-targeted `scroll` calls now require the originating
+  `observation_id` alongside `element_index`. Coordinate scrolls must provide
+  both `x` and `y` and cannot be combined with `element_index`.
+
 ## [0.5.0] - 2026-07-16
 
 ### Changed

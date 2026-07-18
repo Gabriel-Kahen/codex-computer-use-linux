@@ -28,6 +28,9 @@ pub(crate) enum BatchAction {
 
 #[derive(Debug, Clone, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct BatchClick {
+    /// Opaque ID returned by get_app_state. Required for element-based clicks.
+    #[serde(default)]
+    pub(crate) observation_id: Option<String>,
     #[serde(default)]
     pub(crate) element_index: Option<u32>,
     #[serde(default)]

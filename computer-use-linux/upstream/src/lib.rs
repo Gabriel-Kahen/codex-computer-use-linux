@@ -11,9 +11,11 @@ mod diagnostics_impl;
 mod gnome_extension;
 mod identity;
 mod observation;
+mod pointer_dispatch;
 mod remote_desktop;
 #[path = "screenshot.rs"]
 mod screenshot_impl;
+mod scroll_target;
 mod server;
 mod terminal;
 mod windowing;
@@ -22,8 +24,9 @@ mod ydotool;
 
 pub mod atspi_tree {
     pub(crate) use crate::atspi_tree_impl::{
-        focused_element_summary, list_accessible_apps, perform_action, set_element_value,
-        snapshot_compact_tree, AccessibleAppSummary, FocusedElementSummary, ValueSetInvocation,
+        focused_element_summary, list_accessible_apps, live_bounds, perform_action_by_identity,
+        set_element_value, snapshot_compact_tree, AccessibleAppSummary, ActionFingerprint,
+        FocusedElementSummary, ValueSetInvocation,
     };
     pub use crate::atspi_tree_impl::{
         snapshot_tree, AccessibilityAction, AccessibilityNode, AccessibilityText,

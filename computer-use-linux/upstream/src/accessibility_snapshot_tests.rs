@@ -33,9 +33,14 @@ fn snapshots_are_isolated_by_target() {
     let second_id = store.record(window(20), &[node(":1.20/button")]);
 
     assert_ne!(first_id, second_id);
-    assert_eq!(store.snapshots.len(), 2);
-    assert_eq!(store.snapshots[0].nodes[0].object_ref, ":1.10/button");
-    assert_eq!(store.snapshots[1].nodes[0].object_ref, ":1.20/button");
+    assert_eq!(
+        store.resolve(&first_id).unwrap().nodes()[0].object_ref,
+        ":1.10/button"
+    );
+    assert_eq!(
+        store.resolve(&second_id).unwrap().nodes()[0].object_ref,
+        ":1.20/button"
+    );
 }
 
 #[test]
@@ -46,8 +51,11 @@ fn recording_a_target_replaces_its_previous_generation() {
 
     assert_eq!(store.snapshots.len(), 1);
     assert_ne!(stale_id, current_id);
-    assert_eq!(store.snapshots[0].id, current_id);
-    assert_eq!(store.snapshots[0].nodes[0].object_ref, ":1.10/new");
+    assert!(store.resolve(&stale_id).unwrap_err().contains("stale"));
+    assert_eq!(
+        store.resolve(&current_id).unwrap().nodes()[0].object_ref,
+        ":1.10/new"
+    );
 }
 
 #[test]
@@ -96,10 +104,7 @@ fn target_capacity_evicts_the_oldest_snapshot() {
             .collect::<Vec<_>>(),
         vec![retained_id.as_str(), newest_id.as_str()]
     );
-    assert!(store
-        .snapshots
-        .iter()
-        .all(|snapshot| snapshot.id != evicted_id));
+    assert!(store.resolve(&evicted_id).unwrap_err().contains("stale"));
 }
 
 #[test]
@@ -117,36 +122,20 @@ fn target_ttl_expires_snapshots_only_after_the_boundary() {
         &[node(":1.20/button")],
         start + Duration::from_millis(500),
     );
-    let boundary_id = store.record_at(window(30), &[node(":1.30/button")], start + ttl);
-
+    assert_eq!(
+        store.resolve_at(&expiring_id, start + ttl).unwrap().nodes()[0].object_ref,
+        ":1.10/button"
+    );
+    assert!(store
+        .resolve_at(&expiring_id, start + ttl + Duration::from_nanos(1))
+        .unwrap_err()
+        .contains("expired"));
     assert_eq!(
         store
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.id.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            expiring_id.as_str(),
-            control_id.as_str(),
-            boundary_id.as_str()
-        ]
-    );
-
-    let newest_id = store.record_at(
-        window(40),
-        &[node(":1.40/button")],
-        start + ttl + Duration::from_nanos(1),
-    );
-    assert_eq!(
-        store
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.id.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            control_id.as_str(),
-            boundary_id.as_str(),
-            newest_id.as_str()
-        ]
+            .resolve_at(&control_id, start + ttl + Duration::from_nanos(1))
+            .unwrap()
+            .nodes()[0]
+            .object_ref,
+        ":1.20/button"
     );
 }
