@@ -24,9 +24,9 @@ The Rust crate is published as [`computer-use-linux`](https://crates.io/crates/c
 
 Most computer-use MCP servers are macOS-only (they lean on AppKit, AXUIElement, CGEvent). The few that target Linux either drive `xdotool` against an X11 root window or shell out to OCR over screenshots. Four things set this one apart:
 
-- **Wayland actually works.** Coordinate-bearing pointer actions use the absolute uinput backend or `ydotool` / `ydotoold`; the `org.freedesktop.portal.RemoteDesktop` pointer path is limited to untargeted relative scroll because the portal API defines no safe transform from screenshot pixels to absolute pointer coordinates. Portal keyboard input remains available. Screenshots use the GNOME Shell DBus screenshot method when present, `org.freedesktop.portal.Screenshot` otherwise, and fall back to spawning `gnome-screenshot` for background/systemd contexts where both DBus paths are denied.
+- **Wayland actually works.** Coordinate-bearing pointer actions, including observation-bound element clicks, use the absolute uinput backend or `ydotool` / `ydotoold`; the `org.freedesktop.portal.RemoteDesktop` pointer path is limited to untargeted relative scroll because the portal API defines no safe transform from screenshot pixels to absolute pointer coordinates. Portal keyboard input remains available. Screenshots use the GNOME Shell DBus screenshot method when present, `org.freedesktop.portal.Screenshot` otherwise, and fall back to spawning `gnome-screenshot` for background/systemd contexts where both DBus paths are denied.
 - **Window targeting is compositor-aware.** The window registry tries GNOME Shell extension, GNOME Shell Introspect, COSMIC Wayland helper, KWin DBus scripting, Hyprland `hyprctl`, and i3 IPC in order, then reports exactly which backend won or why each backend failed.
-- **Semantic selectors, not pixel coordinates.** Tools like `click`, `perform_action`, and `set_value` accept `role` / `name` / `text` / `states` selectors backed by AT-SPI. Pixel coordinates remain available as a fallback for rendering-only surfaces (canvas, games, X clients without ATK).
+- **Semantic selectors, not pixel coordinates.** Tools like `click`, `perform_action`, and `set_value` accept `role` / `name` / `text` / `states` selectors backed by AT-SPI. Element-targeted `click` and `scroll`, plus `perform_action` and `set_value`, require the originating `observation_id`, preventing an index or object reference from silently crossing snapshots. Pixel coordinates remain available as a fallback for rendering-only surfaces (canvas, games, X clients without ATK).
 - **One JSON readiness report.** `computer-use-linux doctor` returns a structured document covering platform, portals, AT-SPI, windowing, input, and a `readiness` summary with explicit blockers and a recommended next step. MCP hosts can render or surface that to the user without parsing prose.
 
 The crate was extracted from [`codex-desktop-linux`](https://github.com/avifenesh/codex-desktop-linux) (the Linux distribution of Codex Desktop), which still bundles this binary as a built-in plugin. This standalone repo is the upstream.
@@ -46,18 +46,20 @@ MCP tools exposed by the server:
 - `list_apps` — running desktop apps visible to the AT-SPI registry
 - `list_windows` — compositor windows with title, app id, wm_class, focus state, client type (Wayland/X11), and bounds
 - `focused_window` — the window currently holding keyboard focus
-- `get_app_state` — combined screenshot + accessibility tree for a chosen app, with an opt-in adaptive checkpoint/delta mode and element indices that the input tools accept
+- `get_app_state` — combined screenshot + accessibility tree for a chosen app, with an opt-in adaptive checkpoint/delta mode and an opaque `observation_id` for each bounded accessibility snapshot
 - `screenshot` — capture the screen as a bounded PNG or JPEG image; can target a window, which is raised to the front and cropped to just that window
 
 Screenshot payloads are size-bounded by default before they are returned to the MCP host: max 1920 px width/height and 2 MiB image bytes, with hard caps even when callers request more. Agents that need more detail can pass `max_width`, `max_height`, `max_bytes`, `scale`, `format: "jpeg"`, or `quality`, preferably with a window target or crop. PNG remains the default; JPEG lets callers trade lossless pixels for a smaller payload before the byte cap forces further resizing. Returned screenshot metadata includes `coordinate_width`, `coordinate_height`, `scale`, `format`, and `quality` so callers can convert from a downscaled preview to desktop coordinate pixels.
 
 Pass `observation_mode: "adaptive"` to receive a full checkpoint followed by unchanged summaries or up to four coordinate-anchored changed image regions. Echo its `checkpoint_id` as `base_checkpoint_id`; omission or mismatch forces a full refresh, while the normal bounded AT-SPI snapshot remains available. Full checkpoints recur after eight observations by default, on geometry or large visual changes, or with `force_checkpoint: true`; adaptive images share 4 MiB, 4 megapixel, and 3,072 32-pixel-patch caps. The [ShowUI](https://openaccess.thecvf.com/content/CVPR2025/html/Lin_ShowUI_One_Vision-Language-Action_Model_for_GUI_Visual_Agent_CVPR_2025_paper.html) training result motivates this heuristic but does not measure its inference behavior.
 
+Pass the originating `observation_id` with element-targeted `click` and `scroll`, plus `perform_action` and `set_value`. Missing, expired, evicted, target-mismatched, and same-target stale IDs are rejected. Element clicks and scrolls are reverified against the exact window, snapshot node, and live AT-SPI bounds before pointer injection. `perform_action` also invokes the unique live action matching its observed name/description fingerprint.
+
 **Input**
 
 - `click` — by element index, semantic selector, or desktop coordinate pixels
 - `drag` — desktop coordinate drag (start / end)
-- `scroll` — page-based scroll on an element or at a pixel location
+- `scroll` — page-based scroll on an observed element or at a pixel location
 - `press_key` — keys / chords; can focus a window or terminal first
 - `type_text` — literal text input, optionally targeted at a window or terminal
 
@@ -357,7 +359,7 @@ files.
 
 ## Architecture
 
-- **Accessibility tree** — [`atspi`](https://crates.io/crates/atspi) crate (tokio backend) talks to the AT-SPI registry on the user session bus. The tree is flattened to `(role, name, text, states, bounds)` tuples and indexed; element indices are stable for the duration of a `get_app_state` snapshot.
+- **Accessibility tree** — [`atspi`](https://crates.io/crates/atspi) crate (tokio backend) talks to the AT-SPI registry on the user session bus. The tree is flattened to `(role, name, text, states, bounds)` tuples and indexed; each bounded snapshot has an opaque `observation_id` and replaces the previous generation for the same target.
 - **DBus where desktops expose it** — [`zbus`](https://crates.io/crates/zbus) for portal calls (`org.freedesktop.portal.Screenshot`, `…RemoteDesktop`, `…ScreenCast`), GNOME Shell screenshots (`org.gnome.Shell.Screenshot`), the bundled GNOME extension's `dev.avifenesh.ComputerUseLinux.WindowControl` service, and temporary KWin scripting.
 - **MCP transport** — [`rmcp`](https://crates.io/crates/rmcp) with the `transport-io` feature; stdio framing, no network.
 - **Input fallback** — coordinate-bearing pointer actions use absolute uinput or write through `ydotoold`; the remote-desktop portal is limited to input that needs no screenshot-pixel mapping. `install.sh` can configure `ydotoold`; the `setup` command only enables the GNOME AT-SPI bridge.

@@ -1,19 +1,28 @@
+use crate::accessibility_snapshot::{
+    AccessibilitySnapshot, AccessibilitySnapshotStore, AccessibilitySnapshotTarget,
+};
 use crate::action_batch::{
-    execute_action_batch, ActionBatchOutput, ActionBatchParams, ActionOutput, BatchAction,
-    BatchActionRun, BatchClick, NON_EDITABLE_TEXT_LANDING_WARNING,
+    bounded_action_result_message, execute_action_batch, ActionBatchOutput, ActionBatchParams,
+    ActionOutput, BatchAction, BatchActionRun, BatchClick, NON_EDITABLE_TEXT_LANDING_WARNING,
     NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING,
 };
 use crate::atspi_tree::{
-    focused_element_summary, list_accessible_apps, perform_action as invoke_accessibility_action,
-    set_element_value, snapshot_compact_tree, AccessibilityAction, AccessibilityNode,
-    AccessibleAppSummary, Bounds, FocusedElementSummary, ValueSetInvocation,
+    focused_element_summary, list_accessible_apps, perform_action_by_identity, set_element_value,
+    snapshot_compact_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
+    ActionFingerprint, Bounds, FocusedElementSummary, ValueSetInvocation,
 };
+use crate::desktop_transaction::DesktopTransaction;
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
 use crate::input_policy::PointerInputOverrides;
 use crate::observation::{
     prepare_visual_captures, AdaptiveObservationMetadata, ObservationMode, ObservationRegion,
     ObservationTracker, VisualObservationKind, VisualPlan, DEFAULT_CHECKPOINT_INTERVAL,
+};
+use crate::pointer_dispatch::{
+    observed_element_pointer_target, pointer_dispatch_verification, run_verified_pointer_dispatch,
+    verify_pointer_dispatch, ObservedElementPointer, PointerDispatchBoundary,
+    PointerDispatchVerification,
 };
 use crate::remote_desktop::{
     keysyms_for_text, press_keycode_chord, scroll as portal_scroll, start_portal_keyboard_session,
@@ -24,6 +33,7 @@ use crate::screenshot::{
     capture_screenshot_raw, capture_screenshot_raw_recent, prepare_screenshot_payload,
     RawScreenshotCapture, ScreenshotCapture, ScreenshotOutputFormat, ScreenshotPayloadOptions,
 };
+use crate::scroll_target::{resolve_observed_scroll_target, ScrollTargetRequest};
 use crate::windowing::capture_window_exact;
 use crate::windowing::registry;
 use crate::windows::{
@@ -56,6 +66,9 @@ use tokio::{
 };
 use zbus::{Connection as ZbusConnection, Proxy as ZbusProxy};
 
+#[path = "click_target.rs"]
+mod click_target;
+
 const YDOTOOL_TIMEOUT: Duration = Duration::from_secs(10);
 const YDOTOOL_TYPE_CHARS_PER_SECOND: u64 = 20;
 const KDE_CLIPBOARD_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
@@ -72,7 +85,7 @@ struct DiagnosticsCache {
 
 #[derive(Clone, Default)]
 pub struct ComputerUseLinux {
-    last_nodes: Arc<Mutex<Vec<AccessibilityNode>>>,
+    accessibility_snapshots: Arc<Mutex<AccessibilitySnapshotStore>>,
     observation_tracker: Arc<Mutex<ObservationTracker>>,
     adaptive_observation_lock: Arc<tokio::sync::Mutex<()>>,
     portal_pointer_session: Arc<Mutex<Option<PortalPointerSession>>>,
@@ -81,7 +94,7 @@ pub struct ComputerUseLinux {
     abs_pointer: Arc<Mutex<Option<crate::abs_pointer::AbsPointer>>>,
     portal_keyboard_init_lock: Arc<tokio::sync::Mutex<()>>,
     kde_clipboard_lock: Arc<tokio::sync::Mutex<()>>,
-    action_batch_lock: Arc<tokio::sync::Mutex<()>>,
+    desktop_transaction: DesktopTransaction,
     /// Cached logical desktop size (union of monitors) from the most recent
     /// full-frame capture; used for off-screen window/coordinate warnings.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
@@ -295,6 +308,16 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<ActivateWindowParams>,
     ) -> Json<ActivateWindowOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.activate_window_unlocked(params).await })
+            .await
+    }
+
+    async fn activate_window_unlocked(
+        &self,
+        params: ActivateWindowParams,
+    ) -> Json<ActivateWindowOutput> {
         let target = params.into_target();
         let received = Some(serde_json::json!(target.clone()));
         match focus_window_target(&target).await {
@@ -327,7 +350,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Legacy calls return a full observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
+        description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Successful accessibility snapshots include an opaque observation_id that must be echoed for element-targeted clicks, element-targeted scrolls, and direct semantic actions. Legacy calls return a full visual observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<GetAppStateOutput>(),
         annotations(
             read_only_hint = true,
@@ -339,6 +362,16 @@ impl ComputerUseLinux {
     async fn get_app_state(
         &self,
         Parameters(params): Parameters<GetAppStateParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.get_app_state_unlocked(params).await })
+            .await
+    }
+
+    async fn get_app_state_unlocked(
+        &self,
+        params: GetAppStateParams,
     ) -> Result<CallToolResult, ErrorData> {
         let observation_mode = params.observation_mode;
         let adaptive = observation_mode == Some(ObservationMode::Adaptive);
@@ -366,27 +399,47 @@ impl ComputerUseLinux {
                 return (None, None);
             }
 
+            if screenshot_target_requested && window_context.is_none() {
+                let error = window_error
+                    .as_deref()
+                    .unwrap_or("the requested target window could not be resolved");
+                return (
+                    None,
+                    Some(format!(
+                        "targeted screenshot window resolution failed: {error}; refusing to capture the full desktop"
+                    )),
+                );
+            }
+
             let exact_capture = match window_context.as_ref() {
                 Some(window) => match capture_window_exact(window).await {
                     Ok(capture) => capture,
-                    Err(error) => return (None, Some(format!("{error:#}"))),
+                    Err(error) => {
+                        return (
+                            None,
+                            Some(format!(
+                                "targeted exact window capture failed: {error:#}; refusing to capture the full desktop"
+                            )),
+                        );
+                    }
                 },
                 None => None,
             };
             let use_exact_capture = exact_capture.is_some();
+            let bounds = if screenshot_target_requested && !use_exact_capture {
+                match validated_target_bounds(window_context.as_ref()) {
+                    Ok(bounds) => Some(bounds),
+                    Err(error) => return (None, Some(format!("{error:#}"))),
+                }
+            } else {
+                None
+            };
             let raw_capture = match exact_capture {
                 Some(capture) => capture,
                 None => match capture_screenshot_raw_recent().await {
                     Ok(capture) => capture,
                     Err(error) => return (None, Some(format!("{error:#}"))),
                 },
-            };
-            let bounds = if use_exact_capture {
-                None
-            } else {
-                window_context
-                    .as_ref()
-                    .and_then(|window| window.bounds.clone())
             };
             let prepared = tokio::task::spawn_blocking(move || {
                 crop_raw_screenshot(
@@ -440,11 +493,16 @@ impl ComputerUseLinux {
         if window_error.is_some() || screenshot_error.is_some() || accessibility_error.is_some() {
             self.invalidate_diagnostics();
         }
-        if accessibility_error.is_none() {
-            self.cache_nodes(&accessibility_tree);
-        } else {
-            self.clear_cached_nodes();
-        }
+        let accessibility_snapshot_target =
+            accessibility_snapshot_target(&params, window_context.as_ref());
+        let observation_id = accessibility_snapshot_target.as_ref().and_then(|target| {
+            if accessibility_error.is_none() {
+                Some(self.record_accessibility_snapshot(target.clone(), &accessibility_tree))
+            } else {
+                self.invalidate_accessibility_snapshot(target);
+                None
+            }
+        });
 
         let (observation, visual_plan, raw_screenshot) = if adaptive {
             let target_key = window_context.as_ref().map_or_else(
@@ -647,6 +705,7 @@ impl ComputerUseLinux {
             screenshot_error,
             accessibility_tree,
             accessibility_tree_raw_count,
+            observation_id,
             accessibility_coordinate_space: "desktop".to_string(),
             accessibility_error,
             readiness,
@@ -677,24 +736,53 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if params.window_target().is_some() {
+            let owner = self.clone();
+            self.desktop_transaction
+                .run(move || async move { owner.screenshot_unlocked(params).await })
+                .await
+        } else {
+            self.screenshot_unlocked(params).await
+        }
+    }
+
+    async fn screenshot_unlocked(
+        &self,
+        params: ScreenshotParams,
+    ) -> Result<CallToolResult, ErrorData> {
         let target = params.window_target();
         let full_screen = params.full_screen.unwrap_or(false);
         let raise_window = params.raise_window.unwrap_or(true);
         if let Some(target) = target.as_ref().filter(|_| raise_window) {
-            let _ = focus_window_target(target).await;
+            let focus = focus_window_target(target)
+                .await
+                .map_err(|error| screenshot_failure("focus", Some(target), format!("{error:#}")))?;
+            if !focus_satisfies_target(&focus, target) {
+                return Err(screenshot_failure(
+                    "focus_verification",
+                    Some(target),
+                    format!(
+                        "requested window_id {}, focused window_id {:?}",
+                        focus.requested_window.window_id,
+                        focus.focused_window.as_ref().map(|window| window.window_id)
+                    ),
+                ));
+            }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        let window = if let Some(target) = target.as_ref().filter(|_| !full_screen) {
-            let windows = list_windows().await.map_err(|error| {
-                ErrorData::internal_error(format!("window resolution failed: {error:#}"), None)
+        let window = if let Some(target) = target.as_ref() {
+            let windows = if raise_window {
+                registry::list_windows_with_policy(registry::WindowListPolicy::Fresh).await
+            } else {
+                list_windows().await
+            }
+            .map_err(|error| {
+                screenshot_failure("window_resolution", Some(target), format!("{error:#}"))
             })?;
             Some(
                 resolve_window_target(&windows, target)
                     .map_err(|error| {
-                        ErrorData::internal_error(
-                            format!("window resolution failed: {error:#}"),
-                            None,
-                        )
+                        screenshot_failure("window_resolution", Some(target), format!("{error:#}"))
                     })?
                     .clone(),
             )
@@ -705,36 +793,28 @@ impl ComputerUseLinux {
             None
         } else if let Some(window) = window.as_ref() {
             capture_window_exact(window).await.map_err(|error| {
-                ErrorData::internal_error(format!("screenshot failed: {error:#}"), None)
+                screenshot_failure("exact_capture", target.as_ref(), format!("{error:#}"))
             })?
         } else {
             None
         };
         let exact = exact_capture.is_some();
+        let crop = if target.is_none() || full_screen || exact {
+            None
+        } else {
+            Some(validated_target_bounds(window.as_ref()).map_err(|error| {
+                screenshot_failure("window_bounds", target.as_ref(), format!("{error:#}"))
+            })?)
+        };
         let raw_capture = match exact_capture {
             Some(capture) => capture,
             None => capture_screenshot_raw().await.map_err(|error| {
-                ErrorData::internal_error(format!("screenshot failed: {error:#}"), None)
+                screenshot_failure("capture", target.as_ref(), format!("{error:#}"))
             })?,
         };
         if !exact {
             self.cache_desktop_size(raw_capture.width, raw_capture.height);
         }
-        let crop = if full_screen || exact {
-            None
-        } else {
-            Some(
-                window
-                    .as_ref()
-                    .and_then(|window| window.bounds.clone())
-                    .ok_or_else(|| {
-                        ErrorData::internal_error(
-                            "targeted screenshot requires usable window bounds",
-                            None,
-                        )
-                    })?,
-            )
-        };
         let off_screen_note = match crop.as_ref() {
             Some(bounds) => self.off_screen_note_for_bounds(bounds).await,
             None => None,
@@ -751,10 +831,14 @@ impl ComputerUseLinux {
         })
         .await
         .map_err(|error| {
-            ErrorData::internal_error(format!("screenshot preparation task failed: {error}"), None)
+            screenshot_failure(
+                "preparation",
+                target.as_ref(),
+                format!("screenshot preparation task failed: {error}"),
+            )
         })?
         .map_err(|error| {
-            ErrorData::internal_error(format!("screenshot preparation failed: {error}"), None)
+            screenshot_failure("preparation", target.as_ref(), format!("{error:#}"))
         })?;
 
         let mut caption = serde_json::json!({
@@ -831,25 +915,33 @@ impl ComputerUseLinux {
         y: i32,
         button: Option<&str>,
         count: u32,
-    ) -> Option<bool> {
+        verification: Option<&PointerDispatchVerification>,
+    ) -> std::result::Result<Option<bool>, String> {
         if !self.ensure_abs_pointer().await {
-            return None;
+            return Ok(None);
         }
         let btn = crate::abs_pointer::PointerButton::from_name(button);
         let abs_pointer = Arc::clone(&self.abs_pointer);
-        tokio::task::spawn_blocking(move || {
-            let mut guard = abs_pointer.lock().ok()?;
-            let pointer = guard.as_mut()?;
-            Some(pointer.click(x, y, btn, count).is_ok())
-        })
+        run_verified_pointer_dispatch(
+            PointerDispatchBoundary::AbsolutePointer,
+            verify_pointer_dispatch(verification, &self.accessibility_snapshots),
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = abs_pointer.lock().ok()?;
+                    let pointer = guard.as_mut()?;
+                    Some(pointer.click(x, y, btn, count).is_ok())
+                })
+                .await
+                .ok()
+                .flatten()
+            },
+        )
         .await
-        .ok()
-        .flatten()
     }
 
     #[tool(
         name = "click",
-        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata. A plain untargeted element click uses a native AT-SPI action only when that action is explicitly named Click; elements without usable pointer bounds retain the native-action fallback. Targeted elements with bounds, explicit coordinates, other action names, and non-primary clicks use pointer input.",
+        description = "Click an element by index or semantic selector from a specific get_app_state observation_id, or click desktop coordinate pixels from screenshot metadata. A plain left single click with no explicit window selector uses the first observed AT-SPI action directly when it is explicitly named Click; other element clicks require usable bounds and verified pointer input.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -857,9 +949,67 @@ impl ComputerUseLinux {
             open_world_hint = true
         )
     )]
-    async fn click(&self, Parameters(mut params): Parameters<ClickParams>) -> Json<ActionOutput> {
+    async fn click(&self, Parameters(params): Parameters<ClickParams>) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.click_unlocked(params).await })
+            .await
+    }
+
+    async fn click_unlocked(&self, mut params: ClickParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        let window_target = params.window_target();
+        let click_error = |message| {
+            Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "click".to_string(),
+                message,
+                received: received.clone(),
+            })
+        };
+        let mut target = match self.resolve_observed_click_target(&params) {
+            Ok(target) => target,
+            Err(message) => return click_error(message),
+        };
+        if let ClickTarget::ObservedAction(observed) = &target {
+            if let Err(message) = self.verify_observed_click_action_freshness(observed) {
+                return click_error(message);
+            }
+            return match perform_action_by_identity(&observed.object_ref, &observed.action_identity)
+                .await
+            {
+                Ok(invocation) => Json(ActionOutput {
+                    ok: invocation.ok,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message: if invocation.ok {
+                        "Invoked the observation-bound AT-SPI Click action.".to_string()
+                    } else {
+                        "The observation-bound AT-SPI Click action returned false.".to_string()
+                    },
+                    received,
+                }),
+                Err(error) => click_error(error.to_string()),
+            };
+        }
+        let element_targeted = matches!(target, ClickTarget::ObservedCoordinates(_));
+        // Raise the target window first (if specified) so the click lands on the
+        // intended app rather than whatever is stacked on top at that pixel.
+        let mut window_target = params.window_target();
+        let mut pointer_verification = None;
+        if let ClickTarget::ObservedCoordinates(observed) = &target {
+            let point = observed.point;
+            let prepared = match self
+                .prepare_observed_click_target(observed, window_target)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(message) => return click_error(message),
+            };
+            window_target = Some(prepared.0);
+            pointer_verification = Some(prepared.1);
+            target = ClickTarget::Coordinates(point.0, point.1);
+        }
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
                 ok: false,
@@ -869,15 +1019,8 @@ impl ComputerUseLinux {
                 received,
             });
         }
-
-        // Window-relative coordinates must be translated before target
-        // resolution. Other targets resolve first so only pointer input waits
-        // for the window stack to settle after optional focus verification.
-        if params.relative == Some(true) {
-            let target = window_target
-                .as_ref()
-                .expect("relative clicks require a window target");
-            let focus = match self.focus_target_for_input(target).await {
+        if let Some(focus_target) = window_target {
+            let focus = match self.focus_target_for_input(&focus_target).await {
                 Ok(focus) => focus,
                 Err(message) => {
                     return Json(ActionOutput {
@@ -889,49 +1032,25 @@ impl ComputerUseLinux {
                     });
                 }
             };
+            if !element_targeted {
+                pointer_verification =
+                    pointer_dispatch_verification(&focus_target, params.relative, focus.as_ref());
+            }
             tokio::time::sleep(Duration::from_millis(120)).await;
-            let Some(focus) = focus.as_ref() else {
-                return Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message: "Relative coordinate clicks require verified target-window focus."
-                        .to_string(),
-                    received,
-                });
-            };
-            if let Err(message) = apply_window_relative_click_coordinates(&mut params, focus) {
-                return Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message,
-                    received,
-                });
-            }
-        }
-        let target = match self.resolve_click_target(&params) {
-            Ok(target) => target,
-            Err(message) => {
-                return Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message,
-                    received,
-                });
-            }
-        };
-        // Respect an explicit target for every click route. AT-SPI addresses the
-        // element directly and needs no pointer-settle delay after focus.
-        let focus_policy = click_focus_policy(&target, &params);
-        match focus_policy {
-            ClickFocusPolicy::None => {}
-            ClickFocusPolicy::VerifyTarget | ClickFocusPolicy::VerifyTargetAndSettlePointer => {
-                let Some(window_target) = window_target.as_ref() else {
-                    unreachable!("focus policy requires a window target");
+            // Window-relative coordinates: translate by the window's top-left so
+            // the agent can click the pixel it saw in a window-cropped screenshot.
+            if params.relative == Some(true) {
+                let Some(focus) = focus.as_ref() else {
+                    return Json(ActionOutput {
+                        ok: false,
+                        implemented: true,
+                        action: "click".to_string(),
+                        message: "Relative coordinate clicks require verified target-window focus."
+                            .to_string(),
+                        received,
+                    });
                 };
-                if let Err(message) = self.focus_target_for_input(window_target).await {
+                if let Err(message) = apply_window_relative_click_coordinates(&mut params, focus) {
                     return Json(ActionOutput {
                         ok: false,
                         implemented: true,
@@ -940,55 +1059,12 @@ impl ComputerUseLinux {
                         received,
                     });
                 }
+                let point = params.x.zip(params.y).expect("validated coordinates");
+                target = ClickTarget::Coordinates(point.0, point.1);
             }
         }
-        if focus_policy == ClickFocusPolicy::VerifyTargetAndSettlePointer {
-            tokio::time::sleep(Duration::from_millis(120)).await;
-        }
-        if let ClickTarget::PrimaryAction {
-            object_ref,
-            action_name,
-            action_index,
-        } = target
-        {
-            let action_selector = cached_action_selector(action_name.as_deref(), action_index);
-            return match invoke_accessibility_action(&object_ref, Some(&action_selector)).await {
-                Ok(invocation) => Json(ActionOutput {
-                    ok: invocation.ok,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message: if invocation.ok {
-                        format!(
-                            "Invoked the primary AT-SPI action{}. Semantic dispatch is limited to explicitly named untargeted Click actions or elements without usable pointer bounds.",
-                            action_name
-                                .as_deref()
-                                .filter(|name| !name.is_empty())
-                                .map(|name| format!(" ({name})"))
-                                .unwrap_or_default()
-                        )
-                    } else {
-                        format!(
-                            "The primary AT-SPI action{} returned false.",
-                            action_name
-                                .as_deref()
-                                .filter(|name| !name.is_empty())
-                                .map(|name| format!(" ({name})"))
-                                .unwrap_or_default()
-                        )
-                    },
-                    received,
-                }),
-                Err(error) => Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message: error.to_string(),
-                    received,
-                }),
-            };
-        }
         let ClickTarget::Coordinates(x, y) = target else {
-            unreachable!("click target must resolve to coordinates or an AT-SPI action");
+            unreachable!("click target must resolve to coordinates");
         };
         if let Err(message) = self.validate_capture_space_point(x, y).await {
             return Json(ActionOutput {
@@ -1006,28 +1082,32 @@ impl ComputerUseLinux {
         // move, which acceleration + fractional scaling distort) and unlike the
         // portal (per-monitor coordinate scaling + an approval dialog), the
         // absolute pointer lands exactly at the screenshot pixel.
-        if self
+        match self
             .try_abs_click(
                 x,
                 y,
                 params.button.as_deref(),
                 params.click_count.unwrap_or(1).clamp(1, 10),
+                pointer_verification.as_ref(),
             )
             .await
-            == Some(true)
         {
-            return Json(ActionOutput {
-                ok: true,
-                implemented: true,
-                action: "click".to_string(),
-                message: "Action sent through the uinput absolute pointer.".to_string(),
-                received,
-            });
+            Ok(Some(true)) => {
+                return Json(ActionOutput {
+                    ok: true,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message: "Action sent through the uinput absolute pointer.".to_string(),
+                    received,
+                });
+            }
+            Err(message) => return click_error(message),
+            Ok(Some(false) | None) => {}
         }
         if !self.can_fallback_to_ydotool_for_coordinate_action() {
             return Json(portal_coordinate_input_unavailable("click", received));
         }
-        let result = run_ydotool_sequence(&[
+        let sequence = [
             absolute_mousemove_args(x, y),
             vec![
                 "click".to_string(),
@@ -1035,8 +1115,17 @@ impl ComputerUseLinux {
                 click_count,
                 button,
             ],
-        ])
-        .await;
+        ];
+        let result = match run_verified_pointer_dispatch(
+            PointerDispatchBoundary::Ydotool,
+            verify_pointer_dispatch(pointer_verification.as_ref(), &self.accessibility_snapshots),
+            run_ydotool_sequence(&sequence),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => return click_error(message),
+        };
         Json(action_result("click", result, received))
     }
 
@@ -1054,41 +1143,74 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<ActionBatchParams>,
     ) -> Json<ActionBatchOutput> {
-        let _batch_guard = self.action_batch_lock.lock().await;
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.run_action_batch_unlocked(params).await })
+            .await
+    }
+
+    async fn run_action_batch_unlocked(
+        &self,
+        params: ActionBatchParams,
+    ) -> Json<ActionBatchOutput> {
         if let Err(error) = self.validate_action_batch(&params) {
             return Json(ActionBatchOutput::validation_error(error));
         }
 
-        Json(
-            execute_action_batch(params, |action, window_id| async move {
-                match action {
-                    BatchAction::Click(click) => {
-                        let Json(result) = self
-                            .click(Parameters(click.into_click_params(window_id)))
-                            .await;
-                        BatchActionRun::Completed(result)
-                    }
-                    BatchAction::TypeText { text } => {
-                        let Json(result) = self
-                            .type_text(Parameters(TypeTextParams::for_window(window_id, text)))
-                            .await;
-                        BatchActionRun::text(result)
-                    }
-                    BatchAction::PressKey { key } => {
-                        let Json(result) = self
-                            .press_key(Parameters(PressKeyParams::for_window(window_id, key)))
-                            .await;
-                        BatchActionRun::Completed(result)
-                    }
-                }
-            })
-            .await,
+        Json(self.execute_validated_action_batch_unlocked(params).await)
+    }
+
+    #[tool(
+        name = "run_action_batch_and_observe",
+        description = "Run the same validated, ordered, fail-fast input batch as run_action_batch, then return a window-scoped adaptive observation in the same call. Validation failures do not capture state; once execution starts, post-action state is captured even if an action fails so the caller can recover.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ActionBatchAndObserveOutput>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
         )
+    )]
+    async fn run_action_batch_and_observe(
+        &self,
+        Parameters(params): Parameters<ActionBatchAndObserveParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.run_action_batch_and_observe_unlocked(params).await })
+            .await
+    }
+
+    async fn run_action_batch_and_observe_unlocked(
+        &self,
+        params: ActionBatchAndObserveParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(error) = self.validate_action_batch(&params.batch) {
+            return action_batch_and_observation_tool_result(
+                ActionBatchOutput::validation_error(error),
+                PostActionObservationResult::NotAttempted,
+            );
+        }
+
+        let window_id = params.batch.window_id;
+        let batch = self
+            .execute_validated_action_batch_unlocked(params.batch)
+            .await;
+        let observation = match self
+            .get_app_state(Parameters(
+                params.observation.into_get_app_state_params(window_id),
+            ))
+            .await
+        {
+            Ok(observation) => PostActionObservationResult::Completed(observation),
+            Err(error) => PostActionObservationResult::Failed(error),
+        };
+        action_batch_and_observation_tool_result(batch, observation)
     }
 
     #[tool(
         name = "perform_action",
-        description = "Invoke an accessibility action exposed by an element selected by index, identifier, or semantic selector. Defaults to the primary action unless action is provided.",
+        description = "Invoke an accessibility action exposed by an element selected by index, identifier, or semantic selector from a specific get_app_state observation_id. The action is also resolved from that observation and invoked by a field-preserving name/description fingerprint. Defaults to the first observed action unless action is provided.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1100,14 +1222,19 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<ActionParams>,
     ) -> Json<ActionOutput> {
-        let requested_action = requested_or_primary_action(params.action.as_deref());
-        self.perform_element_action(&params, Some(requested_action))
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.perform_action_unlocked(params).await })
             .await
+    }
+
+    async fn perform_action_unlocked(&self, params: ActionParams) -> Json<ActionOutput> {
+        self.perform_element_action(&params).await
     }
 
     #[tool(
         name = "set_value",
-        description = "Set the value of a settable accessibility element selected by index, identifier, or semantic selector.",
+        description = "Set the value of a settable accessibility element selected by index, identifier, or semantic selector from a specific get_app_state observation_id.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1119,8 +1246,16 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<SetValueParams>,
     ) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.set_value_unlocked(params).await })
+            .await
+    }
+
+    async fn set_value_unlocked(&self, params: SetValueParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let object_ref = match self.resolve_object_ref(
+            Some(params.observation_id.as_str()),
             params.element_index,
             params.element_identifier.as_deref(),
             &params.selector(),
@@ -1165,7 +1300,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "scroll",
-        description = "Scroll an element in a direction by a number of pages. With a window target and no x/y/element_index, scrolls at the centre of the targeted window.",
+        description = "Scroll an element from a specific get_app_state observation_id, desktop coordinates, the targeted window centre, or the current pointer position.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1173,12 +1308,50 @@ impl ComputerUseLinux {
             open_world_hint = true
         )
     )]
-    async fn scroll(&self, Parameters(mut params): Parameters<ScrollParams>) -> Json<ActionOutput> {
+    async fn scroll(&self, Parameters(params): Parameters<ScrollParams>) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.scroll_unlocked(params).await })
+            .await
+    }
+
+    async fn scroll_unlocked(&self, mut params: ScrollParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
+        let scroll_error = |message| {
+            Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "scroll".to_string(),
+                message,
+                received: received.clone(),
+            })
+        };
         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
+        let explicit_window_target = params.window_target();
+        let observed_target = match resolve_observed_scroll_target(
+            &self.accessibility_snapshots,
+            ScrollTargetRequest {
+                observation_id: params.observation_id.as_deref(),
+                element_index: params.element_index,
+                x: params.x,
+                y: params.y,
+                relative: params.relative == Some(true),
+                window_target: explicit_window_target.clone(),
+            },
+        ) {
+            Ok(target) => target,
+            Err(message) => return scroll_error(message),
+        };
         // Raise/focus the target window first (parity with click) so wheel
         // events land on the intended app.
-        let window_target = params.window_target();
+        let (window_target, pointer_verification) = if let Some(target) = &observed_target {
+            match target.prepare().await {
+                Ok((window_target, verification)) => (Some(window_target), Some(verification)),
+                Err(message) => return scroll_error(message),
+            }
+        } else {
+            (explicit_window_target, None)
+        };
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
                 ok: false,
@@ -1249,19 +1422,9 @@ impl ComputerUseLinux {
                 }
             }
         }
-        let target_point =
-            match self.resolve_optional_target_point(params.x, params.y, params.element_index) {
-                Ok(point) => point,
-                Err(message) => {
-                    return Json(ActionOutput {
-                        ok: false,
-                        implemented: true,
-                        action: "scroll".to_string(),
-                        message,
-                        received,
-                    });
-                }
-            };
+        let target_point = observed_target
+            .as_ref()
+            .map_or_else(|| params.x.zip(params.y), |target| Some(target.point()));
         let direction = match params.direction.to_ascii_lowercase().as_str() {
             "up" => ScrollDirection::Up,
             "down" => ScrollDirection::Down,
@@ -1344,7 +1507,16 @@ impl ComputerUseLinux {
             sequence.push(absolute_mousemove_args(x, y));
         }
         sequence.push(wheel_mousemove_args(dx, dy));
-        let result = run_ydotool_sequence(&sequence).await;
+        let result = match run_verified_pointer_dispatch(
+            PointerDispatchBoundary::Ydotool,
+            verify_pointer_dispatch(pointer_verification.as_ref(), &self.accessibility_snapshots),
+            run_ydotool_sequence(&sequence),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => return scroll_error(message),
+        };
         Json(action_result("scroll", result, received))
     }
 
@@ -1359,6 +1531,13 @@ impl ComputerUseLinux {
         )
     )]
     async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.drag_unlocked(params).await })
+            .await
+    }
+
+    async fn drag_unlocked(&self, params: DragParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params));
         for (label, x, y) in [
             ("start", params.start_x, params.start_y),
@@ -1431,6 +1610,13 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<PressKeyParams>,
     ) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.press_key_unlocked(params).await })
+            .await
+    }
+
+    async fn press_key_unlocked(&self, params: PressKeyParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let focus = match self.focus_target_for_input(&params.window_target()).await {
             Ok(focus) => focus,
@@ -1478,6 +1664,13 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<TypeTextParams>,
     ) -> Json<ActionOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.type_text_unlocked(params).await })
+            .await
+    }
+
+    async fn type_text_unlocked(&self, params: TypeTextParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let focus = match self.focus_target_for_input(&params.window_target()).await {
             Ok(focus) => focus,
@@ -1583,6 +1776,13 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<MoveWindowParams>,
     ) -> Json<WindowGeometryOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.move_window_unlocked(params).await })
+            .await
+    }
+
+    async fn move_window_unlocked(&self, params: MoveWindowParams) -> Json<WindowGeometryOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let target = params.target.clone().into_target();
         self.window_geometry_op(received, &target, |window| async move {
@@ -1605,6 +1805,16 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<ResizeWindowParams>,
     ) -> Json<WindowGeometryOutput> {
+        let owner = self.clone();
+        self.desktop_transaction
+            .run(move || async move { owner.resize_window_unlocked(params).await })
+            .await
+    }
+
+    async fn resize_window_unlocked(
+        &self,
+        params: ResizeWindowParams,
+    ) -> Json<WindowGeometryOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let target = params.target.clone().into_target();
         self.window_geometry_op(received, &target, |window| async move {
@@ -1615,20 +1825,124 @@ impl ComputerUseLinux {
 }
 
 fn app_state_tool_result(
-    output: GetAppStateOutput,
+    mut output: GetAppStateOutput,
     screenshots: &[&ScreenshotCapture],
 ) -> Result<CallToolResult, ErrorData> {
+    let screenshot_failed = output.screenshot_error.is_some();
+    if screenshot_failed {
+        output.screenshot = None;
+        output.screenshot_regions.clear();
+    }
     let value = serde_json::to_value(output).map_err(|error| {
         ErrorData::internal_error(format!("failed to serialize app state: {error}"), None)
     })?;
     let mut result = CallToolResult::structured(value);
-    for screenshot in screenshots {
-        result.content.push(Content::image(
-            data_url_payload(&screenshot.data_url),
-            screenshot.mime_type.clone(),
-        ));
+    if !screenshot_failed {
+        for screenshot in screenshots {
+            result.content.push(Content::image(
+                data_url_payload(&screenshot.data_url),
+                screenshot.mime_type.clone(),
+            ));
+        }
     }
     Ok(result)
+}
+
+fn action_batch_and_observation_tool_result(
+    batch: ActionBatchOutput,
+    observation_result: PostActionObservationResult,
+) -> Result<CallToolResult, ErrorData> {
+    let (mut observation, observation_error, mut images) = match observation_result {
+        PostActionObservationResult::Completed(result) => {
+            let observation = result.structured_content.ok_or_else(|| {
+                ErrorData::internal_error(
+                    "get_app_state returned no structured post-action observation",
+                    None,
+                )
+            })?;
+            let images = result
+                .content
+                .into_iter()
+                .filter(|content| content.raw.as_image().is_some())
+                .collect::<Vec<_>>();
+            (Some(observation), None, images)
+        }
+        PostActionObservationResult::Failed(error) => (
+            None,
+            Some(bounded_action_result_message(error.message.as_ref())),
+            Vec::new(),
+        ),
+        PostActionObservationResult::NotAttempted => (None, None, Vec::new()),
+    };
+    if let Some(observation) = observation.as_mut() {
+        bound_model_visible_json_strings(observation);
+    }
+    let mut value = serde_json::to_value(ActionBatchAndObserveOutput {
+        batch,
+        observation,
+        observation_error,
+    })
+    .map_err(|error| {
+        ErrorData::internal_error(
+            format!("failed to serialize batch and observation result: {error}"),
+            None,
+        )
+    })?;
+    const MAX_STRUCTURED_BYTES: usize = 8 * 1024;
+    let mut tree_truncated = false;
+    loop {
+        if tree_truncated {
+            value["observation_error"] = serde_json::Value::String(
+                "The post-action accessibility tree was truncated to keep the combined result bounded. Call get_app_state if more nodes are needed."
+                    .to_string(),
+            );
+        }
+        if serde_json::to_vec(&value)
+            .is_ok_and(|serialized| serialized.len() <= MAX_STRUCTURED_BYTES)
+        {
+            break;
+        }
+        let Some(tree) = value
+            .get_mut("observation")
+            .and_then(|observation| observation.get_mut("accessibility_tree"))
+            .and_then(serde_json::Value::as_array_mut)
+            .filter(|tree| !tree.is_empty())
+        else {
+            value["observation"] = serde_json::Value::Null;
+            value["observation_error"] = serde_json::Value::String(
+                "The post-action observation exceeded the combined result limit. Call get_app_state to retrieve current state."
+                    .to_string(),
+            );
+            images.clear();
+            break;
+        };
+        tree.truncate(tree.len() / 2);
+        tree_truncated = true;
+    }
+    let mut result = CallToolResult::structured(value);
+    result.content.extend(images);
+    Ok(result)
+}
+
+fn bound_model_visible_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = bounded_action_result_message(text),
+        serde_json::Value::Array(values) => {
+            values.iter_mut().for_each(bound_model_visible_json_strings);
+        }
+        serde_json::Value::Object(values) => {
+            values
+                .values_mut()
+                .for_each(bound_model_visible_json_strings);
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+enum PostActionObservationResult {
+    NotAttempted,
+    Completed(CallToolResult),
+    Failed(ErrorData),
 }
 
 #[tool_handler(
@@ -1639,7 +1953,7 @@ fn app_state_tool_result(
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.5.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/drag through absolute uinput or ydotool, send targeted scroll through ydotool, send untargeted relative scroll and layout-safe key input through the Wayland remote desktop portal, and send literal type_text through KDE clipboard integration on Plasma Wayland. The portal is never used for screenshot-pixel coordinates because its API defines no safe screenshot-to-pointer transform; click/drag are refused when neither absolute uinput nor an allowed working ydotool backend is available, and targeted scroll is refused without allowed ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id when avoiding model round trips matters; batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot results warn when a target window is partially or fully off-screen, and coordinate input outside the captured desktop bounds is rejected; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/drag through absolute uinput or ydotool, send targeted scroll through ydotool, send untargeted relative scroll and layout-safe key input through the Wayland remote desktop portal, and send literal type_text through KDE clipboard integration on Plasma Wayland. The portal is never used for screenshot-pixel coordinates because its API defines no safe screenshot-to-pointer transform; click/drag are refused when neither absolute uinput nor an allowed working ydotool backend is available, and targeted scroll is refused without allowed ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click and scroll, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot results warn when a target window is partially or fully off-screen, and coordinate input outside the captured desktop bounds is rejected; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. Coordinate scrolls accept the same window targeting and relative coordinates as click; element-targeted scrolls require observation_id and use verified absolute element bounds. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -1864,6 +2178,85 @@ impl GetAppStateParams {
     }
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct PostActionObservationParams {
+    /// Opaque checkpoint ID from the caller's last adaptive observation.
+    #[serde(default)]
+    base_checkpoint_id: Option<String>,
+    /// Adaptive full-checkpoint interval, clamped to 1..=32 (default 8).
+    #[serde(default)]
+    checkpoint_interval: Option<u32>,
+    /// Force the post-action observation to be a full checkpoint.
+    #[serde(default)]
+    force_checkpoint: Option<bool>,
+    #[serde(default)]
+    include_screenshot: Option<bool>,
+    #[serde(default)]
+    max_width: Option<u32>,
+    #[serde(default)]
+    max_height: Option<u32>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    #[serde(default)]
+    scale: Option<f32>,
+    #[serde(default)]
+    format: Option<ScreenshotOutputFormat>,
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 95))]
+    quality: Option<u8>,
+    #[serde(default)]
+    max_nodes: Option<usize>,
+    #[serde(default)]
+    max_depth: Option<u32>,
+}
+
+impl PostActionObservationParams {
+    fn into_get_app_state_params(self, window_id: u64) -> GetAppStateParams {
+        GetAppStateParams {
+            app_name_or_bundle_identifier: None,
+            window_id: Some(window_id),
+            pid: None,
+            tty: None,
+            terminal_pid: None,
+            terminal_command: None,
+            terminal_cwd: None,
+            app_id: None,
+            wm_class: None,
+            title: None,
+            max_nodes: self.max_nodes,
+            max_depth: self.max_depth,
+            include_screenshot: self.include_screenshot,
+            observation_mode: Some(ObservationMode::Adaptive),
+            base_checkpoint_id: self.base_checkpoint_id,
+            checkpoint_interval: self.checkpoint_interval,
+            force_checkpoint: self.force_checkpoint,
+            max_width: self.max_width,
+            max_height: self.max_height,
+            max_bytes: self.max_bytes,
+            scale: self.scale,
+            format: self.format,
+            quality: self.quality,
+            verbose: Some(false),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ActionBatchAndObserveParams {
+    #[serde(flatten)]
+    batch: ActionBatchParams,
+    #[serde(default)]
+    observation: PostActionObservationParams,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct ActionBatchAndObserveOutput {
+    batch: ActionBatchOutput,
+    #[schemars(with = "Option<GetAppStateOutput>")]
+    observation: Option<serde_json::Value>,
+    observation_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ScreenshotParams {
     #[serde(default)]
@@ -1951,6 +2344,8 @@ struct GetAppStateOutput {
     screenshot_error: Option<String>,
     accessibility_tree: Vec<AccessibilityNode>,
     accessibility_tree_raw_count: usize,
+    /// Opaque ID for this bounded accessibility snapshot.
+    observation_id: Option<String>,
     accessibility_coordinate_space: String,
     accessibility_error: Option<String>,
     /// Compact readiness summary (always present).
@@ -2044,6 +2439,9 @@ impl ScreenshotMetadata {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ClickParams {
+    /// Opaque ID returned by get_app_state. Required for element-based clicks.
+    #[serde(default)]
+    observation_id: Option<String>,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -2118,6 +2516,7 @@ impl ClickParams {
 impl BatchClick {
     fn into_click_params(self, window_id: u64) -> ClickParams {
         ClickParams {
+            observation_id: self.observation_id,
             element_index: self.element_index,
             role: self.role,
             name: self.name,
@@ -2139,6 +2538,8 @@ impl BatchClick {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ActionParams {
+    /// Opaque ID returned by get_app_state for the selected element.
+    observation_id: String,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -2168,6 +2569,8 @@ impl ActionParams {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct SetValueParams {
+    /// Opaque ID returned by get_app_state for the selected element.
+    observation_id: String,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -2196,6 +2599,9 @@ impl SetValueParams {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct ScrollParams {
+    /// Required with element_index; returned by the originating get_app_state.
+    #[serde(default)]
+    observation_id: Option<String>,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -2366,13 +2772,42 @@ impl TypeTextParams {
 }
 
 impl ComputerUseLinux {
+    async fn execute_validated_action_batch_unlocked(
+        &self,
+        params: ActionBatchParams,
+    ) -> ActionBatchOutput {
+        execute_action_batch(params, |action, window_id| async move {
+            match action {
+                BatchAction::Click(click) => {
+                    let Json(result) = self
+                        .click(Parameters(click.into_click_params(window_id)))
+                        .await;
+                    BatchActionRun::Completed(result)
+                }
+                BatchAction::TypeText { text } => {
+                    let Json(result) = self
+                        .type_text(Parameters(TypeTextParams::for_window(window_id, text)))
+                        .await;
+                    BatchActionRun::text(result)
+                }
+                BatchAction::PressKey { key } => {
+                    let Json(result) = self
+                        .press_key(Parameters(PressKeyParams::for_window(window_id, key)))
+                        .await;
+                    BatchActionRun::Completed(result)
+                }
+            }
+        })
+        .await
+    }
+
     fn validate_action_batch(&self, params: &ActionBatchParams) -> Result<(), String> {
         params.validate()?;
         for (index, action) in params.actions.iter().enumerate() {
             match action {
                 BatchAction::Click(click) => {
                     let click = click.clone().into_click_params(params.window_id);
-                    self.resolve_click_target(&click)
+                    self.resolve_observed_click_target(&click)
                         .map_err(|error| format!("actions[{index}] is invalid: {error}"))?;
                 }
                 BatchAction::PressKey { key } if key_sequence(key).is_none() => {
@@ -2872,151 +3307,122 @@ impl ComputerUseLinux {
         notes
     }
 
-    fn cache_nodes(&self, nodes: &[AccessibilityNode]) {
-        if let Ok(mut cached) = self.last_nodes.lock() {
-            cached.clear();
-            cached.extend_from_slice(nodes);
-        }
-    }
-
-    fn clear_cached_nodes(&self) {
-        if let Ok(mut cached) = self.last_nodes.lock() {
-            cached.clear();
-        }
-    }
-
-    fn resolve_optional_target_point(
+    fn record_accessibility_snapshot(
         &self,
-        x: Option<i32>,
-        y: Option<i32>,
-        element_index: Option<u32>,
-    ) -> std::result::Result<Option<(i32, i32)>, String> {
-        match (x.zip(y), element_index) {
-            (Some(point), _) => Ok(Some(point)),
-            (None, Some(index)) => self
-                .center_for_cached_node(index)
-                .map(Some)
-                .ok_or_else(|| {
-                    format!(
-                        "No clickable bounds cached for element_index {index}. Call get_app_state first and choose a node with positive width and height."
-                    )
-                }),
-            (None, None) => Ok(None),
-        }
+        target: AccessibilitySnapshotTarget,
+        nodes: &[AccessibilityNode],
+    ) -> String {
+        self.accessibility_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(target, nodes)
     }
 
-    fn resolve_click_target(
+    fn invalidate_accessibility_snapshot(&self, target: &AccessibilitySnapshotTarget) {
+        self.accessibility_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .invalidate(target);
+    }
+
+    fn accessibility_snapshot(
         &self,
-        params: &ClickParams,
-    ) -> std::result::Result<ClickTarget, String> {
-        if let Some((x, y)) = params.x.zip(params.y) {
-            return Ok(ClickTarget::Coordinates(x, y));
-        }
-
-        let selector = params.selector();
-        let node = self.resolve_cached_node(
-            params.element_index,
-            &selector,
-            ElementResolvePurpose::Click,
-        )?;
-        let target_point = node.bounds.as_ref().and_then(bounds_center);
-
-        if let Some(action) = primary_action(node.actions.as_slice())
-            .filter(|action| semantic_action_matches_click(params, action, target_point.is_some()))
-        {
-            return Ok(ClickTarget::PrimaryAction {
-                object_ref: node.object_ref.clone(),
-                action_name: Some(action.name.clone()),
-                action_index: action.index,
-            });
-        }
-
-        target_point
-            .map(|(x, y)| ClickTarget::Coordinates(x, y))
+        observation_id: Option<&str>,
+    ) -> std::result::Result<AccessibilitySnapshot, String> {
+        let observation_id = observation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .ok_or_else(|| {
-                if is_plain_left_click(params.button.as_deref(), params.click_count) {
-                    format!(
-                        "No clickable bounds cached for element_index {}, and the element exposes no primary AT-SPI action.",
-                        node.index
-                    )
-                } else {
-                    format!(
-                        "No clickable bounds cached for element_index {}. Call get_app_state first and choose a node with positive width and height.",
-                        node.index
-                    )
-                }
-            })
-    }
-
-    fn center_for_cached_node(&self, element_index: u32) -> Option<(i32, i32)> {
-        let cached = self.last_nodes.lock().ok()?;
-        let node = cached.iter().find(|node| node.index == element_index)?;
-        bounds_center(node.bounds.as_ref()?)
+                "observation_id is required for element-based actions. Call get_app_state and pass the returned observation_id."
+                    .to_string()
+            })?;
+        self.accessibility_snapshots
+            .lock()
+            .map_err(|_| {
+                "Could not read accessibility observations. Call get_app_state and retry."
+                    .to_string()
+            })?
+            .resolve(observation_id)
     }
 
     fn resolve_object_ref(
         &self,
+        observation_id: Option<&str>,
         element_index: Option<u32>,
         element_identifier: Option<&str>,
         selector: &ElementSelector<'_>,
         purpose: ElementResolvePurpose,
     ) -> std::result::Result<String, String> {
+        self.resolve_observed_node(
+            observation_id,
+            element_index,
+            element_identifier,
+            selector,
+            purpose,
+        )
+        .map(|node| node.object_ref)
+    }
+
+    fn resolve_observed_node(
+        &self,
+        observation_id: Option<&str>,
+        element_index: Option<u32>,
+        element_identifier: Option<&str>,
+        selector: &ElementSelector<'_>,
+        purpose: ElementResolvePurpose,
+    ) -> std::result::Result<AccessibilityNode, String> {
+        let snapshot = self.accessibility_snapshot(observation_id)?;
+        let nodes = snapshot.nodes();
         if let Some(element_identifier) = element_identifier
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            return Ok(element_identifier.to_string());
+            let node = nodes
+                .iter()
+                .find(|node| node.object_ref == element_identifier)
+                .cloned()
+                .ok_or_else(|| {
+                    "element_identifier does not belong to the supplied accessibility observation. Call get_app_state again and use an object_ref from that result."
+                        .to_string()
+                })?;
+            if element_index.is_some_and(|element_index| element_index != node.index) {
+                return Err(
+                    "element_index and element_identifier select different nodes in the supplied accessibility observation."
+                        .to_string(),
+                );
+            }
+            return Ok(node);
         }
-
-        self.resolve_cached_node(element_index, selector, purpose)
-            .map(|node| node.object_ref)
-    }
-
-    fn resolve_cached_node(
-        &self,
-        element_index: Option<u32>,
-        selector: &ElementSelector<'_>,
-        purpose: ElementResolvePurpose,
-    ) -> std::result::Result<AccessibilityNode, String> {
-        let cached = self.last_nodes.lock().map_err(|_| {
-            "Could not read cached accessibility nodes. Call get_app_state and retry.".to_string()
-        })?;
-
         if let Some(element_index) = element_index {
-            return cached
+            return nodes
                 .iter()
                 .find(|node| node.index == element_index)
                 .cloned()
                 .ok_or_else(|| {
                     format!(
-                        "No cached accessibility node for element_index {element_index}. Call get_app_state first."
+                        "No accessibility node for element_index {element_index} exists in the supplied observation. Call get_app_state again."
                     )
                 });
         }
-
         if selector.is_empty() {
             return Err(
-                "Pass element_index, element_identifier, or a semantic selector such as role/name/text/states from the latest get_app_state result."
+                "Pass element_index, element_identifier, or a semantic selector such as role/name/text/states from the supplied get_app_state result."
                     .to_string(),
             );
         }
-
-        resolve_semantic_node(cached.as_slice(), selector, purpose)
+        resolve_semantic_node(nodes, selector, purpose)
     }
 
-    async fn perform_element_action(
-        &self,
-        params: &ActionParams,
-        requested_action: Option<&str>,
-    ) -> Json<ActionOutput> {
+    async fn perform_element_action(&self, params: &ActionParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        let object_ref = match self.resolve_object_ref(
+        let node = match self.resolve_observed_node(
+            Some(params.observation_id.as_str()),
             params.element_index,
             params.element_identifier.as_deref(),
             &params.selector(),
             ElementResolvePurpose::Action,
         ) {
-            Ok(object_ref) => object_ref,
+            Ok(node) => node,
             Err(message) => {
                 return Json(ActionOutput {
                     ok: false,
@@ -3027,8 +3433,21 @@ impl ComputerUseLinux {
                 });
             }
         };
+        let action_identity =
+            match snapshot_action_identity(&node.actions, params.action.as_deref()) {
+                Ok(action_identity) => action_identity,
+                Err(message) => {
+                    return Json(ActionOutput {
+                        ok: false,
+                        implemented: true,
+                        action: "perform_action".to_string(),
+                        message,
+                        received,
+                    });
+                }
+            };
 
-        match invoke_accessibility_action(&object_ref, requested_action).await {
+        match perform_action_by_identity(&node.object_ref, &action_identity).await {
             Ok(invocation) => Json(ActionOutput {
                 ok: invocation.ok,
                 implemented: true,
@@ -3067,36 +3486,17 @@ impl ComputerUseLinux {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum ClickTarget {
     Coordinates(i32, i32),
-    PrimaryAction {
-        object_ref: String,
-        action_name: Option<String>,
-        action_index: i32,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClickFocusPolicy {
-    None,
-    VerifyTarget,
-    VerifyTargetAndSettlePointer,
-}
-
-fn click_focus_policy(target: &ClickTarget, params: &ClickParams) -> ClickFocusPolicy {
-    if params.relative == Some(true) || params.window_target().is_none() {
-        ClickFocusPolicy::None
-    } else if matches!(target, ClickTarget::Coordinates(_, _)) {
-        ClickFocusPolicy::VerifyTargetAndSettlePointer
-    } else {
-        ClickFocusPolicy::VerifyTarget
-    }
+    ObservedCoordinates(click_target::ObservedClickTarget),
+    ObservedAction(click_target::ObservedClickAction),
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ElementResolvePurpose {
-    Click,
+    ObservedClick,
+    ObservedSemanticClick,
     Action,
     SetValue,
 }
@@ -3212,9 +3612,15 @@ fn node_matches_selector(node: &AccessibilityNode, selector: &ElementSelector<'_
 
 fn node_matches_resolve_purpose(node: &AccessibilityNode, purpose: ElementResolvePurpose) -> bool {
     match purpose {
-        ElementResolvePurpose::Click => {
+        ElementResolvePurpose::ObservedClick => {
             node.bounds.as_ref().and_then(bounds_center).is_some()
-                || primary_action_name(&node.actions).is_some()
+        }
+        ElementResolvePurpose::ObservedSemanticClick => {
+            node.bounds.as_ref().and_then(bounds_center).is_some()
+                || node
+                    .actions
+                    .first()
+                    .is_some_and(|action| action.name.trim().eq_ignore_ascii_case("click"))
         }
         ElementResolvePurpose::Action => !node.actions.is_empty(),
         ElementResolvePurpose::SetValue => node.supports_editable_text || node.value.is_some(),
@@ -3298,38 +3704,47 @@ fn is_plain_left_click(button: Option<&str>, click_count: Option<u32>) -> bool {
     matches!(button.to_ascii_lowercase().as_str(), "left" | "primary") && click_count == 1
 }
 
-fn semantic_action_matches_click(
-    params: &ClickParams,
-    action: &AccessibilityAction,
-    has_usable_bounds: bool,
-) -> bool {
-    is_plain_left_click(params.button.as_deref(), params.click_count)
-        && (!has_usable_bounds
-            || (params.window_target().is_none()
-                && action.name.trim().eq_ignore_ascii_case("click")))
-}
-
-fn cached_action_selector(action_name: Option<&str>, action_index: i32) -> String {
-    action_name
+fn snapshot_action_identity(
+    actions: &[AccessibilityAction],
+    requested_action: Option<&str>,
+) -> std::result::Result<ActionFingerprint, String> {
+    let requested_action = requested_action
         .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| action_index.to_string())
-}
-
-fn requested_or_primary_action(action: Option<&str>) -> &str {
-    match action.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(action) => action,
-        None => "0",
+        .filter(|value| !value.is_empty());
+    let action = match requested_action {
+        None => actions.first(),
+        Some(requested_action) => {
+            let mut text_matches = actions.iter().filter(|action| {
+                action.name.trim().eq_ignore_ascii_case(requested_action)
+                    || action
+                        .description
+                        .trim()
+                        .eq_ignore_ascii_case(requested_action)
+            });
+            let text_match = text_matches.next();
+            if text_matches.next().is_some() {
+                return Err(
+                    "The requested AT-SPI action is ambiguous in the supplied accessibility observation."
+                        .to_string(),
+                );
+            }
+            text_match.or_else(|| {
+                requested_action
+                    .parse::<i32>()
+                    .ok()
+                    .and_then(|index| actions.iter().find(|action| action.index == index))
+            })
+        }
     }
-}
+    .ok_or_else(|| {
+        "The requested AT-SPI action was not present in the supplied accessibility observation. Call get_app_state again."
+            .to_string()
+    })?;
 
-fn primary_action(actions: &[AccessibilityAction]) -> Option<&AccessibilityAction> {
-    actions.first()
-}
-
-fn primary_action_name(actions: &[AccessibilityAction]) -> Option<String> {
-    primary_action(actions).map(|action| action.name.clone())
+    ActionFingerprint::new(&action.name, &action.description).ok_or_else(|| {
+        "The selected AT-SPI action has no stable textual identity, so it cannot be invoked safely."
+            .to_string()
+    })
 }
 
 fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
@@ -3495,6 +3910,28 @@ fn accessibility_filter_candidates(window_context: Option<&WindowInfo>) -> Vec<S
     candidates
 }
 
+fn accessibility_snapshot_target(
+    params: &GetAppStateParams,
+    window_context: Option<&WindowInfo>,
+) -> Option<AccessibilitySnapshotTarget> {
+    if let Some(window) = window_context {
+        return Some(AccessibilitySnapshotTarget::Window {
+            window_id: window.window_id,
+            pid: window.pid,
+        });
+    }
+    if let Some(application) = trimmed_nonempty(params.app_name_or_bundle_identifier.as_deref()) {
+        return Some(AccessibilitySnapshotTarget::application(application));
+    }
+    if let Some(pid) = params.pid {
+        return Some(AccessibilitySnapshotTarget::Process(pid));
+    }
+    if params.window_target().has_target() {
+        return None;
+    }
+    Some(AccessibilitySnapshotTarget::Desktop)
+}
+
 fn push_candidate(candidates: &mut Vec<String>, value: Option<&str>) {
     let Some(value) = trimmed_nonempty(value) else {
         return;
@@ -3529,11 +3966,72 @@ fn data_url_payload(data_url: &str) -> String {
         .to_string()
 }
 
+fn screenshot_failure(
+    stage: &'static str,
+    target: Option<&WindowTarget>,
+    error: impl std::fmt::Display,
+) -> ErrorData {
+    let data = target.map(|target| {
+        let mut selector_fields = Vec::new();
+        for (name, present) in [
+            ("tty", target.tty.is_some()),
+            ("terminal_command", target.terminal_command.is_some()),
+            ("terminal_cwd", target.terminal_cwd.is_some()),
+            ("app_id", target.app_id.is_some()),
+            ("wm_class", target.wm_class.is_some()),
+            ("title", target.title.is_some()),
+        ] {
+            if present {
+                selector_fields.push(name);
+            }
+        }
+        serde_json::json!({
+            "stage": stage,
+            "target": {
+                "window_id": target.window_id,
+                "pid": target.pid,
+                "terminal_pid": target.terminal_pid,
+                "selector_fields": selector_fields,
+            },
+            "image_returned": false,
+        })
+    });
+    let error = bounded_screenshot_error(error);
+    ErrorData::internal_error(format!("screenshot {stage} failed: {error}"), data)
+}
+
+fn bounded_screenshot_error(error: impl std::fmt::Display) -> String {
+    const MAX_CHARS: usize = 512;
+    let error = error.to_string();
+    let mut chars = error.chars();
+    let mut bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
 fn session_is_wayland(session_type: Option<&str>, wayland_display: Option<&str>) -> bool {
     match session_type {
         Some(value) => value.eq_ignore_ascii_case("wayland"),
         None => wayland_display.is_some_and(|value| !value.is_empty()),
     }
+}
+
+fn validated_target_bounds(window: Option<&WindowInfo>) -> Result<crate::windowing::WindowBounds> {
+    let bounds = window
+        .and_then(|window| window.bounds.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "targeted screenshot requires resolved window bounds; refusing to capture the full desktop"
+            )
+        })?;
+    window_crop_rect(&bounds).ok_or_else(|| {
+        anyhow::anyhow!(
+            "targeted screenshot has unusable window bounds; refusing to capture the full desktop"
+        )
+    })?;
+    Ok(bounds)
 }
 
 fn crop_raw_screenshot(
@@ -4485,6 +4983,29 @@ mod tests {
     use crate::atspi_tree::{AccessibilityAction, Bounds};
     use crate::windows::{WindowBounds, GNOME_SHELL_EXTENSION_BACKEND};
 
+    fn cache_observation(backend: &ComputerUseLinux, nodes: &[AccessibilityNode]) -> String {
+        backend.record_accessibility_snapshot(AccessibilitySnapshotTarget::Desktop, nodes)
+    }
+
+    fn cache_window_observation(backend: &ComputerUseLinux, nodes: &[AccessibilityNode]) -> String {
+        backend.record_accessibility_snapshot(
+            AccessibilitySnapshotTarget::Window {
+                window_id: 42,
+                pid: Some(4242),
+            },
+            nodes,
+        )
+    }
+
+    fn action(index: i32, name: &str, description: &str) -> AccessibilityAction {
+        AccessibilityAction {
+            index,
+            name: name.to_string(),
+            description: description.to_string(),
+            keybinding: String::new(),
+        }
+    }
+
     #[test]
     fn exported_tool_schemas_omit_unsigned_integer_formats() {
         let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
@@ -4512,10 +5033,232 @@ mod tests {
         assert!(tool.output_schema.is_some());
         assert!(schema.contains("coordinate_width"));
         assert!(schema.contains("checkpoint_id"));
+        assert!(schema.contains("observation_id"));
         assert!(schema.contains("screenshot_regions"));
         assert!(input_schema.contains("base_checkpoint_id"));
         assert!(input_schema.contains("observation_mode"));
         assert!(!schema.contains("data_url"));
+    }
+
+    #[test]
+    fn action_batch_and_observe_schema_exposes_batch_and_adaptive_options() {
+        let tool = ComputerUseLinux::default()
+            .mcp_tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "run_action_batch_and_observe")
+            .unwrap();
+        let input_schema = serde_json::to_string(&tool.input_schema).unwrap();
+        let output_schema = serde_json::to_string(&tool.output_schema).unwrap();
+
+        assert!(tool.output_schema.is_some());
+        assert!(input_schema.contains("window_id"));
+        assert!(input_schema.contains("actions"));
+        assert!(input_schema.contains("observation"));
+        assert!(input_schema.contains("base_checkpoint_id"));
+        assert!(output_schema.contains("batch"));
+        assert!(output_schema.contains("observation"));
+        assert!(output_schema.contains("observation_error"));
+        assert!(output_schema.contains("accessibility_tree"));
+    }
+
+    #[test]
+    fn post_action_observation_is_exact_window_scoped_and_adaptive() {
+        let observation = PostActionObservationParams {
+            base_checkpoint_id: Some("checkpoint-7".to_string()),
+            checkpoint_interval: Some(5),
+            force_checkpoint: Some(true),
+            include_screenshot: Some(false),
+            max_width: Some(800),
+            max_height: Some(600),
+            max_bytes: Some(200_000),
+            scale: Some(0.75),
+            format: Some(ScreenshotOutputFormat::Jpeg),
+            quality: Some(70),
+            max_nodes: Some(80),
+            max_depth: Some(8),
+        };
+
+        assert_eq!(
+            serde_json::to_value(observation.into_get_app_state_params(42)).unwrap(),
+            serde_json::json!({
+                "app_name_or_bundle_identifier": null,
+                "window_id": 42,
+                "pid": null,
+                "tty": null,
+                "terminal_pid": null,
+                "terminal_command": null,
+                "terminal_cwd": null,
+                "app_id": null,
+                "wm_class": null,
+                "title": null,
+                "max_nodes": 80,
+                "max_depth": 8,
+                "include_screenshot": false,
+                "observation_mode": "adaptive",
+                "base_checkpoint_id": "checkpoint-7",
+                "checkpoint_interval": 5,
+                "force_checkpoint": true,
+                "max_width": 800,
+                "max_height": 600,
+                "max_bytes": 200_000,
+                "scale": 0.75,
+                "format": "jpeg",
+                "quality": 70,
+                "verbose": false,
+            })
+        );
+    }
+
+    #[test]
+    fn batch_and_observation_result_carries_observation_images_once() {
+        let batch = ActionBatchOutput {
+            ok: false,
+            completed: 0,
+            failed_at: Some(0),
+            results: Vec::new(),
+            error: Some("Action 0 failed.".to_string()),
+        };
+        let observation = serde_json::json!({"message": "post-action state"});
+        let mut observation_result = CallToolResult::structured(observation.clone());
+        observation_result
+            .content
+            .push(Content::image("AAAA", "image/png"));
+        observation_result
+            .content
+            .push(Content::image("BBBB", "image/png"));
+
+        let result = action_batch_and_observation_tool_result(
+            batch.clone(),
+            PostActionObservationResult::Completed(observation_result),
+        )
+        .unwrap();
+        let expected = serde_json::json!({
+            "batch": batch,
+            "observation": observation,
+            "observation_error": null,
+        });
+        let serialized = serde_json::to_string(&result).unwrap();
+
+        assert_eq!(result.structured_content.as_ref(), Some(&expected));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &result.content[0].raw.as_text().unwrap().text
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(result.content.len(), 3);
+        assert_eq!(serialized.matches("AAAA").count(), 1);
+        assert_eq!(serialized.matches("BBBB").count(), 1);
+    }
+
+    #[test]
+    fn batch_and_observation_result_compacts_oversized_model_context() {
+        let batch = ActionBatchOutput {
+            ok: true,
+            completed: 0,
+            failed_at: None,
+            results: Vec::new(),
+            error: None,
+        };
+        let nodes = (0..128)
+            .map(|index| serde_json::json!({"index": index, "name": "x".repeat(1_000)}))
+            .collect::<Vec<_>>();
+        let mut observation_result = CallToolResult::structured(serde_json::json!({
+            "accessibility_tree": nodes,
+            "message": "post-action state",
+        }));
+        observation_result
+            .content
+            .push(Content::image("AAAA", "image/png"));
+
+        let result = action_batch_and_observation_tool_result(
+            batch,
+            PostActionObservationResult::Completed(observation_result),
+        )
+        .unwrap();
+        let structured = result.structured_content.as_ref().unwrap();
+        let retained_nodes = structured["observation"]["accessibility_tree"]
+            .as_array()
+            .unwrap();
+
+        assert!(serde_json::to_vec(structured).unwrap().len() <= 8 * 1024);
+        assert!(!retained_nodes.is_empty());
+        assert!(retained_nodes.len() < 128);
+        assert!(retained_nodes
+            .iter()
+            .all(|node| node["name"].as_str().unwrap().len() <= 512));
+        assert!(structured["observation_error"]
+            .as_str()
+            .unwrap()
+            .contains("truncated"));
+        assert_eq!(result.content.len(), 2);
+    }
+
+    #[test]
+    fn validation_failure_result_has_no_observation_content() {
+        let batch = ActionBatchOutput::validation_error("invalid batch".to_string());
+        let result = action_batch_and_observation_tool_result(
+            batch.clone(),
+            PostActionObservationResult::NotAttempted,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({
+                "batch": batch,
+                "observation": null,
+                "observation_error": null,
+            }))
+        );
+        assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn observation_failure_preserves_batch_and_bounds_the_error() {
+        let batch = ActionBatchOutput {
+            ok: false,
+            completed: 0,
+            failed_at: Some(0),
+            results: Vec::new(),
+            error: Some("Action 0 failed.".to_string()),
+        };
+        let observation_error =
+            ErrorData::internal_error(format!("post-action failure\n{}", "x".repeat(600)), None);
+        let result = action_batch_and_observation_tool_result(
+            batch.clone(),
+            PostActionObservationResult::Failed(observation_error),
+        )
+        .unwrap();
+        let structured = result.structured_content.unwrap();
+        let error = structured["observation_error"].as_str().unwrap();
+
+        assert_eq!(structured["batch"], serde_json::to_value(batch).unwrap());
+        assert_eq!(structured["observation"], serde_json::Value::Null);
+        assert!(error.len() <= 512);
+        assert!(error.ends_with("... [truncated]"));
+        assert!(!error.contains('\n'));
+        assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn click_scroll_and_semantic_action_schemas_handle_observation_ids() {
+        let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
+        for name in ["click", "scroll", "run_action_batch"] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            assert!(serde_json::to_string(&tool.input_schema)
+                .unwrap()
+                .contains("observation_id"));
+        }
+        for name in ["perform_action", "set_value"] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            assert!(schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "observation_id")));
+        }
     }
 
     #[test]
@@ -4536,6 +5279,36 @@ mod tests {
             ComputerUseLinux::default().validate_action_batch(&params),
             Err("actions[1] has an unsupported key. Use names like Enter, Escape, Tab, ArrowLeft, Ctrl+L, or a single US keyboard letter/digit.".to_string())
         );
+    }
+
+    #[test]
+    fn action_batch_preflight_rejects_mismatched_click_observation() {
+        let backend = ComputerUseLinux::default();
+        let observation_id = cache_window_observation(
+            &backend,
+            &[node(
+                7,
+                Some(Bounds {
+                    x: 10,
+                    y: 20,
+                    width: 100,
+                    height: 40,
+                }),
+            )],
+        );
+        let params = ActionBatchParams {
+            window_id: 41,
+            actions: vec![BatchAction::Click(BatchClick {
+                observation_id: Some(observation_id),
+                element_index: Some(7),
+                ..Default::default()
+            })],
+        };
+
+        assert!(backend
+            .validate_action_batch(&params)
+            .unwrap_err()
+            .contains("does not match the requested target window"));
     }
 
     #[test]
@@ -4568,6 +5341,7 @@ mod tests {
             screenshot_error: None,
             accessibility_tree: Vec::new(),
             accessibility_tree_raw_count: 0,
+            observation_id: None,
             accessibility_coordinate_space: "desktop".to_string(),
             accessibility_error: None,
             readiness: diagnostics.readiness,
@@ -4600,6 +5374,117 @@ mod tests {
         assert_eq!(serialized.matches("AAAA").count(), 1);
         assert_eq!(serialized.matches("BBBB").count(), 1);
         assert_eq!(result.content.len(), 3);
+    }
+
+    #[test]
+    fn failed_app_state_screenshot_cannot_leak_image_content() {
+        let capture = ScreenshotCapture {
+            mime_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,DESKTOP_PIXELS".to_string(),
+            source: "test".to_string(),
+            width: 2,
+            height: 1,
+            coordinate_width: 2,
+            coordinate_height: 1,
+            scale: 1.0,
+            resized: false,
+            bytes: 14,
+            original_bytes: 14,
+            max_bytes: 1024,
+            format: ScreenshotOutputFormat::Png,
+            quality: None,
+        };
+        let diagnostics = doctor_report();
+        let output = GetAppStateOutput {
+            app_name_or_bundle_identifier: None,
+            window_context: None,
+            window_error: None,
+            window_permissions_hint: None,
+            backend: "linux-atspi".to_string(),
+            screenshot: Some(ScreenshotMetadata::from_capture(&capture, None, (0, 0))),
+            screenshot_regions: vec![ScreenshotRegionMetadata::from_capture(
+                ObservationRegion {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 1,
+                },
+                &capture,
+                None,
+                (0, 0),
+            )],
+            screenshot_error: Some(
+                "targeted exact window capture failed; refusing to capture the full desktop"
+                    .to_string(),
+            ),
+            accessibility_tree: Vec::new(),
+            accessibility_tree_raw_count: 0,
+            observation_id: None,
+            accessibility_coordinate_space: "desktop".to_string(),
+            accessibility_error: None,
+            readiness: diagnostics.readiness,
+            diagnostics: None,
+            observation: None,
+            message: "Targeted screenshot failed.".to_string(),
+        };
+
+        let result = app_state_tool_result(output, &[&capture]).unwrap();
+        let serialized = serde_json::to_string(&result).unwrap();
+
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["screenshot"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["screenshot_regions"],
+            serde_json::json!([])
+        );
+        assert!(!serialized.contains("DESKTOP_PIXELS"));
+    }
+
+    #[test]
+    fn targeted_screenshot_errors_include_fail_closed_metadata() {
+        let target = WindowTarget {
+            app_id: Some("org.example.Editor".to_string()),
+            ..Default::default()
+        };
+
+        let error = screenshot_failure(
+            "window_resolution",
+            Some(&target),
+            "app_id matched multiple windows",
+        );
+
+        assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({
+                "stage": "window_resolution",
+                "target": {
+                    "window_id": null,
+                    "pid": null,
+                    "terminal_pid": null,
+                    "selector_fields": ["app_id"],
+                },
+                "image_returned": false,
+            }))
+        );
+    }
+
+    #[test]
+    fn targeted_screenshot_errors_bound_caller_controlled_details() {
+        let unbounded = "x".repeat(20_000);
+        let target = WindowTarget {
+            title: Some(unbounded.clone()),
+            ..Default::default()
+        };
+
+        let error = screenshot_failure("window_resolution", Some(&target), &unbounded);
+        let serialized = serde_json::to_string(&error).unwrap();
+
+        assert!(serialized.len() < 2_000);
+        assert!(!serialized.contains(&unbounded));
     }
 
     #[test]
@@ -4833,6 +5718,74 @@ mod tests {
         let error = crop_raw_screenshot(raw, None, true).unwrap_err();
 
         assert!(error.to_string().contains("requires a resolved window"));
+    }
+
+    #[test]
+    fn targeted_screenshot_requires_bounds_before_desktop_capture() {
+        let mut window = window_info(
+            42,
+            Some("Editor"),
+            Some("org.example.Editor"),
+            Some("Editor"),
+            Some(1234),
+        );
+        window.bounds = None;
+
+        let error = validated_target_bounds(Some(&window)).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires resolved window bounds"));
+        assert!(error
+            .to_string()
+            .contains("refusing to capture the full desktop"));
+    }
+
+    #[test]
+    fn targeted_screenshot_rejects_unusable_bounds_before_desktop_capture() {
+        let mut window = window_info(
+            42,
+            Some("Editor"),
+            Some("org.example.Editor"),
+            Some("Editor"),
+            Some(1234),
+        );
+        window.bounds = Some(WindowBounds {
+            x: Some(10),
+            y: Some(20),
+            width: 0,
+            height: 100,
+        });
+
+        let error = validated_target_bounds(Some(&window)).unwrap_err();
+
+        assert!(error.to_string().contains("unusable window bounds"));
+        assert!(error
+            .to_string()
+            .contains("refusing to capture the full desktop"));
+    }
+
+    #[test]
+    fn targeted_crop_failure_never_returns_the_source_capture() {
+        let raw = RawScreenshotCapture {
+            mime_type: "image/png".to_string(),
+            bytes: b"not a png".to_vec(),
+            source: "desktop-test".to_string(),
+            width: 400,
+            height: 200,
+        };
+        let bounds = WindowBounds {
+            x: Some(50),
+            y: Some(20),
+            width: 200,
+            height: 100,
+        };
+
+        let error = crop_raw_screenshot(raw, Some(&bounds), true).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("targeted screenshot crop failed"));
     }
 
     #[test]
@@ -5297,365 +6250,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_element_index_resolves_to_bounds_center() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-        )]);
-
-        let point = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(point, (60, 40));
-    }
-
-    #[test]
-    fn coordinate_target_overrides_cached_element_index() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-        )]);
-
-        let point = backend
-            .resolve_optional_target_point(Some(200), Some(300), Some(7))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(point, (200, 300));
-    }
-
-    #[test]
-    fn cached_element_index_requires_positive_bounds() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 0,
-                height: 40,
-            }),
-        )]);
-
-        let error = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
-    }
-
-    #[test]
-    fn cached_element_index_ignores_sentinel_bounds() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: i32::MIN,
-                y: i32::MIN,
-                width: 1,
-                height: 1,
-            }),
-        )]);
-
-        let error = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
-    }
-
-    #[test]
-    fn empty_node_cache_clears_stale_element_index() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-        )]);
-        backend.cache_nodes(&[]);
-
-        let error = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
-    }
-
-    #[test]
-    fn bounds_free_plain_click_preserves_primary_action_fallback() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            None,
-            vec![AccessibilityAction {
-                index: 0,
-                name: "activate".to_string(),
-                description: "Activates the element".to_string(),
-                keybinding: String::new(),
-            }],
-        )]);
-
-        let target = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(
-            target,
-            ClickTarget::PrimaryAction {
-                object_ref: ":1.7/org/a11y/atspi/accessible/7".to_string(),
-                action_name: Some("activate".to_string()),
-                action_index: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn plain_element_click_uses_primary_action_with_sentinel_bounds() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            Some(Bounds {
-                x: i32::MIN,
-                y: i32::MIN,
-                width: 1,
-                height: 1,
-            }),
-            vec![click_action()],
-        )]);
-
-        let target = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(
-            target,
-            ClickTarget::PrimaryAction {
-                object_ref: ":1.7/org/a11y/atspi/accessible/7".to_string(),
-                action_name: Some("Click".to_string()),
-                action_index: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn untargeted_plain_click_uses_explicit_click_action_when_bounds_exist() {
-        let backend = ComputerUseLinux::default();
-        let mut action = click_action();
-        action.name = "cLiCk".to_string();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-            vec![action],
-        )]);
-
-        let target = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(
-            target,
-            ClickTarget::PrimaryAction {
-                object_ref: ":1.7/org/a11y/atspi/accessible/7".to_string(),
-                action_name: Some("cLiCk".to_string()),
-                action_index: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn targeted_element_with_bounds_uses_coordinates_even_for_click_action() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-            vec![click_action()],
-        )]);
-
-        let target = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                window_id: Some(42),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(target, ClickTarget::Coordinates(60, 40));
-    }
-
-    #[test]
-    fn non_click_action_with_bounds_uses_coordinates() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-            vec![AccessibilityAction {
-                index: 0,
-                name: "activate".to_string(),
-                description: "Activates the element".to_string(),
-                keybinding: String::new(),
-            }],
-        )]);
-
-        let target = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(target, ClickTarget::Coordinates(60, 40));
-    }
-
-    #[test]
-    fn cached_action_selector_prefers_name_across_index_reordering() {
-        assert_eq!(cached_action_selector(Some("Click"), 0), "Click");
-        assert_eq!(cached_action_selector(Some("Click"), 7), "Click");
-        assert_eq!(cached_action_selector(Some("  "), 7), "7");
-        assert_eq!(cached_action_selector(None, 7), "7");
-    }
-
-    #[test]
-    fn semantic_click_focus_policy_verifies_only_explicit_target_without_pointer_settle() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(7, None, vec![click_action()])]);
-        let untargeted_params = ClickParams {
-            element_index: Some(7),
-            ..Default::default()
-        };
-        let target = backend.resolve_click_target(&untargeted_params).unwrap();
-
-        assert_eq!(
-            click_focus_policy(&target, &untargeted_params),
-            ClickFocusPolicy::None
-        );
-
-        let targeted_params = ClickParams {
-            window_id: Some(42),
-            ..untargeted_params
-        };
-        assert_eq!(
-            click_focus_policy(&target, &targeted_params),
-            ClickFocusPolicy::VerifyTarget
-        );
-        assert_eq!(
-            click_focus_policy(&ClickTarget::Coordinates(10, 20), &targeted_params),
-            ClickFocusPolicy::VerifyTargetAndSettlePointer
-        );
-    }
-
-    #[test]
-    fn explicit_coordinates_override_element_primary_action() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(7, None, vec![click_action()])]);
-
-        let target = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                x: Some(300),
-                y: Some(400),
-                ..Default::default()
-            })
-            .unwrap();
-
-        assert_eq!(target, ClickTarget::Coordinates(300, 400));
-    }
-
-    #[test]
-    fn non_primary_element_clicks_use_coordinates() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-            vec![click_action()],
-        )]);
-
-        for (button, click_count) in [("right", 1), ("middle", 1), ("left", 2)] {
-            let target = backend
-                .resolve_click_target(&ClickParams {
-                    element_index: Some(7),
-                    button: Some(button.to_string()),
-                    click_count: Some(click_count),
-                    ..Default::default()
-                })
-                .unwrap();
-
-            assert_eq!(target, ClickTarget::Coordinates(60, 40));
-        }
-    }
-
-    #[test]
-    fn click_target_requires_bounds_for_non_plain_clicks() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            None,
-            vec![AccessibilityAction {
-                index: 0,
-                name: "Click".to_string(),
-                description: "Clicks the button".to_string(),
-                keybinding: String::new(),
-            }],
-        )]);
-
-        let error = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                button: Some("right".to_string()),
-                ..Default::default()
-            })
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
-    }
-
-    #[test]
     fn absolute_mousemove_uses_coordinate_separator() {
         assert_eq!(
             absolute_mousemove_args(200, 300),
@@ -5955,13 +6549,53 @@ mod tests {
     }
 
     #[test]
-    fn perform_action_defaults_to_primary_action_index() {
-        assert_eq!(requested_or_primary_action(None), "0");
-        assert_eq!(requested_or_primary_action(Some("   ")), "0");
+    fn perform_action_defaults_to_first_snapshot_action() {
+        let actions = [
+            action(4, " open ", " Open item "),
+            action(0, "delete", "Delete item"),
+        ];
+        let expected = ActionFingerprint::new("open", "Open item").unwrap();
+
         assert_eq!(
-            requested_or_primary_action(Some(" show-menu ")),
-            "show-menu"
+            snapshot_action_identity(&actions, None),
+            Ok(expected.clone())
         );
+        assert_eq!(
+            snapshot_action_identity(&actions, Some("   ")),
+            Ok(expected)
+        );
+    }
+
+    #[test]
+    fn text_action_precedes_snapshot_index_fallback() {
+        let actions = [action(0, "delete", ""), action(7, "0", "literal")];
+        let expected = ActionFingerprint::new("0", "literal").unwrap();
+
+        assert_eq!(
+            snapshot_action_identity(&actions, Some("0")),
+            Ok(expected.clone())
+        );
+        assert_eq!(snapshot_action_identity(&actions, Some("7")), Ok(expected));
+        assert!(snapshot_action_identity(&actions, Some("2")).is_err());
+    }
+
+    #[test]
+    fn perform_action_rejects_ambiguous_or_unstable_snapshot_actions() {
+        let duplicate = [
+            action(0, "delete", "remove"),
+            action(1, "archive", "remove"),
+        ];
+        assert!(snapshot_action_identity(&duplicate, Some("remove"))
+            .unwrap_err()
+            .contains("ambiguous"));
+
+        let unnamed = [action(0, "", "")];
+        assert!(snapshot_action_identity(&unnamed, None)
+            .unwrap_err()
+            .contains("no stable textual identity"));
+        assert!(snapshot_action_identity(&unnamed, Some("missing"))
+            .unwrap_err()
+            .contains("not present"));
     }
 
     #[test]
@@ -5981,29 +6615,31 @@ mod tests {
     }
 
     #[test]
-    fn element_identifier_overrides_cached_object_ref() {
+    fn element_identifier_must_belong_to_the_observation() {
         let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(7, None)]);
+        let observation_id = cache_observation(&backend, &[node(7, None)]);
 
-        let object_ref = backend
+        let error = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 Some(7),
                 Some(":1.99/org/a11y/atspi/accessible/3"),
                 &ElementSelector::default(),
                 ElementResolvePurpose::Action,
             )
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(object_ref, ":1.99/org/a11y/atspi/accessible/3");
+        assert!(error.contains("does not belong to the supplied accessibility observation"));
     }
 
     #[test]
     fn element_index_resolves_to_cached_object_ref() {
         let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(7, None)]);
+        let observation_id = cache_observation(&backend, &[node(7, None)]);
 
         let object_ref = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 Some(7),
                 None,
                 &ElementSelector::default(),
@@ -6012,6 +6648,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
+        assert!(backend
+            .resolve_object_ref(
+                None,
+                Some(7),
+                None,
+                &ElementSelector::default(),
+                ElementResolvePurpose::Action,
+            )
+            .unwrap_err()
+            .contains("observation_id is required"));
     }
 
     #[test]
@@ -6021,10 +6667,11 @@ mod tests {
         search_entry.role = "entry".to_string();
         search_entry.name = Some("Search files".to_string());
         search_entry.supports_editable_text = true;
-        backend.cache_nodes(&[search_entry]);
+        let observation_id = cache_observation(&backend, &[search_entry]);
 
         let object_ref = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 None,
                 None,
                 &ElementSelector {
@@ -6048,10 +6695,11 @@ mod tests {
         let mut button = node_with_actions(7, None, vec![click_action()]);
         button.role = "push button".to_string();
         button.name = Some("Close".to_string());
-        backend.cache_nodes(&[label, button]);
+        let observation_id = cache_observation(&backend, &[label, button]);
 
         let object_ref = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 None,
                 None,
                 &ElementSelector {
@@ -6075,10 +6723,11 @@ mod tests {
         entry.role = "entry".to_string();
         entry.name = Some("Search".to_string());
         entry.supports_editable_text = true;
-        backend.cache_nodes(&[label, entry]);
+        let observation_id = cache_observation(&backend, &[label, entry]);
 
         let object_ref = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 None,
                 None,
                 &ElementSelector {
@@ -6099,10 +6748,11 @@ mod tests {
         first.name = Some("Close".to_string());
         let mut second = node_with_actions(9, None, vec![click_action()]);
         second.name = Some("Close".to_string());
-        backend.cache_nodes(&[first, second]);
+        let observation_id = cache_observation(&backend, &[first, second]);
 
         let error = backend
             .resolve_object_ref(
+                Some(&observation_id),
                 None,
                 None,
                 &ElementSelector {
@@ -6119,7 +6769,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_click_selector_resolves_primary_action() {
+    fn semantic_click_selector_resolves_observation_bound_action() {
         let backend = ComputerUseLinux::default();
         let mut button = node_with_actions(
             7,
@@ -6132,24 +6782,57 @@ mod tests {
             vec![click_action()],
         );
         button.name = Some("Run".to_string());
-        backend.cache_nodes(&[button]);
+        let observation_id = cache_window_observation(&backend, &[button]);
 
         let target = backend
-            .resolve_click_target(&ClickParams {
+            .resolve_observed_click_target(&ClickParams {
+                observation_id: Some(observation_id),
                 role: Some("button".to_string()),
                 name: Some("run".to_string()),
                 ..Default::default()
             })
             .unwrap();
 
+        let ClickTarget::ObservedAction(target) = target else {
+            panic!("expected an observation-bound AT-SPI action");
+        };
+        assert_eq!(target.object_ref, ":1.7/org/a11y/atspi/accessible/7");
         assert_eq!(
-            target,
-            ClickTarget::PrimaryAction {
-                object_ref: ":1.7/org/a11y/atspi/accessible/7".to_string(),
-                action_name: Some("Click".to_string()),
-                action_index: 0,
-            }
+            target.action_identity,
+            ActionFingerprint::new("Click", "Clicks the element").unwrap()
         );
+    }
+
+    #[test]
+    fn semantic_click_selector_rejects_ambiguous_native_and_pointer_matches() {
+        let backend = ComputerUseLinux::default();
+        let mut action_only = node_with_actions(8, None, vec![click_action()]);
+        action_only.name = Some("Run".to_string());
+        let mut bounded = node_with_actions(
+            7,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 40,
+            }),
+            vec![click_action()],
+        );
+        bounded.name = Some("Run".to_string());
+        let observation_id = cache_window_observation(&backend, &[action_only, bounded]);
+
+        let error = backend
+            .resolve_observed_click_target(&ClickParams {
+                observation_id: Some(observation_id),
+                role: Some("button".to_string()),
+                name: Some("run".to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+
+        assert!(error.contains("matched multiple cached nodes"));
+        assert!(error.contains("element_index 7"));
+        assert!(error.contains("element_index 8"));
     }
 
     #[test]
@@ -6193,6 +6876,7 @@ mod tests {
     #[test]
     fn relative_scroll_translates_coordinates() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: Some(10),
             y: Some(20),
@@ -6221,6 +6905,7 @@ mod tests {
     #[test]
     fn window_targeted_scroll_defaults_to_window_center() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: None,
             y: None,
@@ -6249,6 +6934,7 @@ mod tests {
     #[test]
     fn window_targeted_scroll_without_bounds_errors() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: None,
             y: None,
@@ -6280,6 +6966,7 @@ mod tests {
     #[test]
     fn relative_scroll_rejects_out_of_bounds() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: Some(801),
             y: Some(20),
