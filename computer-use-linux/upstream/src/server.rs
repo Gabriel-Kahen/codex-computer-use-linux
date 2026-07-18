@@ -2736,22 +2736,24 @@ impl ComputerUseLinux {
         ))
     }
 
-    /// Refuse coordinate input unless the point is inside the captured desktop.
-    /// Coordinates are physical capture-space pixels, so compare only against
-    /// the capture rectangle, never logical compositor bounds.
+    /// Refuse coordinate input unless the point is inside a known desktop
+    /// coordinate space. Screenshot coordinates use the physical capture rect,
+    /// while AT-SPI and window-derived coordinates can use a logical monitor
+    /// rect (including monitors placed left of or above the primary display).
     async fn validate_capture_space_point(
         &self,
         x: i32,
         y: i32,
     ) -> std::result::Result<(), String> {
-        let (mx, my, mw, mh) = self.capture_space_rect().await.ok_or_else(|| {
+        let capture_rect = self.capture_space_rect().await.ok_or_else(|| {
             "Could not establish the addressable desktop bounds; refusing coordinate input."
                 .to_string()
         })?;
-        let visible = x >= mx && y >= my && x < mx.saturating_add(mw) && y < my.saturating_add(mh);
-        if !visible {
+        let logical_rects = self.logical_monitor_rects().await.unwrap_or_default();
+        if !point_in_addressable_desktop((x, y), capture_rect, &logical_rects) {
+            let (_, _, width, height) = capture_rect;
             return Err(format!(
-                "Coordinate {x},{y} is outside the addressable desktop ({mw}x{mh}); no input was sent."
+                "Coordinate {x},{y} is outside the addressable desktop ({width}x{height} capture space); no input was sent."
             ));
         }
         Ok(())
@@ -3568,6 +3570,30 @@ fn crop_raw_screenshot(
 
 /// Convert a window's bounds into a crop rectangle, if it has a usable origin
 /// and non-zero size.
+fn point_in_addressable_desktop(
+    point: (i32, i32),
+    capture_rect: (i32, i32, i32, i32),
+    logical_rects: &[(i32, i32, i32, i32)],
+) -> bool {
+    std::iter::once(&capture_rect)
+        .chain(logical_rects)
+        .any(|&(x, y, width, height)| {
+            let (point_x, point_y) = (i64::from(point.0), i64::from(point.1));
+            let (x, y, width, height) = (
+                i64::from(x),
+                i64::from(y),
+                i64::from(width),
+                i64::from(height),
+            );
+            width > 0
+                && height > 0
+                && point_x >= x
+                && point_y >= y
+                && point_x < x + width
+                && point_y < y + height
+        })
+}
+
 fn window_crop_rect(bounds: &crate::windowing::WindowBounds) -> Option<(i32, i32, u32, u32)> {
     let x = bounds.x?;
     let y = bounds.y?;
@@ -5473,22 +5499,24 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn coordinate_validation_rejects_edges_and_negative_points() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_desktop_size(1920, 1080);
+    #[test]
+    fn coordinate_validation_accepts_capture_and_logical_monitor_spaces() {
+        let capture_rect = (0, 0, 1920, 1080);
+        let logical_rects = [(-1400, 0, 1280, 1024), (0, 0, 1920, 1080)];
 
-        assert!(backend.validate_capture_space_point(0, 0).await.is_ok());
-        assert!(backend
-            .validate_capture_space_point(1919, 1079)
-            .await
-            .is_ok());
-        for point in [(-1, 0), (0, -1), (1920, 0), (0, 1080)] {
-            let error = backend
-                .validate_capture_space_point(point.0, point.1)
-                .await
-                .unwrap_err();
-            assert!(error.contains("no input was sent"));
+        for point in [(0, 0), (1919, 1079), (-1400, 0), (-121, 1023)] {
+            assert!(point_in_addressable_desktop(
+                point,
+                capture_rect,
+                &logical_rects
+            ));
+        }
+        for point in [(-1401, 0), (-120, 0), (0, -1), (1920, 0), (0, 1080)] {
+            assert!(!point_in_addressable_desktop(
+                point,
+                capture_rect,
+                &logical_rects
+            ));
         }
     }
 
