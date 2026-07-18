@@ -22,7 +22,7 @@ pub(crate) async fn run_verified_pointer_dispatch<T>(
     Ok(dispatch.await)
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ObservedElementPointer {
     pub(crate) observation_id: String,
     pub(crate) object_ref: String,
@@ -239,7 +239,7 @@ fn ensure_element_point_in_live_bounds(point: (i32, i32), bounds: &Bounds) -> Re
     }
 }
 
-fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
+pub(crate) fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
     if bounds.width <= 0 || bounds.height <= 0 {
         return None;
     }

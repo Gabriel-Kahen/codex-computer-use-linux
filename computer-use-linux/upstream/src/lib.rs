@@ -15,6 +15,7 @@ mod pointer_dispatch;
 mod remote_desktop;
 #[path = "screenshot.rs"]
 mod screenshot_impl;
+mod scroll_target;
 mod server;
 mod terminal;
 mod windowing;

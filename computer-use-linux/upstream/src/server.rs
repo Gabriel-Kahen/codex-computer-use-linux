@@ -34,6 +34,7 @@ use crate::screenshot::{
     capture_screenshot_raw, capture_screenshot_raw_recent, prepare_screenshot_payload,
     RawScreenshotCapture, ScreenshotCapture, ScreenshotOutputFormat, ScreenshotPayloadOptions,
 };
+use crate::scroll_target::{resolve_observed_scroll_target, ScrollTargetRequest};
 use crate::windowing::capture_window_exact;
 use crate::windowing::registry;
 use crate::windows::{
@@ -351,7 +352,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Successful accessibility snapshots include an opaque observation_id that must be echoed for element-targeted clicks and direct semantic actions. Legacy calls return a full visual observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
+        description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Successful accessibility snapshots include an opaque observation_id that must be echoed for element-targeted clicks, element-targeted scrolls, and direct semantic actions. Legacy calls return a full visual observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<GetAppStateOutput>(),
         annotations(
             read_only_hint = true,
@@ -1396,7 +1397,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "scroll",
-        description = "Scroll an element in a direction by a number of pages. With a window target and no x/y/element_index, scrolls at the centre of the targeted window.",
+        description = "Scroll an element from a specific get_app_state observation_id, desktop coordinates, the targeted window centre, or the current pointer position.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1413,10 +1414,42 @@ impl ComputerUseLinux {
 
     async fn scroll_unlocked(&self, mut params: ScrollParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
+        let scroll_error = |message| {
+            Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "scroll".to_string(),
+                message,
+                received: received.clone(),
+            })
+        };
         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
+        let explicit_window_target = params.window_target();
+        let observed_target = match resolve_observed_scroll_target(
+            &self.accessibility_snapshots,
+            ScrollTargetRequest {
+                observation_id: params.observation_id.as_deref(),
+                element_index: params.element_index,
+                x: params.x,
+                y: params.y,
+                relative: params.relative == Some(true),
+                window_target: explicit_window_target.clone(),
+            },
+        ) {
+            Ok(target) => target,
+            Err(message) => return scroll_error(message),
+        };
+        let element_targeted = observed_target.is_some();
         // Raise/focus the target window first (parity with click) so wheel
         // events land on the intended app.
-        let window_target = params.window_target();
+        let (window_target, pointer_verification) = if let Some(target) = &observed_target {
+            match target.prepare().await {
+                Ok((window_target, verification)) => (Some(window_target), Some(verification)),
+                Err(message) => return scroll_error(message),
+            }
+        } else {
+            (explicit_window_target, None)
+        };
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
                 ok: false,
@@ -1487,8 +1520,10 @@ impl ComputerUseLinux {
                 }
             }
         }
-        let target_point =
-            match self.resolve_optional_target_point(params.x, params.y, params.element_index) {
+        let target_point = if let Some(target) = &observed_target {
+            Some(target.point())
+        } else {
+            match self.resolve_optional_target_point(params.x, params.y, None) {
                 Ok(point) => point,
                 Err(message) => {
                     return Json(ActionOutput {
@@ -1499,7 +1534,8 @@ impl ComputerUseLinux {
                         received,
                     });
                 }
-            };
+            }
+        };
         let direction = match params.direction.to_ascii_lowercase().as_str() {
             "up" => ScrollDirection::Up,
             "down" => ScrollDirection::Down,
@@ -1521,7 +1557,10 @@ impl ComputerUseLinux {
             None => None,
         };
 
-        if let Some(session) = self.cached_portal_pointer_session() {
+        if let Some(session) = self
+            .cached_portal_pointer_session()
+            .filter(|_| !element_targeted)
+        {
             match portal_scroll(&session, target_point, direction, units).await {
                 Ok(()) => {
                     return Json(with_notes(
@@ -1537,7 +1576,7 @@ impl ComputerUseLinux {
                 }
                 Err(_) => self.clear_portal_pointer_session(),
             }
-        } else if self.should_prefer_portal_pointer_backend() {
+        } else if !element_targeted && self.should_prefer_portal_pointer_backend() {
             match self.ensure_portal_pointer_session().await {
                 Ok(Some(session)) => {
                     match portal_scroll(&session, target_point, direction, units).await {
@@ -1582,7 +1621,16 @@ impl ComputerUseLinux {
             sequence.push(absolute_mousemove_args(x, y));
         }
         sequence.push(wheel_mousemove_args(dx, dy));
-        let result = run_ydotool_sequence(&sequence).await;
+        let result = match run_verified_pointer_dispatch(
+            PointerDispatchBoundary::Ydotool,
+            verify_pointer_dispatch(pointer_verification.as_ref(), &self.accessibility_snapshots),
+            run_ydotool_sequence(&sequence),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => return scroll_error(message),
+        };
         Json(with_notes(
             action_result("scroll", result, received),
             off_screen_note,
@@ -2003,7 +2051,7 @@ enum PostActionObservationResult {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.5.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. scroll still accepts element_index from the latest get_app_state result. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/scroll/drag and observation-bound element clicks through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click and scroll, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. Coordinate scrolls accept the same window targeting and relative coordinates as click; element-targeted scrolls require observation_id and use verified absolute element bounds. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -2652,6 +2700,9 @@ impl SetValueParams {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct ScrollParams {
+    /// Required with element_index; returned by the originating get_app_state.
+    #[serde(default)]
+    observation_id: Option<String>,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -3514,7 +3565,7 @@ impl ComputerUseLinux {
 
         if selector.is_empty() {
             return Err(
-                "Pass element_index, element_identifier, or a semantic selector such as role/name/text/states from the latest get_app_state result."
+                "Pass element_index, element_identifier, or a semantic selector such as role/name/text/states from a get_app_state result."
                     .to_string(),
             );
         }
@@ -5234,9 +5285,15 @@ mod tests {
     }
 
     #[test]
-    fn click_and_semantic_action_schemas_accept_observation_ids() {
+    fn click_scroll_and_semantic_action_schemas_accept_observation_ids() {
         let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
-        for name in ["click", "perform_action", "set_value", "run_action_batch"] {
+        for name in [
+            "click",
+            "scroll",
+            "perform_action",
+            "set_value",
+            "run_action_batch",
+        ] {
             let tool = tools.iter().find(|tool| tool.name == name).unwrap();
             assert!(serde_json::to_string(&tool.input_schema)
                 .unwrap()
@@ -6887,6 +6944,7 @@ mod tests {
     #[test]
     fn relative_scroll_translates_coordinates() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: Some(10),
             y: Some(20),
@@ -6915,6 +6973,7 @@ mod tests {
     #[test]
     fn window_targeted_scroll_defaults_to_window_center() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: None,
             y: None,
@@ -6943,6 +7002,7 @@ mod tests {
     #[test]
     fn window_targeted_scroll_without_bounds_errors() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: None,
             y: None,
@@ -6974,6 +7034,7 @@ mod tests {
     #[test]
     fn relative_scroll_rejects_out_of_bounds() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: Some(801),
             y: Some(20),
