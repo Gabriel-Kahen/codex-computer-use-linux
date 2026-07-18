@@ -20,8 +20,9 @@ use crate::observation::{
     ObservationTracker, VisualObservationKind, VisualPlan, DEFAULT_CHECKPOINT_INTERVAL,
 };
 use crate::pointer_dispatch::{
-    pointer_dispatch_verification, run_verified_pointer_dispatch, verify_pointer_dispatch,
-    PointerDispatchBoundary, PointerDispatchVerification,
+    observed_element_pointer_target, pointer_dispatch_verification, run_verified_pointer_dispatch,
+    verify_pointer_dispatch, ObservedElementPointer, PointerDispatchBoundary,
+    PointerDispatchVerification,
 };
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_keycode_chord,
@@ -64,6 +65,9 @@ use tokio::{
     time::{sleep, timeout},
 };
 use zbus::{Connection as ZbusConnection, Proxy as ZbusProxy};
+
+#[path = "click_target.rs"]
+mod click_target;
 
 const YDOTOOL_TIMEOUT: Duration = Duration::from_secs(10);
 const YDOTOOL_TYPE_CHARS_PER_SECOND: u64 = 20;
@@ -347,7 +351,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Successful accessibility snapshots include an opaque observation_id. Legacy calls return a full visual observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
+        description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Successful accessibility snapshots include an opaque observation_id that must be echoed for element-targeted clicks and direct semantic actions. Legacy calls return a full visual observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<GetAppStateOutput>(),
         annotations(
             read_only_hint = true,
@@ -943,7 +947,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "click",
-        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata.",
+        description = "Click an element by index or semantic selector from a specific get_app_state observation_id, or click desktop coordinate pixels from screenshot metadata.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -969,10 +973,28 @@ impl ComputerUseLinux {
                 received: received.clone(),
             })
         };
+        let mut target = match self.resolve_observed_click_target(&params) {
+            Ok(target) => target,
+            Err(message) => return click_error(message),
+        };
+        let element_targeted = matches!(target, ClickTarget::ObservedCoordinates(_));
         // Raise the target window first (if specified) so the click lands on the
         // intended app rather than whatever is stacked on top at that pixel.
-        let window_target = params.window_target();
+        let mut window_target = params.window_target();
         let mut pointer_verification = None;
+        if let ClickTarget::ObservedCoordinates(observed) = &target {
+            let point = observed.point;
+            let prepared = match self
+                .prepare_observed_click_target(observed, window_target)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(message) => return click_error(message),
+            };
+            window_target = Some(prepared.0);
+            pointer_verification = Some(prepared.1);
+            target = ClickTarget::Coordinates(point.0, point.1);
+        }
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
                 ok: false,
@@ -982,8 +1004,8 @@ impl ComputerUseLinux {
                 received,
             });
         }
-        if let Some(target) = window_target {
-            let focus = match self.focus_target_for_input(&target).await {
+        if let Some(focus_target) = window_target {
+            let focus = match self.focus_target_for_input(&focus_target).await {
                 Ok(focus) => focus,
                 Err(message) => {
                     return Json(ActionOutput {
@@ -995,8 +1017,10 @@ impl ComputerUseLinux {
                     });
                 }
             };
-            pointer_verification =
-                pointer_dispatch_verification(&target, params.relative, focus.as_ref());
+            if !element_targeted {
+                pointer_verification =
+                    pointer_dispatch_verification(&focus_target, params.relative, focus.as_ref());
+            }
             tokio::time::sleep(Duration::from_millis(120)).await;
             // Window-relative coordinates: translate by the window's top-left so
             // the agent can click the pixel it saw in a window-cropped screenshot.
@@ -1020,20 +1044,10 @@ impl ComputerUseLinux {
                         received,
                     });
                 }
+                let point = params.x.zip(params.y).expect("validated coordinates");
+                target = ClickTarget::Coordinates(point.0, point.1);
             }
         }
-        let target = match self.resolve_click_target(&params) {
-            Ok(target) => target,
-            Err(message) => {
-                return Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message,
-                    received,
-                });
-            }
-        };
         if let ClickTarget::PrimaryAction {
             object_ref,
             action_name,
@@ -1989,7 +2003,7 @@ enum PostActionObservationResult {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.5.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For perform_action and set_value, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; click still accepts element_index or semantic role/name/text/states selectors from the latest get_app_state result. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. scroll still accepts element_index from the latest get_app_state result. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -2475,6 +2489,9 @@ impl ScreenshotMetadata {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ClickParams {
+    /// Opaque ID returned by get_app_state. Required for element-based clicks.
+    #[serde(default)]
+    observation_id: Option<String>,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -2550,6 +2567,7 @@ impl ClickParams {
 impl BatchClick {
     fn into_click_params(self, window_id: u64) -> ClickParams {
         ClickParams {
+            observation_id: self.observation_id,
             element_index: self.element_index,
             role: self.role,
             name: self.name,
@@ -2839,7 +2857,7 @@ impl ComputerUseLinux {
             match action {
                 BatchAction::Click(click) => {
                     let click = click.clone().into_click_params(params.window_id);
-                    self.resolve_click_target(&click)
+                    self.resolve_observed_click_target(&click)
                         .map_err(|error| format!("actions[{index}] is invalid: {error}"))?;
                 }
                 BatchAction::PressKey { key } if key_sequence(key).is_none() => {
@@ -3327,7 +3345,7 @@ impl ComputerUseLinux {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
-                "observation_id is required for direct accessibility actions. Call get_app_state and pass the returned observation_id."
+                "observation_id is required for element-based actions. Call get_app_state and pass the returned observation_id."
                     .to_string()
             })?;
         self.accessibility_snapshots
@@ -3580,6 +3598,7 @@ impl ComputerUseLinux {
 #[derive(Debug)]
 enum ClickTarget {
     Coordinates(i32, i32),
+    ObservedCoordinates(click_target::ObservedClickTarget),
     PrimaryAction {
         object_ref: String,
         action_name: Option<String>,
@@ -3590,6 +3609,7 @@ enum ClickTarget {
 #[derive(Debug, Clone, Copy)]
 enum ElementResolvePurpose {
     Click,
+    ObservedClick,
     Action,
     SetValue,
 }
@@ -3708,6 +3728,9 @@ fn node_matches_resolve_purpose(node: &AccessibilityNode, purpose: ElementResolv
         ElementResolvePurpose::Click => {
             node.bounds.as_ref().and_then(bounds_center).is_some()
                 || primary_action_name(&node.actions).is_some()
+        }
+        ElementResolvePurpose::ObservedClick => {
+            node.bounds.as_ref().and_then(bounds_center).is_some()
         }
         ElementResolvePurpose::Action => !node.actions.is_empty(),
         ElementResolvePurpose::SetValue => node.supports_editable_text || node.value.is_some(),
@@ -4997,6 +5020,16 @@ mod tests {
         backend.record_accessibility_snapshot(AccessibilitySnapshotTarget::Desktop, nodes)
     }
 
+    fn cache_window_observation(backend: &ComputerUseLinux, nodes: &[AccessibilityNode]) -> String {
+        backend.record_accessibility_snapshot(
+            AccessibilitySnapshotTarget::Window {
+                window_id: 42,
+                pid: Some(4242),
+            },
+            nodes,
+        )
+    }
+
     fn action(index: i32, name: &str, description: &str) -> AccessibilityAction {
         AccessibilityAction {
             index,
@@ -5201,9 +5234,9 @@ mod tests {
     }
 
     #[test]
-    fn semantic_action_schemas_accept_observation_ids() {
+    fn click_and_semantic_action_schemas_accept_observation_ids() {
         let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
-        for name in ["perform_action", "set_value"] {
+        for name in ["click", "perform_action", "set_value", "run_action_batch"] {
             let tool = tools.iter().find(|tool| tool.name == name).unwrap();
             assert!(serde_json::to_string(&tool.input_schema)
                 .unwrap()
@@ -5229,6 +5262,36 @@ mod tests {
             ComputerUseLinux::default().validate_action_batch(&params),
             Err("actions[1] has an unsupported key. Use names like Enter, Escape, Tab, ArrowLeft, Ctrl+L, or a single US keyboard letter/digit.".to_string())
         );
+    }
+
+    #[test]
+    fn action_batch_preflight_rejects_mismatched_click_observation() {
+        let backend = ComputerUseLinux::default();
+        let observation_id = cache_window_observation(
+            &backend,
+            &[node(
+                7,
+                Some(Bounds {
+                    x: 10,
+                    y: 20,
+                    width: 100,
+                    height: 40,
+                }),
+            )],
+        );
+        let params = ActionBatchParams {
+            window_id: 41,
+            actions: vec![BatchAction::Click(BatchClick {
+                observation_id: Some(observation_id),
+                element_index: Some(7),
+                ..Default::default()
+            })],
+        };
+
+        assert!(backend
+            .validate_action_batch(&params)
+            .unwrap_err()
+            .contains("does not match the requested target window"));
     }
 
     #[test]
@@ -6283,7 +6346,7 @@ mod tests {
                 assert_eq!(action_name.as_deref(), Some("Click"));
                 assert_eq!(action_index, 0);
             }
-            ClickTarget::Coordinates(_, _) => {
+            ClickTarget::Coordinates(_, _) | ClickTarget::ObservedCoordinates(_) => {
                 panic!("expected AT-SPI primary-action fallback")
             }
         }
@@ -6325,7 +6388,7 @@ mod tests {
                 assert_eq!(action_name.as_deref(), Some("Click"));
                 assert_eq!(action_index, 0);
             }
-            ClickTarget::Coordinates(_, _) => {
+            ClickTarget::Coordinates(_, _) | ClickTarget::ObservedCoordinates(_) => {
                 panic!("expected AT-SPI primary-action fallback")
             }
         }
@@ -6764,17 +6827,23 @@ mod tests {
             vec![click_action()],
         );
         button.name = Some("Run".to_string());
-        backend.cache_nodes(&[button]);
+        let mut action_only = node_with_actions(8, None, vec![click_action()]);
+        action_only.name = Some("Run".to_string());
+        let observation_id = cache_window_observation(&backend, &[action_only, button]);
 
         let target = backend
-            .resolve_click_target(&ClickParams {
+            .resolve_observed_click_target(&ClickParams {
+                observation_id: Some(observation_id),
                 role: Some("button".to_string()),
                 name: Some("run".to_string()),
                 ..Default::default()
             })
             .unwrap();
 
-        assert!(matches!(target, ClickTarget::Coordinates(60, 40)));
+        let ClickTarget::ObservedCoordinates(target) = target else {
+            panic!("expected an observation-bound click target");
+        };
+        assert_eq!(target.point, (60, 40));
     }
 
     #[test]

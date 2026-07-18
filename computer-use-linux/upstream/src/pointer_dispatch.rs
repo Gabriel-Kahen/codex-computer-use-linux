@@ -36,6 +36,33 @@ pub(crate) struct PointerDispatchVerification {
     pub(crate) observed_element: Option<ObservedElementPointer>,
 }
 
+pub(crate) fn observed_element_pointer_target(
+    observed_target: (u64, Option<u32>),
+    observed_element: ObservedElementPointer,
+    window: &WindowInfo,
+) -> Result<(WindowTarget, PointerDispatchVerification), String> {
+    if observed_target != (window.window_id, window.pid) {
+        return Err(format!(
+            "The accessibility observation does not match target window_id {}. Call get_app_state for that exact window and use its observation_id.",
+            window.window_id
+        ));
+    }
+    ensure_element_point_in_window(observed_element.point, window)?;
+    let target = WindowTarget {
+        window_id: Some(window.window_id),
+        pid: window.pid,
+        ..Default::default()
+    };
+    Ok((
+        target,
+        PointerDispatchVerification {
+            exact_window_id: window.window_id,
+            expected_pid: window.pid,
+            observed_element: Some(observed_element),
+        },
+    ))
+}
+
 pub(crate) fn pointer_dispatch_verification(
     target: &WindowTarget,
     relative: Option<bool>,
