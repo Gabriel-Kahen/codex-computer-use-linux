@@ -7,10 +7,9 @@ use crate::action_batch::{
     NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING,
 };
 use crate::atspi_tree::{
-    focused_element_summary, list_accessible_apps, perform_action as invoke_accessibility_action,
-    perform_action_by_identity, set_element_value, snapshot_compact_tree, AccessibilityAction,
-    AccessibilityNode, AccessibleAppSummary, ActionFingerprint, Bounds, FocusedElementSummary,
-    ValueSetInvocation,
+    focused_element_summary, list_accessible_apps, perform_action_by_identity, set_element_value,
+    snapshot_compact_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
+    ActionFingerprint, Bounds, FocusedElementSummary, ValueSetInvocation,
 };
 use crate::desktop_transaction::DesktopTransaction;
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
@@ -86,7 +85,6 @@ struct DiagnosticsCache {
 
 #[derive(Clone, Default)]
 pub struct ComputerUseLinux {
-    last_nodes: Arc<Mutex<Vec<AccessibilityNode>>>,
     accessibility_snapshots: Arc<Mutex<AccessibilitySnapshotStore>>,
     observation_tracker: Arc<Mutex<ObservationTracker>>,
     adaptive_observation_lock: Arc<tokio::sync::Mutex<()>>,
@@ -494,11 +492,6 @@ impl ComputerUseLinux {
             .map_or((None, (0, 0)), |(capture, origin)| (Some(capture), origin));
         if window_error.is_some() || screenshot_error.is_some() || accessibility_error.is_some() {
             self.invalidate_diagnostics();
-        }
-        if accessibility_error.is_none() {
-            self.cache_nodes(&accessibility_tree);
-        } else {
-            self.clear_cached_nodes();
         }
         let accessibility_snapshot_target =
             accessibility_snapshot_target(&params, window_context.as_ref());
@@ -1049,50 +1042,8 @@ impl ComputerUseLinux {
                 target = ClickTarget::Coordinates(point.0, point.1);
             }
         }
-        if let ClickTarget::PrimaryAction {
-            object_ref,
-            action_name,
-            action_index,
-        } = target
-        {
-            let action_index = action_index.to_string();
-            return match invoke_accessibility_action(&object_ref, Some(&action_index)).await {
-                Ok(invocation) => Json(ActionOutput {
-                    ok: invocation.ok,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message: if invocation.ok {
-                        format!(
-                            "No clickable bounds were cached, so I invoked the primary AT-SPI action{}.",
-                            action_name
-                                .as_deref()
-                                .filter(|name| !name.is_empty())
-                                .map(|name| format!(" ({name})"))
-                                .unwrap_or_default()
-                        )
-                    } else {
-                        format!(
-                            "The primary AT-SPI action{} returned false.",
-                            action_name
-                                .as_deref()
-                                .filter(|name| !name.is_empty())
-                                .map(|name| format!(" ({name})"))
-                                .unwrap_or_default()
-                        )
-                    },
-                    received,
-                }),
-                Err(error) => Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message: error.to_string(),
-                    received,
-                }),
-            };
-        }
         let ClickTarget::Coordinates(x, y) = target else {
-            unreachable!("click target must resolve to coordinates or an AT-SPI action");
+            unreachable!("click target must resolve to coordinates");
         };
         let button = mouse_button_code(params.button.as_deref());
         let click_count = params.click_count.unwrap_or(1).clamp(1, 10).to_string();
@@ -1520,22 +1471,9 @@ impl ComputerUseLinux {
                 }
             }
         }
-        let target_point = if let Some(target) = &observed_target {
-            Some(target.point())
-        } else {
-            match self.resolve_optional_target_point(params.x, params.y, None) {
-                Ok(point) => point,
-                Err(message) => {
-                    return Json(ActionOutput {
-                        ok: false,
-                        implemented: true,
-                        action: "scroll".to_string(),
-                        message,
-                        received,
-                    });
-                }
-            }
-        };
+        let target_point = observed_target
+            .as_ref()
+            .map_or_else(|| params.x.zip(params.y), |target| Some(target.point()));
         let direction = match params.direction.to_ascii_lowercase().as_str() {
             "up" => ScrollDirection::Up,
             "down" => ScrollDirection::Down,
@@ -3357,19 +3295,6 @@ impl ComputerUseLinux {
         notes
     }
 
-    fn cache_nodes(&self, nodes: &[AccessibilityNode]) {
-        if let Ok(mut cached) = self.last_nodes.lock() {
-            cached.clear();
-            cached.extend_from_slice(nodes);
-        }
-    }
-
-    fn clear_cached_nodes(&self) {
-        if let Ok(mut cached) = self.last_nodes.lock() {
-            cached.clear();
-        }
-    }
-
     fn record_accessibility_snapshot(
         &self,
         target: AccessibilitySnapshotTarget,
@@ -3406,71 +3331,6 @@ impl ComputerUseLinux {
                     .to_string()
             })?
             .resolve(observation_id)
-    }
-
-    fn resolve_optional_target_point(
-        &self,
-        x: Option<i32>,
-        y: Option<i32>,
-        element_index: Option<u32>,
-    ) -> std::result::Result<Option<(i32, i32)>, String> {
-        match (x.zip(y), element_index) {
-            (Some(point), _) => Ok(Some(point)),
-            (None, Some(index)) => self
-                .center_for_cached_node(index)
-                .map(Some)
-                .ok_or_else(|| {
-                    format!(
-                        "No clickable bounds cached for element_index {index}. Call get_app_state first and choose a node with positive width and height."
-                    )
-                }),
-            (None, None) => Ok(None),
-        }
-    }
-
-    fn resolve_click_target(
-        &self,
-        params: &ClickParams,
-    ) -> std::result::Result<ClickTarget, String> {
-        if let Some((x, y)) = params.x.zip(params.y) {
-            return Ok(ClickTarget::Coordinates(x, y));
-        }
-
-        let selector = params.selector();
-        let node = self.resolve_cached_node(
-            params.element_index,
-            &selector,
-            ElementResolvePurpose::Click,
-        )?;
-
-        if let Some((x, y)) = node.bounds.as_ref().and_then(bounds_center) {
-            return Ok(ClickTarget::Coordinates(x, y));
-        }
-
-        if !is_plain_left_click(params.button.as_deref(), params.click_count) {
-            return Err(format!(
-                "No clickable bounds cached for element_index {}. Call get_app_state first and choose a node with positive width and height.",
-                node.index
-            ));
-        }
-
-        let Some(action) = primary_action(node.actions.as_slice()) else {
-            return Err(format!(
-                "No clickable bounds cached for element_index {}, and the element exposes no primary AT-SPI action.",
-                node.index
-            ));
-        };
-        Ok(ClickTarget::PrimaryAction {
-            object_ref: node.object_ref.clone(),
-            action_name: Some(action.name.clone()),
-            action_index: action.index,
-        })
-    }
-
-    fn center_for_cached_node(&self, element_index: u32) -> Option<(i32, i32)> {
-        let cached = self.last_nodes.lock().ok()?;
-        let node = cached.iter().find(|node| node.index == element_index)?;
-        bounds_center(node.bounds.as_ref()?)
     }
 
     fn resolve_object_ref(
@@ -3539,38 +3399,6 @@ impl ComputerUseLinux {
             );
         }
         resolve_semantic_node(nodes, selector, purpose)
-    }
-
-    fn resolve_cached_node(
-        &self,
-        element_index: Option<u32>,
-        selector: &ElementSelector<'_>,
-        purpose: ElementResolvePurpose,
-    ) -> std::result::Result<AccessibilityNode, String> {
-        let cached = self.last_nodes.lock().map_err(|_| {
-            "Could not read cached accessibility nodes. Call get_app_state and retry.".to_string()
-        })?;
-
-        if let Some(element_index) = element_index {
-            return cached
-                .iter()
-                .find(|node| node.index == element_index)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "No cached accessibility node for element_index {element_index}. Call get_app_state first."
-                    )
-                });
-        }
-
-        if selector.is_empty() {
-            return Err(
-                "Pass element_index, element_identifier, or a semantic selector such as role/name/text/states from a get_app_state result."
-                    .to_string(),
-            );
-        }
-
-        resolve_semantic_node(cached.as_slice(), selector, purpose)
     }
 
     async fn perform_element_action(&self, params: &ActionParams) -> Json<ActionOutput> {
@@ -3650,16 +3478,10 @@ impl ComputerUseLinux {
 enum ClickTarget {
     Coordinates(i32, i32),
     ObservedCoordinates(click_target::ObservedClickTarget),
-    PrimaryAction {
-        object_ref: String,
-        action_name: Option<String>,
-        action_index: i32,
-    },
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ElementResolvePurpose {
-    Click,
     ObservedClick,
     Action,
     SetValue,
@@ -3776,10 +3598,6 @@ fn node_matches_selector(node: &AccessibilityNode, selector: &ElementSelector<'_
 
 fn node_matches_resolve_purpose(node: &AccessibilityNode, purpose: ElementResolvePurpose) -> bool {
     match purpose {
-        ElementResolvePurpose::Click => {
-            node.bounds.as_ref().and_then(bounds_center).is_some()
-                || primary_action_name(&node.actions).is_some()
-        }
         ElementResolvePurpose::ObservedClick => {
             node.bounds.as_ref().and_then(bounds_center).is_some()
         }
@@ -3859,12 +3677,6 @@ fn describe_matching_nodes(nodes: &[&AccessibilityNode]) -> String {
         .join("; ")
 }
 
-fn is_plain_left_click(button: Option<&str>, click_count: Option<u32>) -> bool {
-    let button = button.unwrap_or("left");
-    let click_count = click_count.unwrap_or(1);
-    matches!(button.to_ascii_lowercase().as_str(), "left" | "primary") && click_count == 1
-}
-
 fn snapshot_action_identity(
     actions: &[AccessibilityAction],
     requested_action: Option<&str>,
@@ -3906,14 +3718,6 @@ fn snapshot_action_identity(
         "The selected AT-SPI action has no stable textual identity, so it cannot be invoked safely."
             .to_string()
     })
-}
-
-fn primary_action(actions: &[AccessibilityAction]) -> Option<&AccessibilityAction> {
-    actions.first()
-}
-
-fn primary_action_name(actions: &[AccessibilityAction]) -> Option<String> {
-    primary_action(actions).map(|action| action.name.clone())
 }
 
 fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
@@ -6267,213 +6071,6 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "KDE clipboard proxy creation timed out");
-    }
-
-    #[test]
-    fn cached_element_index_resolves_to_bounds_center() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-        )]);
-
-        let point = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(point, (60, 40));
-    }
-
-    #[test]
-    fn coordinate_target_overrides_cached_element_index() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-        )]);
-
-        let point = backend
-            .resolve_optional_target_point(Some(200), Some(300), Some(7))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(point, (200, 300));
-    }
-
-    #[test]
-    fn cached_element_index_requires_positive_bounds() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 0,
-                height: 40,
-            }),
-        )]);
-
-        let error = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
-    }
-
-    #[test]
-    fn cached_element_index_ignores_sentinel_bounds() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: i32::MIN,
-                y: i32::MIN,
-                width: 1,
-                height: 1,
-            }),
-        )]);
-
-        let error = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
-    }
-
-    #[test]
-    fn empty_node_cache_clears_stale_element_index() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-        )]);
-        backend.cache_nodes(&[]);
-
-        let error = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
-    }
-
-    #[test]
-    fn click_target_falls_back_to_primary_action_without_bounds() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            None,
-            vec![AccessibilityAction {
-                index: 0,
-                name: "Click".to_string(),
-                description: "Clicks the button".to_string(),
-                keybinding: String::new(),
-            }],
-        )]);
-
-        let target = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                ..Default::default()
-            })
-            .unwrap();
-
-        match target {
-            ClickTarget::PrimaryAction {
-                object_ref,
-                action_name,
-                action_index,
-            } => {
-                assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
-                assert_eq!(action_name.as_deref(), Some("Click"));
-                assert_eq!(action_index, 0);
-            }
-            ClickTarget::Coordinates(_, _) | ClickTarget::ObservedCoordinates(_) => {
-                panic!("expected AT-SPI primary-action fallback")
-            }
-        }
-    }
-
-    #[test]
-    fn click_target_falls_back_to_primary_action_with_sentinel_bounds() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            Some(Bounds {
-                x: i32::MIN,
-                y: i32::MIN,
-                width: 1,
-                height: 1,
-            }),
-            vec![AccessibilityAction {
-                index: 0,
-                name: "Click".to_string(),
-                description: "Clicks the button".to_string(),
-                keybinding: String::new(),
-            }],
-        )]);
-
-        let target = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                ..Default::default()
-            })
-            .unwrap();
-
-        match target {
-            ClickTarget::PrimaryAction {
-                object_ref,
-                action_name,
-                action_index,
-            } => {
-                assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
-                assert_eq!(action_name.as_deref(), Some("Click"));
-                assert_eq!(action_index, 0);
-            }
-            ClickTarget::Coordinates(_, _) | ClickTarget::ObservedCoordinates(_) => {
-                panic!("expected AT-SPI primary-action fallback")
-            }
-        }
-    }
-
-    #[test]
-    fn click_target_requires_bounds_for_non_plain_clicks() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            None,
-            vec![AccessibilityAction {
-                index: 0,
-                name: "Click".to_string(),
-                description: "Clicks the button".to_string(),
-                keybinding: String::new(),
-            }],
-        )]);
-
-        let error = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                button: Some("right".to_string()),
-                ..Default::default()
-            })
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
     }
 
     #[test]
