@@ -24,7 +24,7 @@ impl ComputerUseLinux {
         let selector = params.selector();
         let has_element_target = params.element_index.is_some() || !selector.is_empty();
         match (params.x, params.y) {
-            (Some(_), Some(_)) => return self.resolve_click_target(params),
+            (Some(x), Some(y)) => return Ok(ClickTarget::Coordinates(x, y)),
             (Some(_), None) | (None, Some(_)) => {
                 return Err("Coordinate clicks require both x and y.".to_string());
             }
@@ -84,7 +84,7 @@ impl ComputerUseLinux {
                     params.element_index,
                     None,
                     &selector,
-                    ElementResolvePurpose::Click,
+                    ElementResolvePurpose::Action,
                 ) {
                     Ok(node) if node.bounds.as_ref().and_then(bounds_center).is_none() => {
                         bounds_error(node.index)
