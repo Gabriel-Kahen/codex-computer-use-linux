@@ -941,7 +941,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "click",
-        description = "Click an element by index or semantic selector from a specific get_app_state observation_id, or click desktop coordinate pixels from screenshot metadata.",
+        description = "Click an element by index or semantic selector from a specific get_app_state observation_id, or click desktop coordinate pixels from screenshot metadata. A plain left single click with no explicit window selector uses the first observed AT-SPI action directly when it is explicitly named Click; other element clicks require usable bounds and verified pointer input.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -971,6 +971,27 @@ impl ComputerUseLinux {
             Ok(target) => target,
             Err(message) => return click_error(message),
         };
+        if let ClickTarget::ObservedAction(observed) = &target {
+            if let Err(message) = self.verify_observed_click_action_freshness(observed) {
+                return click_error(message);
+            }
+            return match perform_action_by_identity(&observed.object_ref, &observed.action_identity)
+                .await
+            {
+                Ok(invocation) => Json(ActionOutput {
+                    ok: invocation.ok,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message: if invocation.ok {
+                        "Invoked the observation-bound AT-SPI Click action.".to_string()
+                    } else {
+                        "The observation-bound AT-SPI Click action returned false.".to_string()
+                    },
+                    received,
+                }),
+                Err(error) => click_error(error.to_string()),
+            };
+        }
         let element_targeted = matches!(target, ClickTarget::ObservedCoordinates(_));
         // Raise the target window first (if specified) so the click lands on the
         // intended app rather than whatever is stacked on top at that pixel.
@@ -3478,11 +3499,13 @@ impl ComputerUseLinux {
 enum ClickTarget {
     Coordinates(i32, i32),
     ObservedCoordinates(click_target::ObservedClickTarget),
+    ObservedAction(click_target::ObservedClickAction),
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ElementResolvePurpose {
     ObservedClick,
+    ObservedSemanticClick,
     Action,
     SetValue,
 }
@@ -3601,6 +3624,13 @@ fn node_matches_resolve_purpose(node: &AccessibilityNode, purpose: ElementResolv
         ElementResolvePurpose::ObservedClick => {
             node.bounds.as_ref().and_then(bounds_center).is_some()
         }
+        ElementResolvePurpose::ObservedSemanticClick => {
+            node.bounds.as_ref().and_then(bounds_center).is_some()
+                || node
+                    .actions
+                    .first()
+                    .is_some_and(|action| action.name.trim().eq_ignore_ascii_case("click"))
+        }
         ElementResolvePurpose::Action => !node.actions.is_empty(),
         ElementResolvePurpose::SetValue => node.supports_editable_text || node.value.is_some(),
     }
@@ -3675,6 +3705,12 @@ fn describe_matching_nodes(nodes: &[&AccessibilityNode]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn is_plain_left_click(button: Option<&str>, click_count: Option<u32>) -> bool {
+    let button = button.unwrap_or("left");
+    let click_count = click_count.unwrap_or(1);
+    matches!(button.to_ascii_lowercase().as_str(), "left" | "primary") && click_count == 1
 }
 
 fn snapshot_action_identity(
@@ -6468,7 +6504,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_click_selector_resolves_coordinates() {
+    fn semantic_click_selector_resolves_observation_bound_action() {
         let backend = ComputerUseLinux::default();
         let mut button = node_with_actions(
             7,
@@ -6481,9 +6517,7 @@ mod tests {
             vec![click_action()],
         );
         button.name = Some("Run".to_string());
-        let mut action_only = node_with_actions(8, None, vec![click_action()]);
-        action_only.name = Some("Run".to_string());
-        let observation_id = cache_window_observation(&backend, &[action_only, button]);
+        let observation_id = cache_window_observation(&backend, &[button]);
 
         let target = backend
             .resolve_observed_click_target(&ClickParams {
@@ -6494,10 +6528,46 @@ mod tests {
             })
             .unwrap();
 
-        let ClickTarget::ObservedCoordinates(target) = target else {
-            panic!("expected an observation-bound click target");
+        let ClickTarget::ObservedAction(target) = target else {
+            panic!("expected an observation-bound AT-SPI action");
         };
-        assert_eq!(target.point, (60, 40));
+        assert_eq!(target.object_ref, ":1.7/org/a11y/atspi/accessible/7");
+        assert_eq!(
+            target.action_identity,
+            ActionFingerprint::new("Click", "Clicks the element").unwrap()
+        );
+    }
+
+    #[test]
+    fn semantic_click_selector_rejects_ambiguous_native_and_pointer_matches() {
+        let backend = ComputerUseLinux::default();
+        let mut action_only = node_with_actions(8, None, vec![click_action()]);
+        action_only.name = Some("Run".to_string());
+        let mut bounded = node_with_actions(
+            7,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 40,
+            }),
+            vec![click_action()],
+        );
+        bounded.name = Some("Run".to_string());
+        let observation_id = cache_window_observation(&backend, &[action_only, bounded]);
+
+        let error = backend
+            .resolve_observed_click_target(&ClickParams {
+                observation_id: Some(observation_id),
+                role: Some("button".to_string()),
+                name: Some("run".to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+
+        assert!(error.contains("matched multiple cached nodes"));
+        assert!(error.contains("element_index 7"));
+        assert!(error.contains("element_index 8"));
     }
 
     #[test]
