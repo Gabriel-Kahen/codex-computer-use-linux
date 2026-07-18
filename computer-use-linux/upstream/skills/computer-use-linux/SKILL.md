@@ -72,7 +72,7 @@ If the binary is not on `PATH`, use the absolute path (typically `~/.local/bin/c
 2. If `can_build_accessibility_tree` is false, run `setup` and restart the target app.
 3. If `can_query_windows` is false on GNOME Wayland, run `setup-window-targeting` and ask the user to log out and back in if setup says the shell extension needs a reload.
 4. Before targeted input, call `list_windows` or `focused_window` and verify the intended window by title, app id, pid, or wm class.
-5. Prefer `get_app_state` with `observation_mode: "adaptive"`, echoing `checkpoint_id` as `base_checkpoint_id`; use its element indices or semantic selectors.
+5. Prefer `get_app_state` with `observation_mode: "adaptive"`, echoing `checkpoint_id` as `base_checkpoint_id`. Separately preserve its `observation_id` and pass that ID with element-targeted `click` and `scroll`, `perform_action`, and `set_value` calls that use its indices or semantic selectors.
 6. Use coordinates only when the UI surface has no useful accessibility tree.
 7. For text input, prefer `type_text` with a target selector (`window_id`, `pid`, `app_id`, `wm_class`, `title`, `tty`, `terminal_pid`, `terminal_command`, or `terminal_cwd`) rather than relying on current focus.
 8. Use `run_action_batch` to avoid round trips for a short sequence against one exact `window_id`, such as `Ctrl+L` → type text → `Enter`, or click a field → type text → `Enter`. A batch is fail-fast and may contain at most one click, first, because clicks can invalidate later coordinates or element indices.

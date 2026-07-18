@@ -88,6 +88,35 @@ fn verification_is_scoped_to_exact_absolute_targets() {
     );
 }
 
+#[test]
+fn observed_pointer_preparation_requires_exact_contained_window() {
+    let observed = || ObservedElementPointer {
+        observation_id: "obs-1".to_string(),
+        object_ref: ":1.42/object".to_string(),
+        point: (70, 80),
+    };
+    let exact_window = window_info(42, Some(4242));
+    let (target, verification) =
+        observed_element_pointer_target((42, Some(4242)), observed(), &exact_window).unwrap();
+    assert_eq!(
+        (target.window_id, target.pid, verification.exact_window_id),
+        (Some(42), Some(4242), 42)
+    );
+
+    let mut outside = exact_window.clone();
+    outside.bounds.as_mut().unwrap().x = Some(1_000);
+    assert!(
+        observed_element_pointer_target((42, Some(4242)), observed(), &outside)
+            .unwrap_err()
+            .contains("observed element center")
+    );
+    assert!(
+        observed_element_pointer_target((42, None), observed(), &exact_window)
+            .unwrap_err()
+            .contains("does not match")
+    );
+}
+
 fn observed_node() -> AccessibilityNode {
     AccessibilityNode {
         index: 42,

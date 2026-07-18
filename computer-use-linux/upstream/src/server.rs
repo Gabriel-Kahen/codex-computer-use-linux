@@ -7,10 +7,9 @@ use crate::action_batch::{
     NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING,
 };
 use crate::atspi_tree::{
-    focused_element_summary, list_accessible_apps, perform_action as invoke_accessibility_action,
-    perform_action_by_identity, set_element_value, snapshot_compact_tree, AccessibilityAction,
-    AccessibilityNode, AccessibleAppSummary, ActionFingerprint, Bounds, FocusedElementSummary,
-    ValueSetInvocation,
+    focused_element_summary, list_accessible_apps, perform_action_by_identity, set_element_value,
+    snapshot_compact_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
+    ActionFingerprint, Bounds, FocusedElementSummary, ValueSetInvocation,
 };
 use crate::desktop_transaction::DesktopTransaction;
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
@@ -20,8 +19,9 @@ use crate::observation::{
     ObservationTracker, VisualObservationKind, VisualPlan, DEFAULT_CHECKPOINT_INTERVAL,
 };
 use crate::pointer_dispatch::{
-    pointer_dispatch_verification, run_verified_pointer_dispatch, verify_pointer_dispatch,
-    PointerDispatchBoundary, PointerDispatchVerification,
+    observed_element_pointer_target, pointer_dispatch_verification, run_verified_pointer_dispatch,
+    verify_pointer_dispatch, ObservedElementPointer, PointerDispatchBoundary,
+    PointerDispatchVerification,
 };
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_keycode_chord,
@@ -33,6 +33,7 @@ use crate::screenshot::{
     capture_screenshot_raw, capture_screenshot_raw_recent, prepare_screenshot_payload,
     RawScreenshotCapture, ScreenshotCapture, ScreenshotOutputFormat, ScreenshotPayloadOptions,
 };
+use crate::scroll_target::{resolve_observed_scroll_target, ScrollTargetRequest};
 use crate::windowing::capture_window_exact;
 use crate::windowing::registry;
 use crate::windows::{
@@ -65,6 +66,9 @@ use tokio::{
 };
 use zbus::{Connection as ZbusConnection, Proxy as ZbusProxy};
 
+#[path = "click_target.rs"]
+mod click_target;
+
 const YDOTOOL_TIMEOUT: Duration = Duration::from_secs(10);
 const YDOTOOL_TYPE_CHARS_PER_SECOND: u64 = 20;
 const KDE_CLIPBOARD_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
@@ -81,7 +85,6 @@ struct DiagnosticsCache {
 
 #[derive(Clone, Default)]
 pub struct ComputerUseLinux {
-    last_nodes: Arc<Mutex<Vec<AccessibilityNode>>>,
     accessibility_snapshots: Arc<Mutex<AccessibilitySnapshotStore>>,
     observation_tracker: Arc<Mutex<ObservationTracker>>,
     adaptive_observation_lock: Arc<tokio::sync::Mutex<()>>,
@@ -347,7 +350,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Successful accessibility snapshots include an opaque observation_id. Legacy calls return a full visual observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
+        description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Successful accessibility snapshots include an opaque observation_id that must be echoed for element-targeted clicks, element-targeted scrolls, and direct semantic actions. Legacy calls return a full visual observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<GetAppStateOutput>(),
         annotations(
             read_only_hint = true,
@@ -489,11 +492,6 @@ impl ComputerUseLinux {
             .map_or((None, (0, 0)), |(capture, origin)| (Some(capture), origin));
         if window_error.is_some() || screenshot_error.is_some() || accessibility_error.is_some() {
             self.invalidate_diagnostics();
-        }
-        if accessibility_error.is_none() {
-            self.cache_nodes(&accessibility_tree);
-        } else {
-            self.clear_cached_nodes();
         }
         let accessibility_snapshot_target =
             accessibility_snapshot_target(&params, window_context.as_ref());
@@ -943,7 +941,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "click",
-        description = "Click an element by index, semantic selector, or desktop coordinate pixels from screenshot metadata.",
+        description = "Click an element by index or semantic selector from a specific get_app_state observation_id, or click desktop coordinate pixels from screenshot metadata. A plain left single click with no explicit window selector uses the first observed AT-SPI action directly when it is explicitly named Click; other element clicks require usable bounds and verified pointer input.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -969,10 +967,49 @@ impl ComputerUseLinux {
                 received: received.clone(),
             })
         };
+        let mut target = match self.resolve_observed_click_target(&params) {
+            Ok(target) => target,
+            Err(message) => return click_error(message),
+        };
+        if let ClickTarget::ObservedAction(observed) = &target {
+            if let Err(message) = self.verify_observed_click_action_freshness(observed) {
+                return click_error(message);
+            }
+            return match perform_action_by_identity(&observed.object_ref, &observed.action_identity)
+                .await
+            {
+                Ok(invocation) => Json(ActionOutput {
+                    ok: invocation.ok,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message: if invocation.ok {
+                        "Invoked the observation-bound AT-SPI Click action.".to_string()
+                    } else {
+                        "The observation-bound AT-SPI Click action returned false.".to_string()
+                    },
+                    received,
+                }),
+                Err(error) => click_error(error.to_string()),
+            };
+        }
+        let element_targeted = matches!(target, ClickTarget::ObservedCoordinates(_));
         // Raise the target window first (if specified) so the click lands on the
         // intended app rather than whatever is stacked on top at that pixel.
-        let window_target = params.window_target();
+        let mut window_target = params.window_target();
         let mut pointer_verification = None;
+        if let ClickTarget::ObservedCoordinates(observed) = &target {
+            let point = observed.point;
+            let prepared = match self
+                .prepare_observed_click_target(observed, window_target)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(message) => return click_error(message),
+            };
+            window_target = Some(prepared.0);
+            pointer_verification = Some(prepared.1);
+            target = ClickTarget::Coordinates(point.0, point.1);
+        }
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
                 ok: false,
@@ -982,8 +1019,8 @@ impl ComputerUseLinux {
                 received,
             });
         }
-        if let Some(target) = window_target {
-            let focus = match self.focus_target_for_input(&target).await {
+        if let Some(focus_target) = window_target {
+            let focus = match self.focus_target_for_input(&focus_target).await {
                 Ok(focus) => focus,
                 Err(message) => {
                     return Json(ActionOutput {
@@ -995,8 +1032,10 @@ impl ComputerUseLinux {
                     });
                 }
             };
-            pointer_verification =
-                pointer_dispatch_verification(&target, params.relative, focus.as_ref());
+            if !element_targeted {
+                pointer_verification =
+                    pointer_dispatch_verification(&focus_target, params.relative, focus.as_ref());
+            }
             tokio::time::sleep(Duration::from_millis(120)).await;
             // Window-relative coordinates: translate by the window's top-left so
             // the agent can click the pixel it saw in a window-cropped screenshot.
@@ -1020,64 +1059,12 @@ impl ComputerUseLinux {
                         received,
                     });
                 }
+                let point = params.x.zip(params.y).expect("validated coordinates");
+                target = ClickTarget::Coordinates(point.0, point.1);
             }
-        }
-        let target = match self.resolve_click_target(&params) {
-            Ok(target) => target,
-            Err(message) => {
-                return Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message,
-                    received,
-                });
-            }
-        };
-        if let ClickTarget::PrimaryAction {
-            object_ref,
-            action_name,
-            action_index,
-        } = target
-        {
-            let action_index = action_index.to_string();
-            return match invoke_accessibility_action(&object_ref, Some(&action_index)).await {
-                Ok(invocation) => Json(ActionOutput {
-                    ok: invocation.ok,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message: if invocation.ok {
-                        format!(
-                            "No clickable bounds were cached, so I invoked the primary AT-SPI action{}.",
-                            action_name
-                                .as_deref()
-                                .filter(|name| !name.is_empty())
-                                .map(|name| format!(" ({name})"))
-                                .unwrap_or_default()
-                        )
-                    } else {
-                        format!(
-                            "The primary AT-SPI action{} returned false.",
-                            action_name
-                                .as_deref()
-                                .filter(|name| !name.is_empty())
-                                .map(|name| format!(" ({name})"))
-                                .unwrap_or_default()
-                        )
-                    },
-                    received,
-                }),
-                Err(error) => Json(ActionOutput {
-                    ok: false,
-                    implemented: true,
-                    action: "click".to_string(),
-                    message: error.to_string(),
-                    received,
-                }),
-            };
         }
         let ClickTarget::Coordinates(x, y) = target else {
-            unreachable!("click target must resolve to coordinates or an AT-SPI action");
+            unreachable!("click target must resolve to coordinates");
         };
         let button = mouse_button_code(params.button.as_deref());
         let click_count = params.click_count.unwrap_or(1).clamp(1, 10).to_string();
@@ -1382,7 +1369,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "scroll",
-        description = "Scroll an element in a direction by a number of pages. With a window target and no x/y/element_index, scrolls at the centre of the targeted window.",
+        description = "Scroll an element from a specific get_app_state observation_id, desktop coordinates, the targeted window centre, or the current pointer position.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1399,10 +1386,42 @@ impl ComputerUseLinux {
 
     async fn scroll_unlocked(&self, mut params: ScrollParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
+        let scroll_error = |message| {
+            Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "scroll".to_string(),
+                message,
+                received: received.clone(),
+            })
+        };
         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
+        let explicit_window_target = params.window_target();
+        let observed_target = match resolve_observed_scroll_target(
+            &self.accessibility_snapshots,
+            ScrollTargetRequest {
+                observation_id: params.observation_id.as_deref(),
+                element_index: params.element_index,
+                x: params.x,
+                y: params.y,
+                relative: params.relative == Some(true),
+                window_target: explicit_window_target.clone(),
+            },
+        ) {
+            Ok(target) => target,
+            Err(message) => return scroll_error(message),
+        };
+        let element_targeted = observed_target.is_some();
         // Raise/focus the target window first (parity with click) so wheel
         // events land on the intended app.
-        let window_target = params.window_target();
+        let (window_target, pointer_verification) = if let Some(target) = &observed_target {
+            match target.prepare().await {
+                Ok((window_target, verification)) => (Some(window_target), Some(verification)),
+                Err(message) => return scroll_error(message),
+            }
+        } else {
+            (explicit_window_target, None)
+        };
         if params.relative == Some(true) && window_target.is_none() {
             return Json(ActionOutput {
                 ok: false,
@@ -1473,19 +1492,9 @@ impl ComputerUseLinux {
                 }
             }
         }
-        let target_point =
-            match self.resolve_optional_target_point(params.x, params.y, params.element_index) {
-                Ok(point) => point,
-                Err(message) => {
-                    return Json(ActionOutput {
-                        ok: false,
-                        implemented: true,
-                        action: "scroll".to_string(),
-                        message,
-                        received,
-                    });
-                }
-            };
+        let target_point = observed_target
+            .as_ref()
+            .map_or_else(|| params.x.zip(params.y), |target| Some(target.point()));
         let direction = match params.direction.to_ascii_lowercase().as_str() {
             "up" => ScrollDirection::Up,
             "down" => ScrollDirection::Down,
@@ -1507,7 +1516,10 @@ impl ComputerUseLinux {
             None => None,
         };
 
-        if let Some(session) = self.cached_portal_pointer_session() {
+        if let Some(session) = self
+            .cached_portal_pointer_session()
+            .filter(|_| !element_targeted)
+        {
             match portal_scroll(&session, target_point, direction, units).await {
                 Ok(()) => {
                     return Json(with_notes(
@@ -1523,7 +1535,7 @@ impl ComputerUseLinux {
                 }
                 Err(_) => self.clear_portal_pointer_session(),
             }
-        } else if self.should_prefer_portal_pointer_backend() {
+        } else if !element_targeted && self.should_prefer_portal_pointer_backend() {
             match self.ensure_portal_pointer_session().await {
                 Ok(Some(session)) => {
                     match portal_scroll(&session, target_point, direction, units).await {
@@ -1568,7 +1580,16 @@ impl ComputerUseLinux {
             sequence.push(absolute_mousemove_args(x, y));
         }
         sequence.push(wheel_mousemove_args(dx, dy));
-        let result = run_ydotool_sequence(&sequence).await;
+        let result = match run_verified_pointer_dispatch(
+            PointerDispatchBoundary::Ydotool,
+            verify_pointer_dispatch(pointer_verification.as_ref(), &self.accessibility_snapshots),
+            run_ydotool_sequence(&sequence),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(message) => return scroll_error(message),
+        };
         Json(with_notes(
             action_result("scroll", result, received),
             off_screen_note,
@@ -1989,7 +2010,7 @@ enum PostActionObservationResult {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.5.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For perform_action and set_value, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; click still accepts element_index or semantic role/name/text/states selectors from the latest get_app_state result. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/scroll/drag and observation-bound element clicks through the Wayland remote desktop portal when available, and send layout-safe literal type_text through KDE clipboard integration on Plasma Wayland or through portal keysyms on other Wayland sessions before falling back to ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click and scroll, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. Coordinate scrolls accept the same window targeting and relative coordinates as click; element-targeted scrolls require observation_id and use verified absolute element bounds. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -2475,6 +2496,9 @@ impl ScreenshotMetadata {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ClickParams {
+    /// Opaque ID returned by get_app_state. Required for element-based clicks.
+    #[serde(default)]
+    observation_id: Option<String>,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -2550,6 +2574,7 @@ impl ClickParams {
 impl BatchClick {
     fn into_click_params(self, window_id: u64) -> ClickParams {
         ClickParams {
+            observation_id: self.observation_id,
             element_index: self.element_index,
             role: self.role,
             name: self.name,
@@ -2634,6 +2659,9 @@ impl SetValueParams {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct ScrollParams {
+    /// Required with element_index; returned by the originating get_app_state.
+    #[serde(default)]
+    observation_id: Option<String>,
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
@@ -2839,7 +2867,7 @@ impl ComputerUseLinux {
             match action {
                 BatchAction::Click(click) => {
                     let click = click.clone().into_click_params(params.window_id);
-                    self.resolve_click_target(&click)
+                    self.resolve_observed_click_target(&click)
                         .map_err(|error| format!("actions[{index}] is invalid: {error}"))?;
                 }
                 BatchAction::PressKey { key } if key_sequence(key).is_none() => {
@@ -3288,19 +3316,6 @@ impl ComputerUseLinux {
         notes
     }
 
-    fn cache_nodes(&self, nodes: &[AccessibilityNode]) {
-        if let Ok(mut cached) = self.last_nodes.lock() {
-            cached.clear();
-            cached.extend_from_slice(nodes);
-        }
-    }
-
-    fn clear_cached_nodes(&self) {
-        if let Ok(mut cached) = self.last_nodes.lock() {
-            cached.clear();
-        }
-    }
-
     fn record_accessibility_snapshot(
         &self,
         target: AccessibilitySnapshotTarget,
@@ -3327,7 +3342,7 @@ impl ComputerUseLinux {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
-                "observation_id is required for direct accessibility actions. Call get_app_state and pass the returned observation_id."
+                "observation_id is required for element-based actions. Call get_app_state and pass the returned observation_id."
                     .to_string()
             })?;
         self.accessibility_snapshots
@@ -3337,71 +3352,6 @@ impl ComputerUseLinux {
                     .to_string()
             })?
             .resolve(observation_id)
-    }
-
-    fn resolve_optional_target_point(
-        &self,
-        x: Option<i32>,
-        y: Option<i32>,
-        element_index: Option<u32>,
-    ) -> std::result::Result<Option<(i32, i32)>, String> {
-        match (x.zip(y), element_index) {
-            (Some(point), _) => Ok(Some(point)),
-            (None, Some(index)) => self
-                .center_for_cached_node(index)
-                .map(Some)
-                .ok_or_else(|| {
-                    format!(
-                        "No clickable bounds cached for element_index {index}. Call get_app_state first and choose a node with positive width and height."
-                    )
-                }),
-            (None, None) => Ok(None),
-        }
-    }
-
-    fn resolve_click_target(
-        &self,
-        params: &ClickParams,
-    ) -> std::result::Result<ClickTarget, String> {
-        if let Some((x, y)) = params.x.zip(params.y) {
-            return Ok(ClickTarget::Coordinates(x, y));
-        }
-
-        let selector = params.selector();
-        let node = self.resolve_cached_node(
-            params.element_index,
-            &selector,
-            ElementResolvePurpose::Click,
-        )?;
-
-        if let Some((x, y)) = node.bounds.as_ref().and_then(bounds_center) {
-            return Ok(ClickTarget::Coordinates(x, y));
-        }
-
-        if !is_plain_left_click(params.button.as_deref(), params.click_count) {
-            return Err(format!(
-                "No clickable bounds cached for element_index {}. Call get_app_state first and choose a node with positive width and height.",
-                node.index
-            ));
-        }
-
-        let Some(action) = primary_action(node.actions.as_slice()) else {
-            return Err(format!(
-                "No clickable bounds cached for element_index {}, and the element exposes no primary AT-SPI action.",
-                node.index
-            ));
-        };
-        Ok(ClickTarget::PrimaryAction {
-            object_ref: node.object_ref.clone(),
-            action_name: Some(action.name.clone()),
-            action_index: action.index,
-        })
-    }
-
-    fn center_for_cached_node(&self, element_index: u32) -> Option<(i32, i32)> {
-        let cached = self.last_nodes.lock().ok()?;
-        let node = cached.iter().find(|node| node.index == element_index)?;
-        bounds_center(node.bounds.as_ref()?)
     }
 
     fn resolve_object_ref(
@@ -3470,38 +3420,6 @@ impl ComputerUseLinux {
             );
         }
         resolve_semantic_node(nodes, selector, purpose)
-    }
-
-    fn resolve_cached_node(
-        &self,
-        element_index: Option<u32>,
-        selector: &ElementSelector<'_>,
-        purpose: ElementResolvePurpose,
-    ) -> std::result::Result<AccessibilityNode, String> {
-        let cached = self.last_nodes.lock().map_err(|_| {
-            "Could not read cached accessibility nodes. Call get_app_state and retry.".to_string()
-        })?;
-
-        if let Some(element_index) = element_index {
-            return cached
-                .iter()
-                .find(|node| node.index == element_index)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "No cached accessibility node for element_index {element_index}. Call get_app_state first."
-                    )
-                });
-        }
-
-        if selector.is_empty() {
-            return Err(
-                "Pass element_index, element_identifier, or a semantic selector such as role/name/text/states from the latest get_app_state result."
-                    .to_string(),
-            );
-        }
-
-        resolve_semantic_node(cached.as_slice(), selector, purpose)
     }
 
     async fn perform_element_action(&self, params: &ActionParams) -> Json<ActionOutput> {
@@ -3580,16 +3498,14 @@ impl ComputerUseLinux {
 #[derive(Debug)]
 enum ClickTarget {
     Coordinates(i32, i32),
-    PrimaryAction {
-        object_ref: String,
-        action_name: Option<String>,
-        action_index: i32,
-    },
+    ObservedCoordinates(click_target::ObservedClickTarget),
+    ObservedAction(click_target::ObservedClickAction),
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ElementResolvePurpose {
-    Click,
+    ObservedClick,
+    ObservedSemanticClick,
     Action,
     SetValue,
 }
@@ -3705,9 +3621,15 @@ fn node_matches_selector(node: &AccessibilityNode, selector: &ElementSelector<'_
 
 fn node_matches_resolve_purpose(node: &AccessibilityNode, purpose: ElementResolvePurpose) -> bool {
     match purpose {
-        ElementResolvePurpose::Click => {
+        ElementResolvePurpose::ObservedClick => {
             node.bounds.as_ref().and_then(bounds_center).is_some()
-                || primary_action_name(&node.actions).is_some()
+        }
+        ElementResolvePurpose::ObservedSemanticClick => {
+            node.bounds.as_ref().and_then(bounds_center).is_some()
+                || node
+                    .actions
+                    .first()
+                    .is_some_and(|action| action.name.trim().eq_ignore_ascii_case("click"))
         }
         ElementResolvePurpose::Action => !node.actions.is_empty(),
         ElementResolvePurpose::SetValue => node.supports_editable_text || node.value.is_some(),
@@ -3832,14 +3754,6 @@ fn snapshot_action_identity(
         "The selected AT-SPI action has no stable textual identity, so it cannot be invoked safely."
             .to_string()
     })
-}
-
-fn primary_action(actions: &[AccessibilityAction]) -> Option<&AccessibilityAction> {
-    actions.first()
-}
-
-fn primary_action_name(actions: &[AccessibilityAction]) -> Option<String> {
-    primary_action(actions).map(|action| action.name.clone())
 }
 
 fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
@@ -4997,6 +4911,16 @@ mod tests {
         backend.record_accessibility_snapshot(AccessibilitySnapshotTarget::Desktop, nodes)
     }
 
+    fn cache_window_observation(backend: &ComputerUseLinux, nodes: &[AccessibilityNode]) -> String {
+        backend.record_accessibility_snapshot(
+            AccessibilitySnapshotTarget::Window {
+                window_id: 42,
+                pid: Some(4242),
+            },
+            nodes,
+        )
+    }
+
     fn action(index: i32, name: &str, description: &str) -> AccessibilityAction {
         AccessibilityAction {
             index,
@@ -5201,9 +5125,15 @@ mod tests {
     }
 
     #[test]
-    fn semantic_action_schemas_accept_observation_ids() {
+    fn click_scroll_and_semantic_action_schemas_accept_observation_ids() {
         let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
-        for name in ["perform_action", "set_value"] {
+        for name in [
+            "click",
+            "scroll",
+            "perform_action",
+            "set_value",
+            "run_action_batch",
+        ] {
             let tool = tools.iter().find(|tool| tool.name == name).unwrap();
             assert!(serde_json::to_string(&tool.input_schema)
                 .unwrap()
@@ -5229,6 +5159,36 @@ mod tests {
             ComputerUseLinux::default().validate_action_batch(&params),
             Err("actions[1] has an unsupported key. Use names like Enter, Escape, Tab, ArrowLeft, Ctrl+L, or a single US keyboard letter/digit.".to_string())
         );
+    }
+
+    #[test]
+    fn action_batch_preflight_rejects_mismatched_click_observation() {
+        let backend = ComputerUseLinux::default();
+        let observation_id = cache_window_observation(
+            &backend,
+            &[node(
+                7,
+                Some(Bounds {
+                    x: 10,
+                    y: 20,
+                    width: 100,
+                    height: 40,
+                }),
+            )],
+        );
+        let params = ActionBatchParams {
+            window_id: 41,
+            actions: vec![BatchAction::Click(BatchClick {
+                observation_id: Some(observation_id),
+                element_index: Some(7),
+                ..Default::default()
+            })],
+        };
+
+        assert!(backend
+            .validate_action_batch(&params)
+            .unwrap_err()
+            .contains("does not match the requested target window"));
     }
 
     #[test]
@@ -6150,213 +6110,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_element_index_resolves_to_bounds_center() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-        )]);
-
-        let point = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(point, (60, 40));
-    }
-
-    #[test]
-    fn coordinate_target_overrides_cached_element_index() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-        )]);
-
-        let point = backend
-            .resolve_optional_target_point(Some(200), Some(300), Some(7))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(point, (200, 300));
-    }
-
-    #[test]
-    fn cached_element_index_requires_positive_bounds() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 0,
-                height: 40,
-            }),
-        )]);
-
-        let error = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
-    }
-
-    #[test]
-    fn cached_element_index_ignores_sentinel_bounds() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: i32::MIN,
-                y: i32::MIN,
-                width: 1,
-                height: 1,
-            }),
-        )]);
-
-        let error = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
-    }
-
-    #[test]
-    fn empty_node_cache_clears_stale_element_index() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node(
-            7,
-            Some(Bounds {
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 40,
-            }),
-        )]);
-        backend.cache_nodes(&[]);
-
-        let error = backend
-            .resolve_optional_target_point(None, None, Some(7))
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
-    }
-
-    #[test]
-    fn click_target_falls_back_to_primary_action_without_bounds() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            None,
-            vec![AccessibilityAction {
-                index: 0,
-                name: "Click".to_string(),
-                description: "Clicks the button".to_string(),
-                keybinding: String::new(),
-            }],
-        )]);
-
-        let target = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                ..Default::default()
-            })
-            .unwrap();
-
-        match target {
-            ClickTarget::PrimaryAction {
-                object_ref,
-                action_name,
-                action_index,
-            } => {
-                assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
-                assert_eq!(action_name.as_deref(), Some("Click"));
-                assert_eq!(action_index, 0);
-            }
-            ClickTarget::Coordinates(_, _) => {
-                panic!("expected AT-SPI primary-action fallback")
-            }
-        }
-    }
-
-    #[test]
-    fn click_target_falls_back_to_primary_action_with_sentinel_bounds() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            Some(Bounds {
-                x: i32::MIN,
-                y: i32::MIN,
-                width: 1,
-                height: 1,
-            }),
-            vec![AccessibilityAction {
-                index: 0,
-                name: "Click".to_string(),
-                description: "Clicks the button".to_string(),
-                keybinding: String::new(),
-            }],
-        )]);
-
-        let target = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                ..Default::default()
-            })
-            .unwrap();
-
-        match target {
-            ClickTarget::PrimaryAction {
-                object_ref,
-                action_name,
-                action_index,
-            } => {
-                assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
-                assert_eq!(action_name.as_deref(), Some("Click"));
-                assert_eq!(action_index, 0);
-            }
-            ClickTarget::Coordinates(_, _) => {
-                panic!("expected AT-SPI primary-action fallback")
-            }
-        }
-    }
-
-    #[test]
-    fn click_target_requires_bounds_for_non_plain_clicks() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_nodes(&[node_with_actions(
-            7,
-            None,
-            vec![AccessibilityAction {
-                index: 0,
-                name: "Click".to_string(),
-                description: "Clicks the button".to_string(),
-                keybinding: String::new(),
-            }],
-        )]);
-
-        let error = backend
-            .resolve_click_target(&ClickParams {
-                element_index: Some(7),
-                button: Some("right".to_string()),
-                ..Default::default()
-            })
-            .unwrap_err();
-
-        assert!(error.contains("No clickable bounds cached for element_index 7"));
-    }
-
-    #[test]
     fn absolute_mousemove_uses_coordinate_separator() {
         assert_eq!(
             absolute_mousemove_args(200, 300),
@@ -6751,7 +6504,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_click_selector_resolves_coordinates() {
+    fn semantic_click_selector_resolves_observation_bound_action() {
         let backend = ComputerUseLinux::default();
         let mut button = node_with_actions(
             7,
@@ -6764,17 +6517,57 @@ mod tests {
             vec![click_action()],
         );
         button.name = Some("Run".to_string());
-        backend.cache_nodes(&[button]);
+        let observation_id = cache_window_observation(&backend, &[button]);
 
         let target = backend
-            .resolve_click_target(&ClickParams {
+            .resolve_observed_click_target(&ClickParams {
+                observation_id: Some(observation_id),
                 role: Some("button".to_string()),
                 name: Some("run".to_string()),
                 ..Default::default()
             })
             .unwrap();
 
-        assert!(matches!(target, ClickTarget::Coordinates(60, 40)));
+        let ClickTarget::ObservedAction(target) = target else {
+            panic!("expected an observation-bound AT-SPI action");
+        };
+        assert_eq!(target.object_ref, ":1.7/org/a11y/atspi/accessible/7");
+        assert_eq!(
+            target.action_identity,
+            ActionFingerprint::new("Click", "Clicks the element").unwrap()
+        );
+    }
+
+    #[test]
+    fn semantic_click_selector_rejects_ambiguous_native_and_pointer_matches() {
+        let backend = ComputerUseLinux::default();
+        let mut action_only = node_with_actions(8, None, vec![click_action()]);
+        action_only.name = Some("Run".to_string());
+        let mut bounded = node_with_actions(
+            7,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 40,
+            }),
+            vec![click_action()],
+        );
+        bounded.name = Some("Run".to_string());
+        let observation_id = cache_window_observation(&backend, &[action_only, bounded]);
+
+        let error = backend
+            .resolve_observed_click_target(&ClickParams {
+                observation_id: Some(observation_id),
+                role: Some("button".to_string()),
+                name: Some("run".to_string()),
+                ..Default::default()
+            })
+            .unwrap_err();
+
+        assert!(error.contains("matched multiple cached nodes"));
+        assert!(error.contains("element_index 7"));
+        assert!(error.contains("element_index 8"));
     }
 
     #[test]
@@ -6818,6 +6611,7 @@ mod tests {
     #[test]
     fn relative_scroll_translates_coordinates() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: Some(10),
             y: Some(20),
@@ -6846,6 +6640,7 @@ mod tests {
     #[test]
     fn window_targeted_scroll_defaults_to_window_center() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: None,
             y: None,
@@ -6874,6 +6669,7 @@ mod tests {
     #[test]
     fn window_targeted_scroll_without_bounds_errors() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: None,
             y: None,
@@ -6905,6 +6701,7 @@ mod tests {
     #[test]
     fn relative_scroll_rejects_out_of_bounds() {
         let mut params = ScrollParams {
+            observation_id: None,
             element_index: None,
             x: Some(801),
             y: Some(20),

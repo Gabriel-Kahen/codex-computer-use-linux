@@ -22,7 +22,7 @@ pub(crate) async fn run_verified_pointer_dispatch<T>(
     Ok(dispatch.await)
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ObservedElementPointer {
     pub(crate) observation_id: String,
     pub(crate) object_ref: String,
@@ -34,6 +34,33 @@ pub(crate) struct PointerDispatchVerification {
     pub(crate) exact_window_id: u64,
     pub(crate) expected_pid: Option<u32>,
     pub(crate) observed_element: Option<ObservedElementPointer>,
+}
+
+pub(crate) fn observed_element_pointer_target(
+    observed_target: (u64, Option<u32>),
+    observed_element: ObservedElementPointer,
+    window: &WindowInfo,
+) -> Result<(WindowTarget, PointerDispatchVerification), String> {
+    if observed_target != (window.window_id, window.pid) {
+        return Err(format!(
+            "The accessibility observation does not match target window_id {}. Call get_app_state for that exact window and use its observation_id.",
+            window.window_id
+        ));
+    }
+    ensure_element_point_in_window(observed_element.point, window)?;
+    let target = WindowTarget {
+        window_id: Some(window.window_id),
+        pid: window.pid,
+        ..Default::default()
+    };
+    Ok((
+        target,
+        PointerDispatchVerification {
+            exact_window_id: window.window_id,
+            expected_pid: window.pid,
+            observed_element: Some(observed_element),
+        },
+    ))
 }
 
 pub(crate) fn pointer_dispatch_verification(
@@ -207,7 +234,7 @@ fn ensure_element_point_in_live_bounds(point: (i32, i32), bounds: &Bounds) -> Re
     }
 }
 
-fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
+pub(crate) fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
     if bounds.width <= 0 || bounds.height <= 0 {
         return None;
     }
