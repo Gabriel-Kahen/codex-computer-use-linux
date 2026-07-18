@@ -295,32 +295,27 @@ pub async fn focused_element_summary(
     Ok(None)
 }
 
-pub async fn perform_action(
-    object_ref_id: &str,
-    requested_action: Option<&str>,
-) -> Result<ActionInvocation> {
-    perform_selected_action(object_ref_id, ActionSelection::Flexible(requested_action)).await
-}
-
 pub async fn perform_action_by_identity(
     object_ref_id: &str,
     action_identity: &ActionFingerprint,
 ) -> Result<ActionInvocation> {
-    perform_selected_action(
-        object_ref_id,
-        ActionSelection::StableIdentity(action_identity),
-    )
-    .await
+    perform_selected_action(object_ref_id, action_identity).await
 }
 
-enum ActionSelection<'a> {
-    Flexible(Option<&'a str>),
-    StableIdentity(&'a ActionFingerprint),
+pub async fn live_bounds(object_ref_id: &str) -> Result<Bounds> {
+    let conn = connect().await?;
+    let object_ref = object_ref_from_id(object_ref_id)?;
+    let proxy = open_accessible(&conn, &object_ref)
+        .await
+        .with_context(|| format!("failed to open AT-SPI object {object_ref_id}"))?;
+    bounds(&proxy)
+        .await
+        .ok_or_else(|| anyhow!("AT-SPI object {object_ref_id} has no live screen bounds"))
 }
 
 async fn perform_selected_action(
     object_ref_id: &str,
-    selection: ActionSelection<'_>,
+    action_identity: &ActionFingerprint,
 ) -> Result<ActionInvocation> {
     let conn = connect().await?;
     let object_ref = object_ref_from_id(object_ref_id)?;
@@ -334,14 +329,7 @@ async fn perform_selected_action(
         .await
         .context("element does not expose the AT-SPI Action interface")?;
     let actions = action.get_actions().await.unwrap_or_default();
-    let action_index = match selection {
-        ActionSelection::Flexible(requested_action) => {
-            select_action_index(&actions, requested_action)?
-        }
-        ActionSelection::StableIdentity(action_identity) => {
-            select_stable_action_index(&actions, action_identity)?
-        }
-    };
+    let action_index = select_stable_action_index(&actions, action_identity)?;
     let action_name = actions
         .get(action_index as usize)
         .map(|action| action.name.clone());
@@ -894,6 +882,7 @@ fn state_labels(state_set: StateSet) -> Vec<String> {
     state_set.iter().map(|state| state.to_string()).collect()
 }
 
+#[cfg(test)]
 fn select_action_index(actions: &[atspi::Action], requested_action: Option<&str>) -> Result<i32> {
     if actions.is_empty() {
         return Err(anyhow!("element exposes no AT-SPI actions"));
