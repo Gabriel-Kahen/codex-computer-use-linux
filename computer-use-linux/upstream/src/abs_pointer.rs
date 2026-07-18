@@ -15,7 +15,7 @@
 use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use evdev::{
     uinput::VirtualDevice, AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode,
     PropType, UinputAbsSetup,
@@ -35,10 +35,14 @@ impl AbsPointer {
         let width = width.max(1);
         let height = height.max(1);
         // value, min, max, fuzz, flat, resolution. resolution=1 unit/px.
-        let abs_x =
-            UinputAbsSetup::new(AbsoluteAxisCode::ABS_X, AbsInfo::new(0, 0, width, 0, 0, 1));
-        let abs_y =
-            UinputAbsSetup::new(AbsoluteAxisCode::ABS_Y, AbsInfo::new(0, 0, height, 0, 0, 1));
+        let abs_x = UinputAbsSetup::new(
+            AbsoluteAxisCode::ABS_X,
+            AbsInfo::new(0, 0, width - 1, 0, 0, 1),
+        );
+        let abs_y = UinputAbsSetup::new(
+            AbsoluteAxisCode::ABS_Y,
+            AbsInfo::new(0, 0, height - 1, 0, 0, 1),
+        );
         let keys =
             AttributeSet::from_iter([KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT, KeyCode::BTN_MIDDLE]);
         // INPUT_PROP_DIRECT marks the device as a direct (absolute) pointer so
@@ -68,8 +72,7 @@ impl AbsPointer {
 
     /// Move the pointer to absolute logical coordinates `(x, y)`.
     pub fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
-        let x = x.clamp(0, self.width);
-        let y = y.clamp(0, self.height);
+        validate_point(self.width, self.height, x, y)?;
         self.device
             .emit(&[
                 InputEvent::new_now(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, x),
@@ -116,6 +119,13 @@ impl AbsPointer {
     }
 }
 
+fn validate_point(width: i32, height: i32, x: i32, y: i32) -> Result<()> {
+    if x < 0 || y < 0 || x >= width || y >= height {
+        bail!("coordinate {x},{y} is outside the addressable desktop {width}x{height}");
+    }
+    Ok(())
+}
+
 /// Pointer buttons we can synthesize.
 #[derive(Clone, Copy, Debug)]
 pub enum PointerButton {
@@ -141,3 +151,7 @@ impl PointerButton {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "abs_pointer_tests.rs"]
+mod tests;

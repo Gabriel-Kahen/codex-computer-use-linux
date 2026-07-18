@@ -8,8 +8,6 @@ use std::sync::Mutex;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PointerDispatchBoundary {
     AbsolutePointer,
-    CachedPortal,
-    NewPortal,
     Ydotool,
 }
 

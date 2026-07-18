@@ -102,6 +102,7 @@ Ready output should have:
 - `can_build_accessibility_tree: true`
 - `can_query_windows: true`
 - `can_send_development_input: true`
+- `can_send_coordinate_input: true`
 - `blockers: []`
 
 Then test with your agent by calling the `doctor` tool or asking the agent to list desktop windows.

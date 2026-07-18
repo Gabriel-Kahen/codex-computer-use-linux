@@ -296,8 +296,6 @@ async fn stale_observation_is_rejected_before_live_object_probe() {
 async fn failed_verification_blocks_every_pointer_dispatch_boundary() {
     for boundary in [
         PointerDispatchBoundary::AbsolutePointer,
-        PointerDispatchBoundary::CachedPortal,
-        PointerDispatchBoundary::NewPortal,
         PointerDispatchBoundary::Ydotool,
     ] {
         let dispatched = std::cell::Cell::new(false);

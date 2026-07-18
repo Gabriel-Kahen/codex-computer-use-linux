@@ -10,6 +10,7 @@ mod desktop_transaction;
 mod diagnostics_impl;
 mod gnome_extension;
 mod identity;
+mod input_policy;
 mod observation;
 mod pointer_dispatch;
 mod remote_desktop;
