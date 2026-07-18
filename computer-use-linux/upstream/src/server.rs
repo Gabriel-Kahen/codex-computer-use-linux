@@ -1,3 +1,4 @@
+use crate::accessibility_snapshot::{AccessibilitySnapshotStore, AccessibilitySnapshotTarget};
 use crate::action_batch::{
     bounded_action_result_message, execute_action_batch, ActionBatchOutput, ActionBatchParams,
     ActionOutput, BatchAction, BatchActionRun, BatchClick, NON_EDITABLE_TEXT_LANDING_WARNING,
@@ -74,6 +75,7 @@ struct DiagnosticsCache {
 #[derive(Clone, Default)]
 pub struct ComputerUseLinux {
     last_nodes: Arc<Mutex<Vec<AccessibilityNode>>>,
+    accessibility_snapshots: Arc<Mutex<AccessibilitySnapshotStore>>,
     observation_tracker: Arc<Mutex<ObservationTracker>>,
     adaptive_observation_lock: Arc<tokio::sync::Mutex<()>>,
     portal_pointer_session: Arc<Mutex<Option<PortalPointerSession>>>,
@@ -338,7 +340,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "get_app_state",
-        description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Legacy calls return a full observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
+        description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Successful accessibility snapshots include an opaque observation_id. Legacy calls return a full visual observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<GetAppStateOutput>(),
         annotations(
             read_only_hint = true,
@@ -486,6 +488,16 @@ impl ComputerUseLinux {
         } else {
             self.clear_cached_nodes();
         }
+        let accessibility_snapshot_target =
+            accessibility_snapshot_target(&params, window_context.as_ref());
+        let observation_id = accessibility_snapshot_target.as_ref().and_then(|target| {
+            if accessibility_error.is_none() {
+                Some(self.record_accessibility_snapshot(target.clone(), &accessibility_tree))
+            } else {
+                self.invalidate_accessibility_snapshot(target);
+                None
+            }
+        });
 
         let (observation, visual_plan, raw_screenshot) = if adaptive {
             let target_key = window_context.as_ref().map_or_else(
@@ -688,6 +700,7 @@ impl ComputerUseLinux {
             screenshot_error,
             accessibility_tree,
             accessibility_tree_raw_count,
+            observation_id,
             accessibility_coordinate_space: "desktop".to_string(),
             accessibility_error,
             readiness,
@@ -2310,6 +2323,8 @@ struct GetAppStateOutput {
     screenshot_error: Option<String>,
     accessibility_tree: Vec<AccessibilityNode>,
     accessibility_tree_raw_count: usize,
+    /// Opaque ID for this bounded accessibility snapshot.
+    observation_id: Option<String>,
     accessibility_coordinate_space: String,
     accessibility_error: Option<String>,
     /// Compact readiness summary (always present).
@@ -3223,6 +3238,24 @@ impl ComputerUseLinux {
         }
     }
 
+    fn record_accessibility_snapshot(
+        &self,
+        target: AccessibilitySnapshotTarget,
+        nodes: &[AccessibilityNode],
+    ) -> String {
+        self.accessibility_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(target, nodes)
+    }
+
+    fn invalidate_accessibility_snapshot(&self, target: &AccessibilitySnapshotTarget) {
+        self.accessibility_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .invalidate(target);
+    }
+
     fn resolve_optional_target_point(
         &self,
         x: Option<i32>,
@@ -3791,6 +3824,28 @@ fn accessibility_filter_candidates(window_context: Option<&WindowInfo>) -> Vec<S
     }
 
     candidates
+}
+
+fn accessibility_snapshot_target(
+    params: &GetAppStateParams,
+    window_context: Option<&WindowInfo>,
+) -> Option<AccessibilitySnapshotTarget> {
+    if let Some(window) = window_context {
+        return Some(AccessibilitySnapshotTarget::Window {
+            window_id: window.window_id,
+            pid: window.pid,
+        });
+    }
+    if let Some(application) = trimmed_nonempty(params.app_name_or_bundle_identifier.as_deref()) {
+        return Some(AccessibilitySnapshotTarget::application(application));
+    }
+    if let Some(pid) = params.pid {
+        return Some(AccessibilitySnapshotTarget::Process(pid));
+    }
+    if params.window_target().has_target() {
+        return None;
+    }
+    Some(AccessibilitySnapshotTarget::Desktop)
 }
 
 fn push_candidate(candidates: &mut Vec<String>, value: Option<&str>) {
@@ -4786,6 +4841,7 @@ mod tests {
         assert!(tool.output_schema.is_some());
         assert!(schema.contains("coordinate_width"));
         assert!(schema.contains("checkpoint_id"));
+        assert!(schema.contains("observation_id"));
         assert!(schema.contains("screenshot_regions"));
         assert!(input_schema.contains("base_checkpoint_id"));
         assert!(input_schema.contains("observation_mode"));
@@ -5002,6 +5058,7 @@ mod tests {
             screenshot_error: None,
             accessibility_tree: Vec::new(),
             accessibility_tree_raw_count: 0,
+            observation_id: None,
             accessibility_coordinate_space: "desktop".to_string(),
             accessibility_error: None,
             readiness: diagnostics.readiness,
@@ -5079,6 +5136,7 @@ mod tests {
             ),
             accessibility_tree: Vec::new(),
             accessibility_tree_raw_count: 0,
+            observation_id: None,
             accessibility_coordinate_space: "desktop".to_string(),
             accessibility_error: None,
             readiness: diagnostics.readiness,

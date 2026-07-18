@@ -1,4 +1,5 @@
 mod abs_pointer;
+mod accessibility_snapshot;
 mod action_batch;
 #[path = "atspi_tree.rs"]
 mod atspi_tree_impl;

@@ -46,7 +46,7 @@ MCP tools exposed by the server:
 - `list_apps` — running desktop apps visible to the AT-SPI registry
 - `list_windows` — compositor windows with title, app id, wm_class, focus state, client type (Wayland/X11), and bounds
 - `focused_window` — the window currently holding keyboard focus
-- `get_app_state` — combined screenshot + accessibility tree for a chosen app, with an opt-in adaptive checkpoint/delta mode and element indices that the input tools accept
+- `get_app_state` — combined screenshot + accessibility tree for a chosen app, with an opt-in adaptive checkpoint/delta mode and an opaque `observation_id` for each bounded accessibility snapshot
 - `screenshot` — capture the screen as a bounded PNG or JPEG image; can target a window, which is raised to the front and cropped to just that window
 
 Screenshot payloads are size-bounded by default before they are returned to the MCP host: max 1920 px width/height and 2 MiB image bytes, with hard caps even when callers request more. Agents that need more detail can pass `max_width`, `max_height`, `max_bytes`, `scale`, `format: "jpeg"`, or `quality`, preferably with a window target or crop. PNG remains the default; JPEG lets callers trade lossless pixels for a smaller payload before the byte cap forces further resizing. Returned screenshot metadata includes `coordinate_width`, `coordinate_height`, `scale`, `format`, and `quality` so callers can convert from a downscaled preview to desktop coordinate pixels.
@@ -357,7 +357,7 @@ files.
 
 ## Architecture
 
-- **Accessibility tree** — [`atspi`](https://crates.io/crates/atspi) crate (tokio backend) talks to the AT-SPI registry on the user session bus. The tree is flattened to `(role, name, text, states, bounds)` tuples and indexed; element indices are stable for the duration of a `get_app_state` snapshot.
+- **Accessibility tree** — [`atspi`](https://crates.io/crates/atspi) crate (tokio backend) talks to the AT-SPI registry on the user session bus. The tree is flattened to `(role, name, text, states, bounds)` tuples and indexed; each bounded snapshot has an opaque `observation_id` and replaces the previous generation for the same target.
 - **DBus where desktops expose it** — [`zbus`](https://crates.io/crates/zbus) for portal calls (`org.freedesktop.portal.Screenshot`, `…RemoteDesktop`, `…ScreenCast`), GNOME Shell screenshots (`org.gnome.Shell.Screenshot`), the bundled GNOME extension's `dev.avifenesh.ComputerUseLinux.WindowControl` service, and temporary KWin scripting.
 - **MCP transport** — [`rmcp`](https://crates.io/crates/rmcp) with the `transport-io` feature; stdio framing, no network.
 - **Input fallback** — when the remote-desktop portal isn't available or the host wants deterministic injection, the binary writes to `ydotoold`'s socket, which writes to `/dev/uinput`. `install.sh` can configure `ydotoold`; the `setup` command only enables the GNOME AT-SPI bridge.
