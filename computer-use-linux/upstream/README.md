@@ -24,7 +24,7 @@ The Rust crate is published as [`computer-use-linux`](https://crates.io/crates/c
 
 Most computer-use MCP servers are macOS-only (they lean on AppKit, AXUIElement, CGEvent). The few that target Linux either drive `xdotool` against an X11 root window or shell out to OCR over screenshots. Four things set this one apart:
 
-- **Wayland actually works.** Pointer actions can use the `org.freedesktop.portal.RemoteDesktop` interface on Wayland, with `ydotool` / `ydotoold` (uinput) as the deterministic fallback and keyboard/text path. Screenshots use the GNOME Shell DBus screenshot method when present, `org.freedesktop.portal.Screenshot` otherwise, and fall back to spawning `gnome-screenshot` for background/systemd contexts where both DBus paths are denied.
+- **Wayland actually works.** Coordinate-bearing pointer actions use the absolute uinput backend or `ydotool` / `ydotoold`; the `org.freedesktop.portal.RemoteDesktop` pointer path is limited to untargeted relative scroll because the portal API defines no safe transform from screenshot pixels to absolute pointer coordinates. Portal keyboard input remains available. Screenshots use the GNOME Shell DBus screenshot method when present, `org.freedesktop.portal.Screenshot` otherwise, and fall back to spawning `gnome-screenshot` for background/systemd contexts where both DBus paths are denied.
 - **Window targeting is compositor-aware.** The window registry tries GNOME Shell extension, GNOME Shell Introspect, COSMIC Wayland helper, KWin DBus scripting, Hyprland `hyprctl`, and i3 IPC in order, then reports exactly which backend won or why each backend failed.
 - **Semantic selectors, not pixel coordinates.** Tools like `click`, `perform_action`, and `set_value` accept `role` / `name` / `text` / `states` selectors backed by AT-SPI. Pixel coordinates remain available as a fallback for rendering-only surfaces (canvas, games, X clients without ATK).
 - **One JSON readiness report.** `computer-use-linux doctor` returns a structured document covering platform, portals, AT-SPI, windowing, input, and a `readiness` summary with explicit blockers and a recommended next step. MCP hosts can render or surface that to the user without parsing prose.
@@ -335,9 +335,9 @@ Most setups need none of these — `doctor` and the installers pick sensible def
 | Variable | Effect |
 | --- | --- |
 | `COMPUTER_USE_LINUX_COSMIC_HELPER` | Path to the `computer-use-linux-cosmic` helper when it isn't next to the binary or on `PATH`. |
-| `CU_DISABLE_ABS_POINTER` | Disable the uinput absolute pointer and click through `ydotool` instead for setups where the abs-pointer device misbehaves. |
-| `COMPUTER_USE_LINUX_FORCE_PORTAL_POINTER` / `…_KEYBOARD` | Always route pointer / keyboard through the RemoteDesktop portal on Wayland, skipping auto-detection. |
-| `COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER` / `…_KEYBOARD` | Always route pointer / keyboard through `ydotool`, skipping the portal and KDE clipboard paths. |
+| `CU_DISABLE_ABS_POINTER` | Disable the uinput absolute pointer; coordinate click/drag then require an allowed working `ydotool` backend. |
+| `COMPUTER_USE_LINUX_FORCE_PORTAL_POINTER` / `…_KEYBOARD` | Prefer the RemoteDesktop portal on Wayland. Forced pointer mode leaves absolute click/drag available, supports untargeted portal scroll only, and otherwise refuses coordinate input; `FORCE_YDOTOOL_POINTER` wins if both are set. |
+| `COMPUTER_USE_LINUX_FORCE_YDOTOOL_POINTER` / `…_KEYBOARD` | Prefer `ydotool` over the portal (and over KDE clipboard for keyboard); absolute uinput remains preferred for click/drag. |
 | `COMPUTER_USE_LINUX_SCREENSHOT_BACKEND` | Force a single screenshot backend, skipping the fallback chain. Accepts `gnome-shell`, `portal`, or `gnome-screenshot`. Pin `gnome-screenshot` for background/systemd contexts where the GNOME Shell and portal DBus paths are denied. |
 
 **Build-time identity overrides** (set while compiling a downstream embedded
@@ -360,7 +360,7 @@ files.
 - **Accessibility tree** — [`atspi`](https://crates.io/crates/atspi) crate (tokio backend) talks to the AT-SPI registry on the user session bus. The tree is flattened to `(role, name, text, states, bounds)` tuples and indexed; element indices are stable for the duration of a `get_app_state` snapshot.
 - **DBus where desktops expose it** — [`zbus`](https://crates.io/crates/zbus) for portal calls (`org.freedesktop.portal.Screenshot`, `…RemoteDesktop`, `…ScreenCast`), GNOME Shell screenshots (`org.gnome.Shell.Screenshot`), the bundled GNOME extension's `dev.avifenesh.ComputerUseLinux.WindowControl` service, and temporary KWin scripting.
 - **MCP transport** — [`rmcp`](https://crates.io/crates/rmcp) with the `transport-io` feature; stdio framing, no network.
-- **Input fallback** — when the remote-desktop portal isn't available or the host wants deterministic injection, the binary writes to `ydotoold`'s socket, which writes to `/dev/uinput`. `install.sh` can configure `ydotoold`; the `setup` command only enables the GNOME AT-SPI bridge.
+- **Input fallback** — coordinate-bearing pointer actions use absolute uinput or write through `ydotoold`; the remote-desktop portal is limited to input that needs no screenshot-pixel mapping. `install.sh` can configure `ydotoold`; the `setup` command only enables the GNOME AT-SPI bridge.
 - **Window registry** — `list_windows`, `focused_window`, `activate_window`, `press_key`, and `type_text` share a backend registry. It tries GNOME extension, GNOME Introspect, COSMIC helper, KWin scripting, Hyprland `hyprctl`, and i3 IPC in that order, skipping empty or failed backends so another compositor backend can answer.
 - **GNOME extension fallback** — recent GNOME builds deny `org.gnome.Shell.Introspect.GetWindows` to non-blessed clients. The bundled Shell extension exposes window data and exact activation under `dev.avifenesh.ComputerUseLinux.WindowControl`.
 - **COSMIC helper** — `computer-use-linux-cosmic` talks to COSMIC toplevel protocols and is resolved from `COMPUTER_USE_LINUX_COSMIC_HELPER`, next to the running binary, or from `PATH`.

@@ -1,3 +1,6 @@
+use crate::input_policy::{
+    effective_pointer_input_backends, PointerInputBackends, PointerInputOverrides,
+};
 use crate::windowing::registry::{
     self, COSMIC_WAYLAND_BACKEND, GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND,
     HYPRLAND_BACKEND, I3_BACKEND, KWIN_BACKEND, NIRI_BACKEND, X11_BACKEND,
@@ -180,9 +183,24 @@ pub fn doctor_report() -> DoctorReport {
     let accessibility = accessibility_report();
     let windowing = windowing_report(&platform);
     let input = input_report();
-    let readiness = readiness_report(&platform, &portals, &accessibility, &windowing, &input);
+    let pointer_overrides = PointerInputOverrides::from_env();
+    let readiness = readiness_report(
+        &platform,
+        &portals,
+        &accessibility,
+        &windowing,
+        &input,
+        pointer_overrides,
+    );
 
-    let capabilities = capability_map(&platform, &portals, &accessibility, &windowing, &input);
+    let capabilities = capability_map(
+        &platform,
+        &portals,
+        &accessibility,
+        &windowing,
+        &input,
+        pointer_overrides,
+    );
 
     DoctorReport {
         platform,
@@ -203,16 +221,15 @@ fn capability_map(
     accessibility: &AccessibilityReport,
     windowing: &WindowingReport,
     input: &InputReport,
+    pointer_overrides: PointerInputOverrides,
 ) -> CapabilityMap {
+    let pointer_input = effective_pointer_backends(input, pointer_overrides);
     let mut input_backends = Vec::new();
     // Absolute uinput pointer: accurate, non-blocking of coordinates; preferred.
-    if input.uinput.ok {
+    if pointer_input.abs_pointer {
         input_backends.push("abs_pointer".to_string());
     }
-    if portals.remote_desktop.ok {
-        input_backends.push("portal".to_string());
-    }
-    if input.ydotool.ok && input.ydotoold.ok && input.ydotool_socket.ok {
+    if pointer_input.ydotool {
         input_backends.push("ydotool".to_string());
     }
 
@@ -670,17 +687,18 @@ fn input_report() -> InputReport {
 
 fn readiness_report(
     platform: &PlatformReport,
-    portals: &PortalReport,
+    _portals: &PortalReport,
     accessibility: &AccessibilityReport,
     windowing: &WindowingReport,
     input: &InputReport,
+    pointer_overrides: PointerInputOverrides,
 ) -> ReadinessReport {
     let mut blockers = Vec::new();
     let can_build_accessibility_tree = can_build_accessibility_tree(accessibility);
     let can_query_windows = windowing.can_list_windows;
     let can_focus_apps = windowing.can_focus_apps;
     let can_focus_windows = windowing.can_focus_windows;
-    let can_send_development_input = can_send_development_input(portals, input);
+    let can_send_development_input = can_send_development_input(input, pointer_overrides);
 
     if !can_build_accessibility_tree {
         blockers.push(
@@ -707,7 +725,7 @@ fn readiness_report(
 
     if !can_send_development_input {
         blockers.push(
-            "Development input is unavailable; enable read/write /dev/uinput, XDG RemoteDesktop portal input, or ydotool with a connectable ydotoold socket."
+            "Development coordinate input is unavailable; enable absolute uinput or an allowed working ydotool backend."
                 .to_string(),
         );
     }
@@ -727,7 +745,7 @@ fn readiness_report(
     } else if !can_focus_windows {
         "Enable an exact-focus window backend before using window_id, title, or terminal-targeted input.".to_string()
     } else if !can_send_development_input {
-        "Enable a supported input backend: grant read/write /dev/uinput, enable the XDG RemoteDesktop portal, or start ydotoold with a socket accessible to this desktop user."
+        "Enable coordinate input: allow absolute uinput or start ydotoold and allow ydotool pointer input."
             .to_string()
     } else {
         "Computer Use is ready: AT-SPI tree support, window targeting, and a Linux input backend are available."
@@ -746,10 +764,24 @@ fn readiness_report(
     }
 }
 
-fn can_send_development_input(portals: &PortalReport, input: &InputReport) -> bool {
-    input.uinput.ok
-        || portals.remote_desktop.ok
-        || input.ydotool.ok && input.ydotoold.ok && input.ydotool_socket.ok
+fn can_send_development_input(
+    input: &InputReport,
+    pointer_overrides: PointerInputOverrides,
+) -> bool {
+    effective_pointer_backends(input, pointer_overrides).any()
+}
+
+fn effective_pointer_backends(
+    input: &InputReport,
+    pointer_overrides: PointerInputOverrides,
+) -> PointerInputBackends {
+    effective_pointer_input_backends(
+        PointerInputBackends {
+            abs_pointer: input.uinput.ok,
+            ydotool: input.ydotool.ok && input.ydotoold.ok && input.ydotool_socket.ok,
+        },
+        pointer_overrides,
+    )
 }
 
 fn is_cosmic_wayland_platform(platform: &PlatformReport) -> bool {
@@ -1206,6 +1238,7 @@ mod tests {
             &accessibility,
             &windowing,
             &input,
+            PointerInputOverrides::default(),
         );
 
         assert!(readiness.can_query_windows);
@@ -1236,6 +1269,7 @@ mod tests {
             &accessibility,
             &windowing,
             &input,
+            PointerInputOverrides::default(),
         );
 
         assert!(readiness.can_query_windows);
@@ -1257,6 +1291,7 @@ mod tests {
             &accessibility,
             &windowing,
             &input,
+            PointerInputOverrides::default(),
         );
 
         assert!(readiness.blockers.is_empty());
@@ -1282,8 +1317,22 @@ mod tests {
             Check::fail("/dev/uinput: Permission denied"),
         );
 
-        let capabilities = capability_map(&platform, &portals, &accessibility, &windowing, &input);
-        let readiness = readiness_report(&platform, &portals, &accessibility, &windowing, &input);
+        let capabilities = capability_map(
+            &platform,
+            &portals,
+            &accessibility,
+            &windowing,
+            &input,
+            PointerInputOverrides::default(),
+        );
+        let readiness = readiness_report(
+            &platform,
+            &portals,
+            &accessibility,
+            &windowing,
+            &input,
+            PointerInputOverrides::default(),
+        );
 
         assert!(!capabilities
             .input
@@ -1310,6 +1359,7 @@ mod tests {
             &accessibility,
             &windowing,
             &input,
+            PointerInputOverrides::default(),
         );
 
         assert!(readiness.can_send_development_input);
@@ -1334,6 +1384,7 @@ mod tests {
             &accessibility,
             &windowing,
             &input,
+            PointerInputOverrides::default(),
         );
 
         assert!(readiness.can_send_development_input);
@@ -1341,7 +1392,51 @@ mod tests {
     }
 
     #[test]
-    fn readiness_accepts_remote_desktop_portal_without_local_input_backend() {
+    fn disabled_abs_pointer_is_not_advertised_or_ready_without_ydotool() {
+        let platform = platform_report();
+        let portals = portal_report(Check::fail("missing"));
+        let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
+        let windowing = windowing_report(true, true);
+        let input = input_report_parts(
+            Check::fail("missing ydotool"),
+            Check::fail("ydotoold not running"),
+            Check::fail("no connectable ydotool socket"),
+            Check::ok("read/write: /dev/uinput"),
+        );
+        let overrides = PointerInputOverrides {
+            abs_pointer_disabled: true,
+            ..Default::default()
+        };
+
+        let capabilities = capability_map(
+            &platform,
+            &portals,
+            &accessibility,
+            &windowing,
+            &input,
+            overrides,
+        );
+        let readiness = readiness_report(
+            &platform,
+            &portals,
+            &accessibility,
+            &windowing,
+            &input,
+            overrides,
+        );
+
+        assert_eq!(
+            (
+                capabilities.input,
+                capabilities.preferred.input,
+                readiness.can_send_development_input,
+            ),
+            (Vec::<String>::new(), None, false),
+        );
+    }
+
+    #[test]
+    fn readiness_rejects_remote_desktop_portal_without_coordinate_input_backend() {
         let platform = platform_report();
         let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
         let windowing = windowing_report(true, true);
@@ -1358,10 +1453,11 @@ mod tests {
             &accessibility,
             &windowing,
             &input,
+            PointerInputOverrides::default(),
         );
 
-        assert!(readiness.can_send_development_input);
-        assert!(readiness.blockers.is_empty());
+        assert!(!readiness.can_send_development_input);
+        assert!(!readiness.blockers.is_empty());
     }
 
     #[test]
@@ -1382,16 +1478,17 @@ mod tests {
             &accessibility,
             &windowing,
             &input,
+            PointerInputOverrides::default(),
         );
 
         assert!(!readiness.can_send_development_input);
         assert!(readiness
             .recommended_next_step
-            .contains("Enable a supported input backend"));
+            .contains("Enable coordinate input"));
         assert!(readiness
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("Development input is unavailable")));
+            .any(|blocker| blocker.contains("Development coordinate input is unavailable")));
     }
 
     #[test]
@@ -1446,6 +1543,7 @@ mod tests {
             &accessibility,
             &windowing,
             &input,
+            PointerInputOverrides::default(),
         );
 
         assert!(readiness
