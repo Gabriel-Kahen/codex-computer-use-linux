@@ -279,13 +279,8 @@ async fn redacts_arguments_and_bounds_the_serialized_batch_output() {
     .await;
     let serialized = serde_json::to_string(&result).unwrap();
 
-    assert!(
-        result
-            .results
-            .iter()
-            .all(|result| result.received.is_none()
-                && result.message.len() <= MAX_BATCH_MESSAGE_BYTES)
-    );
+    assert!(result.results.iter().all(|result| result.received.is_none()
+        && result.message.len() <= MAX_ACTION_RESULT_MESSAGE_BYTES));
     assert!(
         serialized.len() < 10_000,
         "serialized length: {}",
