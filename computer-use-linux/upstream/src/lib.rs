@@ -10,8 +10,6 @@ mod gnome_extension;
 mod identity;
 mod input_policy;
 mod observation;
-// The stacked cleanup removes coordinate-only portal helpers after dispatch stops using them.
-#[allow(dead_code)]
 mod remote_desktop;
 #[path = "screenshot.rs"]
 mod screenshot_impl;
