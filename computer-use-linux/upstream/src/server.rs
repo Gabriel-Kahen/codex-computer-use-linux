@@ -1280,7 +1280,7 @@ impl ComputerUseLinux {
             let session = session.clone();
             let result = self
                 .run_portal_pointer_action(async move {
-                    portal_scroll(&session, /*target_point*/ None, direction, units).await
+                    portal_scroll(&session, direction, units).await
                 })
                 .await;
             match result {
