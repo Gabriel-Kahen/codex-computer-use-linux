@@ -307,7 +307,7 @@ Spawn the binary with `["mcp"]` as the argv tail. It speaks JSON-RPC over stdio 
    computer-use-linux doctor | jq .readiness
    ```
 
-   Aim for `can_register_mcp_tools`, `can_build_accessibility_tree`, `can_send_development_input`, and `can_query_windows` all `true`. The `blockers` array should be empty.
+   Aim for `can_register_mcp_tools`, `can_build_accessibility_tree`, `can_send_development_input`, `can_send_coordinate_input`, and `can_query_windows` all `true`. `can_send_development_input` also covers portal keyboard-only setups; coordinate click/drag readiness is reported separately. The `blockers` array should be empty.
 
 2. **If `accessibility.at_spi_bus.ok = false`** — run `computer-use-linux setup` (or call the `setup_accessibility` MCP tool). This sets:
    - `org.gnome.desktop.interface toolkit-accessibility true`

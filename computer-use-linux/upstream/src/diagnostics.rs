@@ -138,6 +138,11 @@ pub struct ReadinessReport {
     pub can_query_windows: bool,
     pub can_focus_apps: bool,
     pub can_focus_windows: bool,
+    /// Whether screenshot/global coordinates can be injected without using an
+    /// unverified portal transform.
+    pub can_send_coordinate_input: bool,
+    /// Whether any development input path, including portal keyboard input, is
+    /// available. Retained for compatibility with existing doctor consumers.
     pub can_send_development_input: bool,
     pub recommended_next_step: String,
     pub blockers: Vec<String>,
@@ -228,6 +233,9 @@ fn capability_map(
     // Absolute uinput pointer: accurate, non-blocking of coordinates; preferred.
     if pointer_input.abs_pointer {
         input_backends.push("abs_pointer".to_string());
+    }
+    if portals.remote_desktop.ok {
+        input_backends.push("portal".to_string());
     }
     if pointer_input.ydotool {
         input_backends.push("ydotool".to_string());
@@ -687,7 +695,7 @@ fn input_report() -> InputReport {
 
 fn readiness_report(
     platform: &PlatformReport,
-    _portals: &PortalReport,
+    portals: &PortalReport,
     accessibility: &AccessibilityReport,
     windowing: &WindowingReport,
     input: &InputReport,
@@ -698,7 +706,8 @@ fn readiness_report(
     let can_query_windows = windowing.can_list_windows;
     let can_focus_apps = windowing.can_focus_apps;
     let can_focus_windows = windowing.can_focus_windows;
-    let can_send_development_input = can_send_development_input(input, pointer_overrides);
+    let can_send_coordinate_input = can_send_coordinate_input(input, pointer_overrides);
+    let can_send_development_input = can_send_coordinate_input || portals.remote_desktop.ok;
 
     if !can_build_accessibility_tree {
         blockers.push(
@@ -723,7 +732,7 @@ fn readiness_report(
         );
     }
 
-    if !can_send_development_input {
+    if !can_send_coordinate_input {
         blockers.push(
             "Development coordinate input is unavailable; enable absolute uinput or an allowed working ydotool backend."
                 .to_string(),
@@ -744,7 +753,7 @@ fn readiness_report(
         )
     } else if !can_focus_windows {
         "Enable an exact-focus window backend before using window_id, title, or terminal-targeted input.".to_string()
-    } else if !can_send_development_input {
+    } else if !can_send_coordinate_input {
         "Enable coordinate input: allow absolute uinput or start ydotoold and allow ydotool pointer input."
             .to_string()
     } else {
@@ -758,13 +767,14 @@ fn readiness_report(
         can_query_windows,
         can_focus_apps,
         can_focus_windows,
+        can_send_coordinate_input,
         can_send_development_input,
         recommended_next_step,
         blockers,
     }
 }
 
-fn can_send_development_input(
+fn can_send_coordinate_input(
     input: &InputReport,
     pointer_overrides: PointerInputOverrides,
 ) -> bool {
@@ -1338,6 +1348,7 @@ mod tests {
             .input
             .iter()
             .any(|backend| backend == "ydotool"));
+        assert!(!readiness.can_send_coordinate_input);
         assert!(!readiness.can_send_development_input);
     }
 
@@ -1362,6 +1373,7 @@ mod tests {
             PointerInputOverrides::default(),
         );
 
+        assert!(readiness.can_send_coordinate_input);
         assert!(readiness.can_send_development_input);
         assert!(readiness.blockers.is_empty());
     }
@@ -1387,6 +1399,7 @@ mod tests {
             PointerInputOverrides::default(),
         );
 
+        assert!(readiness.can_send_coordinate_input);
         assert!(readiness.can_send_development_input);
         assert!(readiness.blockers.is_empty());
     }
@@ -1429,15 +1442,17 @@ mod tests {
             (
                 capabilities.input,
                 capabilities.preferred.input,
+                readiness.can_send_coordinate_input,
                 readiness.can_send_development_input,
             ),
-            (Vec::<String>::new(), None, false),
+            (Vec::<String>::new(), None, false, false),
         );
     }
 
     #[test]
-    fn readiness_rejects_remote_desktop_portal_without_coordinate_input_backend() {
+    fn readiness_preserves_portal_input_but_reports_missing_coordinate_backend() {
         let platform = platform_report();
+        let portals = portal_report(Check::ok("org.freedesktop.portal.RemoteDesktop"));
         let accessibility = accessibility_report(Check::ok("bus"), Check::ok("true"));
         let windowing = windowing_report(true, true);
         let input = input_report_parts(
@@ -1447,16 +1462,27 @@ mod tests {
             Check::fail("/dev/uinput: Permission denied"),
         );
 
+        let capabilities = capability_map(
+            &platform,
+            &portals,
+            &accessibility,
+            &windowing,
+            &input,
+            PointerInputOverrides::default(),
+        );
         let readiness = readiness_report(
             &platform,
-            &portal_report(Check::ok("org.freedesktop.portal.RemoteDesktop")),
+            &portals,
             &accessibility,
             &windowing,
             &input,
             PointerInputOverrides::default(),
         );
 
-        assert!(!readiness.can_send_development_input);
+        assert_eq!(capabilities.input, vec!["portal".to_string()]);
+        assert_eq!(capabilities.preferred.input.as_deref(), Some("portal"));
+        assert!(!readiness.can_send_coordinate_input);
+        assert!(readiness.can_send_development_input);
         assert!(!readiness.blockers.is_empty());
     }
 
@@ -1481,6 +1507,7 @@ mod tests {
             PointerInputOverrides::default(),
         );
 
+        assert!(!readiness.can_send_coordinate_input);
         assert!(!readiness.can_send_development_input);
         assert!(readiness
             .recommended_next_step
