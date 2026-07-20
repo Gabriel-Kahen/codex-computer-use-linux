@@ -11,10 +11,10 @@ Operate the user's real desktop session. Reuse existing application processes, p
 
 1. Use `doctor` when readiness or the active desktop backend is unknown.
 2. When the matching companion skill is available, apply it before using shared observation or input tools:
-   - Hyprland: `$same-session-computer-use`
-   - GNOME: `$gnome-same-session-computer-use`
-   - Plasma Wayland: `$plasma-same-session-computer-use`
-   - EWMH Xorg: `$x11-same-session-computer-use`
+   - Hyprland: `$same-session-computer-use:same-session-computer-use`
+   - GNOME: `$gnome-same-session-computer-use:gnome-same-session-computer-use`
+   - Plasma Wayland: `$plasma-same-session-computer-use:plasma-same-session-computer-use`
+   - EWMH Xorg: `$x11-background-computer-use:x11-same-session-computer-use`
 3. Treat companion window claims and focus/input leases as authoritative. The shared MCP server cannot mechanically enforce a companion's claims, so never use it to inspect or mutate a window claimed by another task.
 4. Keep claim and lease tokens private to their owning task. Follow the companion's validation, renewal, recovery, and cleanup sequence exactly.
 5. For Niri, COSMIC, and i3, use the shared plugin directly and serialize desktop mutations because no companion claim broker is provided.

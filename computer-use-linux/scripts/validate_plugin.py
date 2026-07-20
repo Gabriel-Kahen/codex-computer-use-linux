@@ -44,9 +44,41 @@ def main() -> None:
     assert manifest["skills"] == "./skills/"
     skill_path = PLUGIN_ROOT / manifest["skills"] / "computer-use-linux/SKILL.md"
     skill_metadata, skill_text = read_skill(skill_path)
-    assert (skill_path.parent / "agents/openai.yaml").is_file()
     assert skill_metadata["name"] == "computer-use-linux"
     assert skill_metadata["description"]
+    ui_metadata_path = skill_path.parent / "agents/openai.yaml"
+    ui_lines = ui_metadata_path.read_text(encoding="utf-8").splitlines()
+    assert ui_lines[0] == "interface:", f"Skill UI metadata is invalid: {ui_metadata_path}"
+    ui_metadata = {}
+    for line in ui_lines[1:]:
+        assert line.startswith("  "), f"Skill UI metadata line is invalid: {line}"
+        key, separator, value = line.strip().partition(":")
+        assert separator, f"Skill UI metadata line is invalid: {line}"
+        ui_metadata[key] = json.loads(value.strip())
+    assert set(ui_metadata) == {"display_name", "short_description", "default_prompt"}
+    assert all(isinstance(value, str) and value for value in ui_metadata.values())
+    skill_mention = f"${manifest['name']}:{skill_metadata['name']}"
+    assert skill_mention in ui_metadata["default_prompt"], (
+        f"Skill UI metadata must reference {skill_mention}"
+    )
+
+    companion_skills = [
+        ("contrib/hyprland-background-computer-use", "same-session-computer-use"),
+        ("contrib/gnome-same-session-computer-use", "gnome-same-session-computer-use"),
+        ("contrib/plasma-same-session-computer-use", "plasma-same-session-computer-use"),
+        ("contrib/x11-background-computer-use", "x11-same-session-computer-use"),
+    ]
+    for plugin_dir, skill_name in companion_skills:
+        companion_root = REPO_ROOT / plugin_dir
+        companion_manifest = read_json(companion_root / ".codex-plugin/plugin.json")
+        companion_metadata, _ = read_skill(
+            companion_root / f"skills/{skill_name}/SKILL.md"
+        )
+        companion_mention = f"${companion_manifest['name']}:{companion_metadata['name']}"
+        assert companion_mention in skill_text, (
+            f"Linux Computer Use skill must reference {companion_mention}"
+        )
+
     for required_guidance in [
         "observation_id",
         "checkpoint_id",
