@@ -214,8 +214,11 @@ For an EWMH Xorg desktop:
 codex plugin add x11-background-computer-use@codex-computer-use-linux
 ```
 
-Start a new Codex task after installation so the tools and operating skill are
-loaded, then verify the installed plugins:
+Start a new Codex task after installation so the tools and the shared
+[`computer-use-linux` operating skill](./computer-use-linux/skills/computer-use-linux/SKILL.md)
+are loaded. The skill routes work through an installed desktop companion's
+window claims and input leases before using the shared tools. Then verify the
+installed plugins:
 
 ```shell
 codex plugin list
