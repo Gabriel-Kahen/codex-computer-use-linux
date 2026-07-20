@@ -47,34 +47,43 @@ jobs:
           git config rerere.autoupdate true
 
           # Teach Git the conflict resolutions from recent reviewed upstream
-          # merge commits. Work in a disposable clone because rerere-train
-          # checks out and resets each historical merge while learning it.
-          trainer=/usr/share/git/rerere-train.sh
-          if [[ -x "$trainer" ]]; then
-            mapfile -t resolution_merges < <(
-              git log origin/main \
-                --merges \
-                --max-count=25 \
-                --format=%H \
-                --grep="Merge remote-tracking branch '.*upstream/main' into"
+          # merge commits. Work in a disposable clone because training checks
+          # out and resets each historical merge while learning it.
+          mapfile -t resolution_merges < <(
+            git log origin/main \
+              --merges \
+              --max-count=25 \
+              --format=%H \
+              --grep="Merge remote-tracking branch '.*upstream/main' into"
+          )
+          if (( ${#resolution_merges[@]} > 0 )); then
+            training_repo="$RUNNER_TEMP/upstream-rerere-training"
+            git clone --shared --quiet . "$training_repo"
+            (
+              cd "$training_repo"
+              git config user.name github-actions[bot]
+              git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+              git config rerere.enabled true
+              for merge_commit in "${resolution_merges[@]}"; do
+                read -ra parents <<< "$(git show -s --format=%P "$merge_commit")"
+                git checkout -q "${parents[0]}"
+                if git merge --no-gpg-sign "${parents[@]:1}" >/dev/null 2>&1; then
+                  continue
+                fi
+                if [[ -s "$(git rev-parse --git-dir)/MERGE_RR" ]]; then
+                  git rerere
+                  git checkout -q "$merge_commit" -- .
+                  git rerere
+                fi
+                git reset -q --hard
+              done
             )
-            if (( ${#resolution_merges[@]} > 0 )); then
-              training_repo="$RUNNER_TEMP/upstream-rerere-training"
-              git clone --shared --quiet . "$training_repo"
-              (
-                cd "$training_repo"
-                git config rerere.enabled true
-                "$trainer" --no-walk "${resolution_merges[@]}"
-              )
-              if [[ -d "$training_repo/.git/rr-cache" ]]; then
-                mkdir -p "$(git rev-parse --git-dir)/rr-cache"
-                cp -R \
-                  "$training_repo/.git/rr-cache/." \
-                  "$(git rev-parse --git-dir)/rr-cache/"
-              fi
+            if [[ -d "$training_repo/.git/rr-cache" ]]; then
+              mkdir -p "$(git rev-parse --git-dir)/rr-cache"
+              cp -R \
+                "$training_repo/.git/rr-cache/." \
+                "$(git rev-parse --git-dir)/rr-cache/"
             fi
-          else
-            echo "::warning::git rerere trainer not found at $trainer"
           fi
 
           if git merge-base --is-ancestor upstream/main origin/main; then
