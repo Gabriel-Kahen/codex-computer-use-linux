@@ -38,6 +38,15 @@ identity through the upstream-supported `CUL_*` build variables. It also maps
 legacy `CODEX_COMPUTER_USE_*` runtime variables to their generic equivalents.
 No Codex string patch is required in the upstream engine.
 
+Tagged releases also build architecture-specific marketplace archives for
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` with an Ubuntu 22.04
+glibc 2.35 baseline. Each archive embeds
+both Codex-branded binaries and a `SHA256SUMS` manifest. The launcher verifies
+that manifest before executing a release binary and fails closed if the bundle
+is incomplete or modified. Source checkouts keep the existing locked Cargo
+build behavior; `CODEX_COMPUTER_USE_LINUX_BUILD_FROM_SOURCE=1` explicitly uses
+that path from a release bundle.
+
 The isolated Chrome host is optional and is not started by the MCP plugin:
 
 ```shell
@@ -57,6 +66,17 @@ Do not enable it alongside `computer-use@openai-bundled`; both expose the MCP
 server name `computer-use`. `just computer-use-install` builds and installs the
 repository version. Reinstall after source changes and start a new Codex task so
 the refreshed MCP tools are loaded.
+
+## Publish prebuilt bundles
+
+Bump `PREBUILT_VERSION` and `.codex-plugin/plugin.json` together, merge the
+validated change, and tag that commit with `computer-use-v<version>`. The
+`computer-use-prebuilt-release` workflow builds both supported architectures on
+Ubuntu 22.04, assembles minimal marketplace archives, smoke-tests the x86_64
+archive without Cargo, and publishes each archive with its SHA-256 file. Uploads
+remain in a retryable draft until every asset is present, then the workflow
+publishes without changing the repository-wide latest release. It rejects a tag
+that does not exactly match the plugin version.
 
 ## Upstream maintenance
 

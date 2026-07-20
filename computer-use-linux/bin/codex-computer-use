@@ -5,26 +5,86 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 manifest="$root/upstream/Cargo.toml"
 cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
 target_dir="${CODEX_COMPUTER_USE_LINUX_TARGET_DIR:-$cache_home/codex-computer-use-linux/target}"
-backend="$target_dir/release/computer-use-linux"
+source_backend="$target_dir/release/computer-use-linux"
+build_identity="$root/prebuilt-build.env"
 
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "cargo is required to build the repository-owned Linux Computer Use backend" >&2
-    exit 1
-fi
+set -a
+source "$build_identity"
+set +a
 
-CUL_GNOME_EXTENSION_UUID="codex-window-control@openai.com" \
-CUL_DBUS_SERVICE="com.openai.Codex.WindowControl" \
-CUL_DBUS_OBJECT_PATH="/com/openai/Codex/WindowControl" \
-CARGO_TARGET_DIR="$target_dir" cargo build \
-    --locked \
-    --release \
-    --manifest-path "$manifest" \
-    --quiet
+build_from_source() {
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "cargo is required to build the repository-owned Linux Computer Use backend" >&2
+        exit 1
+    fi
+
+    CARGO_TARGET_DIR="$target_dir" cargo build \
+        --locked \
+        --release \
+        --manifest-path "$manifest" \
+        --bin computer-use-linux \
+        --bin computer-use-linux-cosmic \
+        --quiet
+}
 
 if [ "${1:-}" = "--build-only" ]; then
-    printf '%s\n' "$backend"
+    build_from_source
+    printf '%s\n' "$source_backend"
     exit 0
 fi
+
+prebuilt_target() {
+    if [ "$(uname -s)" != "Linux" ]; then
+        return 1
+    fi
+    case "$(uname -m)" in
+        x86_64 | amd64) printf '%s\n' "x86_64-unknown-linux-gnu" ;;
+        aarch64 | arm64) printf '%s\n' "aarch64-unknown-linux-gnu" ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_prebuilt() {
+    local directory="$1"
+    local checksums="$directory/SHA256SUMS"
+    local digest filename extra
+    local main_entries=0
+    local helper_entries=0
+    if [ ! -x "$directory/computer-use-linux" ] ||
+        [ ! -x "$directory/computer-use-linux-cosmic" ] ||
+        [ -L "$directory/computer-use-linux" ] ||
+        [ -L "$directory/computer-use-linux-cosmic" ] ||
+        [ ! -f "$checksums" ] || [ -L "$checksums" ]; then
+        echo "Linux Computer Use release bundle is incomplete for $(uname -m)" >&2
+        exit 1
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        echo "sha256sum is required to verify the Linux Computer Use release bundle" >&2
+        exit 1
+    fi
+    while read -r digest filename extra; do
+        if [ "${#digest}" -ne 64 ] || [[ "$digest" == *[!0-9a-fA-F]* ]] || [ -n "$extra" ]; then
+            echo "Linux Computer Use release bundle has an invalid checksum manifest" >&2
+            exit 1
+        fi
+        case "$filename" in
+            computer-use-linux) main_entries=$((main_entries + 1)) ;;
+            computer-use-linux-cosmic) helper_entries=$((helper_entries + 1)) ;;
+            *)
+                echo "Linux Computer Use release bundle has an invalid checksum manifest" >&2
+                exit 1
+                ;;
+        esac
+    done < "$checksums"
+    if [ "$main_entries" -ne 1 ] || [ "$helper_entries" -ne 1 ]; then
+        echo "Linux Computer Use release bundle has an invalid checksum manifest" >&2
+        exit 1
+    fi
+    if ! (cd "$directory" && sha256sum --check --strict --status SHA256SUMS); then
+        echo "Linux Computer Use release bundle checksum verification failed" >&2
+        exit 1
+    fi
+}
 
 forward_codex_alias() {
     local codex_name="$1"
@@ -40,5 +100,28 @@ forward_codex_alias CODEX_COMPUTER_USE_FORCE_PORTAL_POINTER COMPUTER_USE_LINUX_F
 forward_codex_alias CODEX_COMPUTER_USE_FORCE_YDOTOOL_KEYBOARD COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD
 forward_codex_alias CODEX_COMPUTER_USE_FORCE_PORTAL_KEYBOARD COMPUTER_USE_LINUX_FORCE_PORTAL_KEYBOARD
 forward_codex_alias CODEX_COMPUTER_USE_COSMIC_HELPER COMPUTER_USE_LINUX_COSMIC_HELPER
+
+if [ "${CODEX_COMPUTER_USE_LINUX_BUILD_FROM_SOURCE:-0}" = "1" ] ||
+    [ ! -f "$root/prebuilt/RELEASE_BUNDLE" ]; then
+    build_from_source
+    backend="$source_backend"
+else
+    bundle_version="$(<"$root/prebuilt/RELEASE_BUNDLE")"
+    expected_version="$(<"$root/PREBUILT_VERSION")"
+    if [ "$bundle_version" != "$expected_version" ]; then
+        echo "Linux Computer Use release bundle version does not match the plugin version" >&2
+        exit 1
+    fi
+    target="$(prebuilt_target)" || {
+        echo "Linux Computer Use release bundles support Linux x86_64 and aarch64; set CODEX_COMPUTER_USE_LINUX_BUILD_FROM_SOURCE=1 to build this platform from source" >&2
+        exit 1
+    }
+    prebuilt_dir="$root/prebuilt/$target"
+    verify_prebuilt "$prebuilt_dir"
+    backend="$prebuilt_dir/computer-use-linux"
+    if [ -z "${COMPUTER_USE_LINUX_COSMIC_HELPER+x}" ]; then
+        export COMPUTER_USE_LINUX_COSMIC_HELPER="$prebuilt_dir/computer-use-linux-cosmic"
+    fi
+fi
 
 exec "$backend" "$@"

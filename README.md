@@ -69,7 +69,9 @@ They are still part of the repository's same-session computer-use feature.
 - Linux running one of the supported desktop backends listed above
 - a current [Codex CLI](https://developers.openai.com/codex/cli) release with
   `codex plugin` support
-- Rust and `cargo`, because the source plugin is built on the target machine
+- `curl`, Python 3, `tar`, and `sha256sum` when installing a prebuilt release bundle
+- glibc 2.35 or newer for prebuilt bundles; older systems can build from source
+- Rust and `cargo` only when installing or developing from source
 - any system dependencies listed by the desktop backend guide you choose
 
 The bundled and repository-owned Computer Use plugins expose the same MCP
@@ -80,7 +82,69 @@ if it is installed:
 codex plugin remove computer-use@openai-bundled
 ```
 
-### Install from the Git marketplace
+### Install a prebuilt bundle
+
+Release bundles contain the Codex Computer Use marketplace, its plugin sources, and
+checksum-pinned `computer-use-linux` and COSMIC helper binaries. Select the
+archive for the current architecture, verify it before extraction, and install
+the extracted marketplace:
+
+```shell
+(
+  set -euo pipefail
+  releases="https://github.com/Gabriel-Kahen/codex-computer-use-linux/releases"
+  release_tag="$(
+    python3 - <<'PY'
+import json
+import urllib.request
+
+url = "https://api.github.com/repos/Gabriel-Kahen/codex-computer-use-linux/releases?per_page=100"
+while url:
+    request = urllib.request.Request(url, headers={"User-Agent": "codex-computer-use-installer"})
+    with urllib.request.urlopen(request) as response:
+        releases = json.load(response)
+        links = response.headers.get("Link", "")
+    for release in releases:
+        tag = release["tag_name"]
+        if tag.startswith("computer-use-v") and not release["draft"] and not release["prerelease"]:
+            print(tag)
+            raise SystemExit
+    url = next(
+        (part[part.index("<") + 1 : part.index(">")] for part in links.split(",") if 'rel="next"' in part),
+        "",
+    )
+raise SystemExit("No published Linux Computer Use bundle release was found")
+PY
+  )"
+  version="${release_tag#computer-use-v}"
+  case "$(uname -m)" in
+    x86_64 | amd64) target=x86_64-unknown-linux-gnu ;;
+    aarch64 | arm64) target=aarch64-unknown-linux-gnu ;;
+    *) echo "No prebuilt Linux Computer Use bundle for $(uname -m)" >&2; exit 1 ;;
+  esac
+  archive="codex-computer-use-linux-$version-$target.tar.gz"
+  base="$releases/download/$release_tag"
+  bundle_tmp="$(mktemp -d)"
+  trap 'rm -rf "$bundle_tmp"' EXIT
+  curl -fL "$base/$archive" -o "$bundle_tmp/$archive"
+  curl -fL "$base/$archive.sha256" -o "$bundle_tmp/$archive.sha256"
+  (cd "$bundle_tmp" && sha256sum --check --strict "$archive.sha256")
+  install_root="${XDG_DATA_HOME:-$HOME/.local/share}/codex-computer-use-linux/$version-$target"
+  mkdir -p "$install_root"
+  tar --no-same-owner -xzf "$bundle_tmp/$archive" -C "$install_root"
+  codex plugin marketplace add "$install_root"
+  codex plugin add computer-use-linux@codex-computer-use-linux
+)
+```
+
+The launcher verifies both bundled executables every time it starts. A missing
+or modified executable fails closed instead of compiling or running a fallback.
+If replacing an existing source installation, first run
+`codex plugin remove computer-use-linux@codex-computer-use-linux` and
+`codex plugin marketplace remove codex-computer-use-linux` so the marketplace
+name can be registered at its new local path.
+
+### Install from the Git marketplace (source build)
 
 This fetches only the marketplace metadata, shared engine, and desktop backend
 plugins instead of cloning the full Codex fork:
@@ -96,8 +160,9 @@ codex plugin marketplace add Gabriel-Kahen/codex-computer-use-linux --ref main \
 codex plugin add computer-use-linux@codex-computer-use-linux
 ```
 
-The launcher performs a locked release build when Codex starts it. Cargo
-reuses the external build cache when the source has not changed.
+This is the source installation path. The launcher performs a locked release
+build when Codex starts it, and Cargo reuses the external build cache when the
+source has not changed.
 
 ### Install from a local checkout
 
@@ -113,6 +178,9 @@ codex plugin add computer-use-linux@codex-computer-use-linux
 
 Codex installs a source snapshot rather than a live link. Reinstall the plugin
 after changing the shared engine or a desktop integration.
+
+Set `CODEX_COMPUTER_USE_LINUX_BUILD_FROM_SOURCE=1` to explicitly rebuild from
+source when running an extracted prebuilt bundle.
 
 ### Install the desktop integration
 
