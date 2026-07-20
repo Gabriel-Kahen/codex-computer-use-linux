@@ -40,6 +40,31 @@ use regex_lite::Regex;
 
 const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
 const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
+const TEST_WAV_SAMPLE_RATE: u32 = 8_000;
+
+fn pcm_wav_data_url(sample_count: u32) -> (String, usize) {
+    let padding = sample_count % 2;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + sample_count + padding).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&TEST_WAV_SAMPLE_RATE.to_le_bytes());
+    bytes.extend_from_slice(&TEST_WAV_SAMPLE_RATE.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&sample_count.to_le_bytes());
+    bytes.resize(
+        bytes.len() + sample_count as usize + padding as usize,
+        /*value*/ 0,
+    );
+    let payload = BASE64_STANDARD.encode(bytes);
+    let payload_len = payload.len();
+    (format!("data:audio/wav;base64,{payload}"), payload_len)
+}
 
 fn assistant_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -420,6 +445,31 @@ fn for_prompt_preserves_inter_agent_assistant_messages() {
 }
 
 #[test]
+fn cloned_history_shares_items_until_mutated() {
+    let first = assistant_msg(&"first ".repeat(1_024));
+    let second = assistant_msg("second");
+    let history = create_history_with_items(vec![first.clone()]);
+    let mut snapshot = history.clone();
+
+    assert!(std::ptr::eq(
+        history.raw_items().as_ptr(),
+        snapshot.raw_items().as_ptr()
+    ));
+
+    snapshot.record_items(
+        std::slice::from_ref(&second),
+        TruncationPolicy::Tokens(10_000),
+    );
+
+    assert!(!std::ptr::eq(
+        history.raw_items().as_ptr(),
+        snapshot.raw_items().as_ptr()
+    ));
+    assert_eq!(history.raw_items(), std::slice::from_ref(&first));
+    assert_eq!(snapshot.raw_items(), &[first, second]);
+}
+
+#[test]
 fn drop_last_n_user_turns_treats_inter_agent_assistant_messages_as_instruction_turns() {
     let first_turn = user_input_text_msg("first");
     let first_reply = assistant_msg("done");
@@ -514,7 +564,7 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
                 FunctionCallOutputContentItem::InputAudio {
-                    audio_url: "data:audio/wav;base64,YXVkaW8=".to_string(),
+                    audio_url: "data:audio/mpeg;base64,YXVkaW8=".to_string(),
                 },
             ]),
             internal_chat_message_metadata_passthrough: None,
@@ -541,14 +591,15 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
                 FunctionCallOutputContentItem::InputAudio {
-                    audio_url: "data:audio/wav;base64,YXVkaW8=".to_string(),
+                    audio_url: "data:audio/ogg;base64,YXVkaW8=".to_string(),
                 },
             ]),
             internal_chat_message_metadata_passthrough: None,
         },
     ];
-    // Populate raw history directly so this exercises prompt normalization for
-    // persisted multimodal tool outputs before record-time truncation removes media.
+    let fully_supported_items = items.clone();
+    // Exercise prompt normalization for persisted tool output that predates
+    // record-time media truncation.
     let mut history = ContextManager::new();
     history.replace(items);
     let text_only_modalities = vec![InputModality::Text];
@@ -633,6 +684,14 @@ fn for_prompt_strips_media_when_model_does_not_support_it() {
         },
     ];
     assert_eq!(stripped, expected);
+    assert_eq!(
+        create_history_with_items(fully_supported_items.clone()).for_prompt(&[
+            InputModality::Text,
+            InputModality::Image,
+            InputModality::Audio,
+        ]),
+        fully_supported_items
+    );
 
     // With image support, images are preserved
     let modalities = default_input_modalities();
@@ -833,68 +892,6 @@ fn remove_first_item_removes_matching_call_for_output() {
 }
 
 #[test]
-fn replace_last_turn_images_replaces_tool_output_images() {
-    let items = vec![
-        user_input_text_msg("hi"),
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "call-1".to_string(),
-            output: FunctionCallOutputPayload {
-                body: FunctionCallOutputBody::ContentItems(vec![
-                    FunctionCallOutputContentItem::InputImage {
-                        image_url: "data:image/png;base64,AAA".to_string(),
-                        detail: Some(DEFAULT_IMAGE_DETAIL),
-                    },
-                ]),
-                success: Some(true),
-            },
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let mut history = create_history_with_items(items);
-
-    assert!(history.replace_last_turn_images("Invalid image"));
-
-    assert_eq!(
-        history.raw_items(),
-        vec![
-            user_input_text_msg("hi"),
-            ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: "call-1".to_string(),
-                output: FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::ContentItems(vec![
-                        FunctionCallOutputContentItem::InputText {
-                            text: "Invalid image".to_string(),
-                        },
-                    ]),
-                    success: Some(true),
-                },
-                internal_chat_message_metadata_passthrough: None,
-            },
-        ]
-    );
-}
-
-#[test]
-fn replace_last_turn_images_does_not_touch_user_images() {
-    let items = vec![ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputImage {
-            image_url: "data:image/png;base64,AAA".to_string(),
-            detail: Some(DEFAULT_IMAGE_DETAIL),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }];
-    let mut history = create_history_with_items(items.clone());
-
-    assert!(!history.replace_last_turn_images("Invalid image"));
-    assert_eq!(history.raw_items(), items);
-}
-
-#[test]
 fn remove_first_item_handles_local_shell_pair() {
     let items = vec![
         ResponseItem::LocalShellCall {
@@ -1064,7 +1061,6 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
         assistant_msg("session prefix item"),
         user_input_text_msg("turn 1 user"),
         assistant_msg("turn 1 assistant"),
-        developer_msg("Generated images are saved to /tmp as /tmp/image-1.png by default."),
         developer_msg(&format!(
             "{APPS_INSTRUCTIONS_OPEN_TAG}\nROLLED_BACK_APPS_INSTRUCTIONS"
         )),
@@ -1095,7 +1091,6 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
             assistant_msg("session prefix item"),
             user_input_text_msg("turn 1 user"),
             assistant_msg("turn 1 assistant"),
-            developer_msg("Generated images are saved to /tmp as /tmp/image-1.png by default."),
         ]
     );
     assert_eq!(
@@ -1336,7 +1331,7 @@ fn record_items_hard_caps_mixed_text_and_images_by_detail() {
             output: FunctionCallOutputPayload::from_content_items(content),
             internal_chat_message_metadata_passthrough: None,
         };
-        let stored = ContextManager::new().process_item(&item, TruncationPolicy::Tokens(100_000));
+        let stored = ContextManager::process_item(&item, TruncationPolicy::Tokens(100_000));
         assert!(estimate_item_token_count(&stored) <= 10_000);
         let ResponseItem::FunctionCallOutput { output, .. } = stored else {
             panic!("expected function output");
@@ -1363,40 +1358,6 @@ fn record_items_hard_caps_mixed_text_and_images_by_detail() {
 }
 
 #[test]
-fn record_items_preserves_supported_audio_tool_output() {
-    let items = vec![
-        ResponseItem::FunctionCall {
-            id: None,
-            name: "listen".to_string(),
-            namespace: None,
-            arguments: "{}".to_string(),
-            call_id: "call-audio".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "call-audio".to_string(),
-            output: FunctionCallOutputPayload::from_content_items(vec![
-                FunctionCallOutputContentItem::InputText {
-                    text: "recording".to_string(),
-                },
-                FunctionCallOutputContentItem::InputAudio {
-                    audio_url: "data:audio/wav;base64,YXVkaW8=".to_string(),
-                },
-            ]),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let mut history = ContextManager::new();
-    history.record_items(&items, TruncationPolicy::Tokens(10_000));
-
-    assert_eq!(
-        history.for_prompt(&[InputModality::Text, InputModality::Audio]),
-        items
-    );
-}
-
-#[test]
 fn record_items_hard_caps_oversized_audio_tool_output() {
     let item = ResponseItem::FunctionCallOutput {
         id: None,
@@ -1412,7 +1373,7 @@ fn record_items_hard_caps_oversized_audio_tool_output() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let stored = ContextManager::new().process_item(&item, TruncationPolicy::Tokens(100_000));
+    let stored = ContextManager::process_item(&item, TruncationPolicy::Tokens(1_000_000));
 
     assert!(estimate_item_token_count(&stored) <= 10_000);
     assert_eq!(
@@ -1425,8 +1386,7 @@ fn record_items_hard_caps_oversized_audio_tool_output() {
                     text: "recording".to_string(),
                 },
                 FunctionCallOutputContentItem::InputText {
-                    text: "[omitted 1 media or encrypted content items to fit the model-context limit]"
-                        .to_string(),
+                    text: "[omitted 1 audio items ...]".to_string(),
                 },
             ]),
             internal_chat_message_metadata_passthrough: None,
@@ -2223,19 +2183,28 @@ fn image_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
 }
 
 #[test]
-fn audio_data_url_payload_uses_decoded_audio_estimate() {
-    let payload = "A".repeat(100_000);
-    let audio_url = format!("data:audio/wav;base64,{payload}");
-    let message = ResponseItem::Message {
+fn audio_data_url_payload_does_not_dominate_message_estimate() {
+    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 801);
+    let item = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
-        content: vec![ContentItem::InputAudio {
-            audio_url: audio_url.clone(),
-        }],
+        content: vec![ContentItem::InputAudio { audio_url }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
-    let tool_output = ResponseItem::FunctionCallOutput {
+
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 2) as i64;
+
+    assert_eq!(estimated, expected);
+    assert!(estimated < raw_len);
+}
+
+#[test]
+fn audio_data_url_payload_does_not_dominate_function_call_output_estimate() {
+    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 800);
+    let item = ResponseItem::FunctionCallOutput {
         id: None,
         call_id: "call-audio".to_string(),
         output: FunctionCallOutputPayload::from_content_items(vec![
@@ -2244,23 +2213,87 @@ fn audio_data_url_payload_uses_decoded_audio_estimate() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_message_len = serde_json::to_string(&message).unwrap().len() as i64;
-    let raw_tool_output_len = serde_json::to_string(&tool_output).unwrap().len() as i64;
-    let estimated_tokens = payload
-        .len()
-        .saturating_mul(3)
-        .div_ceil(4)
-        .div_ceil(AUDIO_INPUT_BYTES_PER_TOKEN_ESTIMATE);
-    let replacement_bytes = approx_bytes_for_tokens(estimated_tokens) as i64;
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 1) as i64;
+
+    assert_eq!(estimated, expected);
+    assert!(estimated < raw_len);
+}
+
+#[test]
+fn audio_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
+    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 80_000);
+    let item = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-custom-audio".to_string(),
+        name: None,
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputAudio { audio_url },
+        ]),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 100) as i64;
+
+    assert_eq!(estimated, expected);
+    assert!(estimated < raw_len);
+}
+
+#[test]
+fn malformed_audio_data_url_falls_back_to_whole_url_size_cost() {
+    let payload = "A".repeat(/*n*/ 100_000);
+    let audio_url = format!("data:audio/wav;base64,{payload}");
+    let fallback_bytes = approx_bytes_for_tokens(approx_token_count(&audio_url)) as i64;
+    let item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputAudio { audio_url }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+
+    assert_eq!(estimated, raw_len - payload.len() as i64 + fallback_bytes);
+}
+
+#[test]
+fn record_items_omits_audio_that_exceeds_the_output_budget() {
+    let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 80_000);
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "call-audio".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![
+                FunctionCallOutputContentItem::InputAudio { audio_url },
+            ]),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = ContextManager::new();
+
+    history.record_items([&item], TruncationPolicy::Tokens(50));
+
     assert_eq!(
-        (
-            estimate_response_item_model_visible_bytes(&message),
-            estimate_response_item_model_visible_bytes(&tool_output),
-        ),
-        (
-            raw_message_len - payload.len() as i64 + replacement_bytes,
-            raw_tool_output_len - payload.len() as i64 + replacement_bytes,
-        )
+        history.raw_items(),
+        &[ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-audio".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: "[omitted 1 audio items ...]".to_string(),
+                    },
+                ]),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        }]
     );
 }
 
