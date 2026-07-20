@@ -1,6 +1,6 @@
 {
   "name": "computer-use-linux",
-  "version": "0.5.0-codex.1+codex.20260716212503",
+  "version": "0.5.0-codex.2+codex.20260720195614",
   "description": "Inspect and control Linux desktop applications from Codex.",
   "author": {
     "name": "Avi Fenesh and contributors"

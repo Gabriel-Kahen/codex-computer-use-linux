@@ -1,0 +1,226 @@
+name: computer-use-prebuilt-release
+
+on:
+  pull_request:
+    paths:
+      - .agents/plugins/marketplace.json
+      - .github/workflows/computer-use-prebuilt-release.yml
+      - computer-use-linux/**
+  push:
+    tags:
+      - computer-use-v*
+
+permissions:
+  contents: read
+
+concurrency:
+  group: computer-use-prebuilt-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate plugin and release versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(<computer-use-linux/PREBUILT_VERSION)"
+          manifest_version="$(python3 -c 'import json; print(json.load(open("computer-use-linux/.codex-plugin/plugin.json"))["version"])')"
+          test "$version" = "$manifest_version"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "computer-use-v$version"
+            commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+            git fetch --no-tags origin main
+            git merge-base --is-ancestor "$commit" origin/main
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Test plugin packaging scripts
+        run: |
+          python3 computer-use-linux/scripts/validate_plugin.py
+          python3 -m unittest discover \
+            -s computer-use-linux/scripts/tests \
+            -p 'test_*.py' \
+            -v
+
+  build:
+    name: Build bundle (${{ matrix.target }})
+    needs: metadata
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            cross: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libdbus-1-dev pkg-config
+          if ${{ matrix.cross }}; then
+            sudo apt-get install --no-install-recommends -y \
+              gcc-aarch64-linux-gnu \
+              libc6-dev-arm64-cross \
+              qemu-user
+          fi
+
+      - name: Build Codex-branded binaries
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          set -euo pipefail
+          set -a
+          source computer-use-linux/prebuilt-build.env
+          set +a
+          cargo build \
+            --locked \
+            --release \
+            --manifest-path computer-use-linux/upstream/Cargo.toml \
+            --target "${{ matrix.target }}" \
+            --bin computer-use-linux \
+            --bin computer-use-linux-cosmic
+
+      - name: Assemble marketplace bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/computer-use-bundle"
+          mkdir -p "$stage/root"
+          git archive "$GITHUB_SHA" -- \
+            computer-use-linux \
+            contrib/gnome-same-session-computer-use \
+            contrib/hyprland-background-computer-use \
+            contrib/plasma-same-session-computer-use \
+            contrib/x11-background-computer-use \
+            .agents/plugins/marketplace.json \
+            | tar -x -C "$stage/root"
+          prebuilt="$stage/root/computer-use-linux/prebuilt/$TARGET"
+          mkdir -p "$prebuilt"
+          printf '%s\n' "$VERSION" > "$stage/root/computer-use-linux/prebuilt/RELEASE_BUNDLE"
+          cp "computer-use-linux/upstream/target/$TARGET/release/computer-use-linux" "$prebuilt/"
+          cp "computer-use-linux/upstream/target/$TARGET/release/computer-use-linux-cosmic" "$prebuilt/"
+          (
+            cd "$prebuilt"
+            sha256sum computer-use-linux computer-use-linux-cosmic > SHA256SUMS
+          )
+          archive="codex-computer-use-linux-$VERSION-$TARGET.tar.gz"
+          tar -czf "$archive" -C "$stage/root" .
+          sha256sum "$archive" > "$archive.sha256"
+          mkdir dist
+          mv "$archive" "$archive.sha256" dist/
+
+      - name: Inspect and smoke-test bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="dist/codex-computer-use-linux-$VERSION-$TARGET.tar.gz"
+          (
+            cd dist
+            sha256sum --check "$(basename "$archive").sha256"
+          )
+          smoke="$RUNNER_TEMP/computer-use-smoke"
+          mkdir -p "$smoke"
+          tar -xzf "$archive" -C "$smoke"
+          file "$smoke/computer-use-linux/prebuilt/$TARGET/computer-use-linux"
+          file "$smoke/computer-use-linux/prebuilt/$TARGET/computer-use-linux-cosmic"
+          if [[ "$TARGET" == x86_64-* ]]; then
+            tools="$RUNNER_TEMP/no-cargo-path"
+            mkdir -p "$tools"
+            for tool in bash dirname sha256sum uname; do
+              ln -s "$(command -v "$tool")" "$tools/$tool"
+            done
+            env -i PATH="$tools" HOME="$RUNNER_TEMP/no-cargo-home" \
+              "$smoke/computer-use-linux/bin/codex-computer-use" --help
+          else
+            qemu-aarch64 -L /usr/aarch64-linux-gnu \
+              "$smoke/computer-use-linux/prebuilt/$TARGET/computer-use-linux" --help
+          fi
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: computer-use-linux-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish prebuilt bundles
+    if: startsWith(github.ref, 'refs/tags/computer-use-v')
+    needs:
+      - metadata
+      - build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download bundle artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: computer-use-linux-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify downloaded bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check --strict *.sha256
+
+      - name: Require a new immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; published bundle assets are immutable" >&2
+            exit 1
+          fi
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Linux Computer Use ${{ needs.metadata.outputs.version }}
+          body: Architecture-specific Codex plugin marketplace bundles for Linux Computer Use. Verify the matching `.sha256` file before extraction.
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          make_latest: false
+          overwrite_files: false
