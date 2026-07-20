@@ -69,7 +69,7 @@ They are still part of the repository's same-session computer-use feature.
 - Linux running one of the supported desktop backends listed above
 - a current [Codex CLI](https://developers.openai.com/codex/cli) release with
   `codex plugin` support
-- `curl`, `tar`, and `sha256sum` when installing a prebuilt release bundle
+- `curl`, Python 3, `tar`, and `sha256sum` when installing a prebuilt release bundle
 - glibc 2.35 or newer for prebuilt bundles; older systems can build from source
 - Rust and `cargo` only when installing or developing from source
 - any system dependencies listed by the desktop backend guide you choose
@@ -92,14 +92,38 @@ the extracted marketplace:
 ```shell
 (
   set -euo pipefail
-  version="$(curl -fsSL https://raw.githubusercontent.com/Gabriel-Kahen/codex-computer-use-linux/main/computer-use-linux/PREBUILT_VERSION)"
+  releases="https://github.com/Gabriel-Kahen/codex-computer-use-linux/releases"
+  release_tag="$(
+    python3 - <<'PY'
+import json
+import urllib.request
+
+url = "https://api.github.com/repos/Gabriel-Kahen/codex-computer-use-linux/releases?per_page=100"
+while url:
+    request = urllib.request.Request(url, headers={"User-Agent": "codex-computer-use-installer"})
+    with urllib.request.urlopen(request) as response:
+        releases = json.load(response)
+        links = response.headers.get("Link", "")
+    for release in releases:
+        tag = release["tag_name"]
+        if tag.startswith("computer-use-v") and not release["draft"] and not release["prerelease"]:
+            print(tag)
+            raise SystemExit
+    url = next(
+        (part[part.index("<") + 1 : part.index(">")] for part in links.split(",") if 'rel="next"' in part),
+        "",
+    )
+raise SystemExit("No published Linux Computer Use bundle release was found")
+PY
+  )"
+  version="${release_tag#computer-use-v}"
   case "$(uname -m)" in
     x86_64 | amd64) target=x86_64-unknown-linux-gnu ;;
     aarch64 | arm64) target=aarch64-unknown-linux-gnu ;;
     *) echo "No prebuilt Linux Computer Use bundle for $(uname -m)" >&2; exit 1 ;;
   esac
   archive="codex-computer-use-linux-$version-$target.tar.gz"
-  base="https://github.com/Gabriel-Kahen/codex-computer-use-linux/releases/download/computer-use-v$version"
+  base="$releases/download/$release_tag"
   bundle_tmp="$(mktemp -d)"
   trap 'rm -rf "$bundle_tmp"' EXIT
   curl -fL "$base/$archive" -o "$bundle_tmp/$archive"
@@ -107,7 +131,7 @@ the extracted marketplace:
   (cd "$bundle_tmp" && sha256sum --check --strict "$archive.sha256")
   install_root="${XDG_DATA_HOME:-$HOME/.local/share}/codex-computer-use-linux/$version-$target"
   mkdir -p "$install_root"
-  tar -xzf "$bundle_tmp/$archive" -C "$install_root"
+  tar --no-same-owner -xzf "$bundle_tmp/$archive" -C "$install_root"
   codex plugin marketplace add "$install_root"
   codex plugin add computer-use-linux@codex-computer-use-linux
 )

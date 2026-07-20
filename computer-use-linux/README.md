@@ -73,8 +73,10 @@ Bump `PREBUILT_VERSION` and `.codex-plugin/plugin.json` together, merge the
 validated change, and tag that commit with `computer-use-v<version>`. The
 `computer-use-prebuilt-release` workflow builds both supported architectures on
 Ubuntu 22.04, assembles minimal marketplace archives, smoke-tests the x86_64
-archive without Cargo, and publishes each archive with its SHA-256 file. The
-workflow rejects a tag that does not exactly match the plugin version.
+archive without Cargo, and publishes each archive with its SHA-256 file. Uploads
+remain in a retryable draft until every asset is present, then the workflow
+publishes without changing the repository-wide latest release. It rejects a tag
+that does not exactly match the plugin version.
 
 ## Upstream maintenance
 

@@ -141,7 +141,7 @@ jobs:
             sha256sum computer-use-linux computer-use-linux-cosmic > SHA256SUMS
           )
           archive="codex-computer-use-linux-$VERSION-$TARGET.tar.gz"
-          tar -czf "$archive" -C "$stage/root" .
+          tar --owner=0 --group=0 --numeric-owner -czf "$archive" -C "$stage/root" .
           sha256sum "$archive" > "$archive.sha256"
           mkdir dist
           mv "$archive" "$archive.sha256" dist/
@@ -209,23 +209,32 @@ jobs:
           cd dist
           sha256sum --check --strict *.sha256
 
-      - name: Require a new immutable release
+      - name: Prepare draft release
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "release $GITHUB_REF_NAME already exists; published bundle assets are immutable" >&2
+          set -euo pipefail
+          state="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq 'if .isDraft then "draft" else "published" end' 2>/dev/null || true)"
+          if [[ "$state" == published ]]; then
+            echo "release $GITHUB_REF_NAME is already published; bundle assets are immutable" >&2
             exit 1
           fi
+          if [[ "$state" != draft ]]; then
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --generate-notes \
+              --notes "Architecture-specific Codex plugin marketplace bundles for Linux Computer Use. Verify the matching SHA-256 file before extraction." \
+              --title "Linux Computer Use $VERSION" \
+              --verify-tag
+          fi
 
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Linux Computer Use ${{ needs.metadata.outputs.version }}
-          body: Architecture-specific Codex plugin marketplace bundles for Linux Computer Use. Verify the matching `.sha256` file before extraction.
-          files: dist/*
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          make_latest: false
-          overwrite_files: false
+      - name: Upload and publish GitHub release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest=false
