@@ -137,9 +137,8 @@ impl ContextManager {
     }
 
     /// Returns the history prepared for sending to the model. This applies a proper
-    /// normalization and drops un-suited items. When `input_modalities` does not
-    /// include `InputModality::Image`, images are stripped from messages and tool
-    /// outputs.
+    /// normalization and drops un-suited items. Unsupported image and audio content
+    /// is stripped from messages and tool outputs according to `input_modalities`.
     pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
         self.normalize_history(input_modalities);
         self.items
@@ -357,7 +356,7 @@ impl ContextManager {
     /// This function enforces a couple of invariants on the in-memory history:
     /// 1. every call (function/custom) has a corresponding output entry
     /// 2. every output has a corresponding call entry
-    /// 3. when images are unsupported, image content is stripped from messages and tool outputs
+    /// 3. unsupported image and audio content is stripped from messages and tool outputs
     fn normalize_history(&mut self, input_modalities: &[InputModality]) {
         // all function/tool calls must have a corresponding output
         normalize::ensure_call_outputs_present(&mut self.items);
@@ -367,6 +366,9 @@ impl ContextManager {
 
         // strip images when model does not support them
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
+
+        // strip audio when model does not support it
+        normalize::strip_audio_when_unsupported(input_modalities, &mut self.items);
 
         let max_tokens =
             i64::try_from(FUNCTION_OUTPUT_MAX_MODEL_VISIBLE_TOKENS).unwrap_or(i64::MAX);
