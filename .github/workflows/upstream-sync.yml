@@ -212,7 +212,7 @@ jobs:
           if [[ "$REUSED_RESOLUTION" == true ]]; then
             pr_body="$pr_body
 
-Git reused conflict resolutions from prior reviewed upstream merges. Automatic merging is disabled; review the reused resolution and fork CI before merging."
+          Git reused conflict resolutions from prior reviewed upstream merges. Automatic merging is disabled; review the reused resolution and fork CI before merging."
           fi
           pr="$(gh api \
             --method GET \
