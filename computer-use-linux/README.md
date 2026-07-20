@@ -67,6 +67,10 @@ server name `computer-use`. `just computer-use-install` builds and installs the
 repository version. Reinstall after source changes and start a new Codex task so
 the refreshed MCP tools are loaded.
 
+The plugin also ships the `computer-use-linux` operating skill. It selects the
+matching installed desktop companion before shared input, preserves companion
+window claims and leases, and guides semantic-first observe-act-verify usage.
+
 ## Publish prebuilt bundles
 
 Bump `PREBUILT_VERSION` and `.codex-plugin/plugin.json` together, merge the

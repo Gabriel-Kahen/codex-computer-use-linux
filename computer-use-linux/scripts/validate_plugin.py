@@ -16,6 +16,19 @@ def read_json(path: Path) -> dict:
         return json.load(handle)
 
 
+def read_skill(path: Path) -> tuple[dict[str, str], str]:
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("---\n"), f"Skill front matter is invalid: {path}"
+    front_matter, separator, _body = text.removeprefix("---\n").partition("\n---\n")
+    assert separator, f"Skill front matter is invalid: {path}"
+    metadata = {}
+    for line in front_matter.splitlines():
+        key, separator, value = line.partition(":")
+        assert separator, f"Skill front matter line is invalid: {line}"
+        metadata[key.strip()] = value.strip()
+    return metadata, text
+
+
 def main() -> None:
     manifest = read_json(PLUGIN_ROOT / ".codex-plugin/plugin.json")
     assert PLUGIN_ROOT.name == manifest["name"]
@@ -27,6 +40,23 @@ def main() -> None:
     launcher = PLUGIN_ROOT / server["command"]
     assert launcher.is_file(), f"MCP launcher is missing: {launcher}"
     assert os.access(launcher, os.X_OK), f"MCP launcher is not executable: {launcher}"
+
+    assert manifest["skills"] == "./skills/"
+    skill_path = PLUGIN_ROOT / manifest["skills"] / "computer-use-linux/SKILL.md"
+    skill_metadata, skill_text = read_skill(skill_path)
+    assert (skill_path.parent / "agents/openai.yaml").is_file()
+    assert skill_metadata["name"] == "computer-use-linux"
+    assert skill_metadata["description"]
+    for required_guidance in [
+        "observation_id",
+        "checkpoint_id",
+        "window claims",
+        "focus/input lease",
+        "explicit authorization",
+    ]:
+        assert required_guidance in skill_text, (
+            f"Linux Computer Use skill is missing required guidance: {required_guidance}"
+        )
 
     marketplace = read_json(REPO_ROOT / ".agents/plugins/marketplace.json")
     entry = next(item for item in marketplace["plugins"] if item["name"] == manifest["name"])

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Linux Computer Use"
+  short_description: "Safely operate apps in the current Linux desktop"
+  default_prompt: "Use $computer-use-linux to inspect and safely operate an app in my current Linux desktop session."
