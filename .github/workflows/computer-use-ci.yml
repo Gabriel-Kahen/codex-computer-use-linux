@@ -18,8 +18,10 @@ jobs:
   codex-sync:
     name: Codex sync integration
     if: >-
-      (github.event_name == 'pull_request' && github.head_ref == 'automation/upstream-sync') ||
-      (github.event_name == 'workflow_dispatch' && github.ref_name == 'automation/upstream-sync')
+      (github.event_name == 'pull_request' &&
+        (github.head_ref == 'automation/upstream-sync' || startsWith(github.head_ref, 'codex/upstream-sync-'))) ||
+      (github.event_name == 'workflow_dispatch' &&
+        (github.ref_name == 'automation/upstream-sync' || startsWith(github.ref_name, 'codex/upstream-sync-')))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
