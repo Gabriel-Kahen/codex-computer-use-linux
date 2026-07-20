@@ -590,6 +590,7 @@ fn hard_cap_function_output_payload(
             matches!(
                 item,
                 FunctionCallOutputContentItem::InputImage { .. }
+                    | FunctionCallOutputContentItem::InputAudio { .. }
                     | FunctionCallOutputContentItem::EncryptedContent { .. }
             )
         }) else {
@@ -642,7 +643,7 @@ fn hard_cap_candidate(
     };
     let marker = FunctionCallOutputContentItem::InputText {
         text: format!(
-            "[omitted {omitted_non_text_items} image or encrypted content items to fit the model-context limit]"
+            "[omitted {omitted_non_text_items} media or encrypted content items to fit the model-context limit]"
         ),
     };
     let insertion_index = items
@@ -700,6 +701,9 @@ fn estimate_item_token_count(item: &ResponseItem) -> i64 {
 /// The estimator later converts bytes to tokens using a 4-bytes/token heuristic
 /// with ceiling division, so 7,373 bytes maps to approximately 1,844 tokens.
 const RESIZED_IMAGE_BYTES_ESTIMATE: i64 = 7373;
+// Audio duration is unavailable at this layer, so use a conservative decoded-byte proxy.
+// This keeps preflight history bounded without treating base64 wire bytes as text tokens.
+const AUDIO_INPUT_BYTES_PER_TOKEN_ESTIMATE: usize = 64;
 // See https://platform.openai.com/docs/guides/images-vision#calculating-costs.
 // Use a direct 32px patch count only for `detail: "original"`;
 // all other image inputs continue to use `RESIZED_IMAGE_BYTES_ESTIMATE`.
@@ -737,6 +741,8 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
                 .unwrap_or_default();
             let (image_payload_bytes, image_replacement_bytes) =
                 image_data_url_estimate_adjustment(item);
+            let (audio_payload_bytes, audio_replacement_bytes) =
+                audio_data_url_estimate_adjustment(item);
             let (encrypted_payload_bytes, encrypted_replacement_bytes) =
                 encrypted_function_output_estimate_adjustment(item);
             // Replace raw base64 payload bytes with a per-image estimate.
@@ -744,7 +750,9 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
             // wrapper bytes already included in `raw`.
             let raw = raw
                 .saturating_sub(image_payload_bytes)
-                .saturating_add(image_replacement_bytes);
+                .saturating_add(image_replacement_bytes)
+                .saturating_sub(audio_payload_bytes)
+                .saturating_add(audio_replacement_bytes);
             raw.saturating_sub(encrypted_payload_bytes)
                 .saturating_add(encrypted_replacement_bytes)
         }
@@ -757,6 +765,10 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
 /// We only discount payloads for `data:image/...;base64,...` URLs (case
 /// insensitive markers) and leave everything else at raw serialized size.
 fn parse_base64_image_data_url(url: &str) -> Option<&str> {
+    parse_base64_media_data_url(url, "image/")
+}
+
+fn parse_base64_media_data_url<'a>(url: &'a str, media_type_prefix: &str) -> Option<&'a str> {
     if !url
         .get(.."data:".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
@@ -774,8 +786,8 @@ fn parse_base64_image_data_url(url: &str) -> Option<&str> {
     let mime_type = metadata_parts.next().unwrap_or_default();
     let has_base64_marker = metadata_parts.any(|part| part.eq_ignore_ascii_case("base64"));
     if !mime_type
-        .get(.."image/".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+        .get(..media_type_prefix.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(media_type_prefix))
     {
         return None;
     }
@@ -783,6 +795,46 @@ fn parse_base64_image_data_url(url: &str) -> Option<&str> {
         return None;
     }
     Some(payload)
+}
+
+/// Replaces inline audio base64 payload bytes with a conservative decoded-audio estimate.
+fn audio_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
+    let mut payload_bytes = 0i64;
+    let mut replacement_bytes = 0i64;
+    let mut accumulate = |audio_url: &str| {
+        if let Some(payload_len) = parse_base64_media_data_url(audio_url, "audio/").map(str::len) {
+            payload_bytes =
+                payload_bytes.saturating_add(i64::try_from(payload_len).unwrap_or(i64::MAX));
+            let decoded_bytes = payload_len.saturating_mul(3).div_ceil(4);
+            let estimated_tokens = decoded_bytes.div_ceil(AUDIO_INPUT_BYTES_PER_TOKEN_ESTIMATE);
+            replacement_bytes = replacement_bytes.saturating_add(
+                i64::try_from(approx_bytes_for_tokens(estimated_tokens)).unwrap_or(i64::MAX),
+            );
+        }
+    };
+
+    match item {
+        ResponseItem::Message { content, .. } => {
+            for content_item in content {
+                if let ContentItem::InputAudio { audio_url } = content_item {
+                    accumulate(audio_url);
+                }
+            }
+        }
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => {
+            if let FunctionCallOutputBody::ContentItems(items) = &output.body {
+                for content_item in items {
+                    if let FunctionCallOutputContentItem::InputAudio { audio_url } = content_item {
+                        accumulate(audio_url);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    (payload_bytes, replacement_bytes)
 }
 
 fn estimate_original_image_bytes(image_url: &str) -> Option<i64> {

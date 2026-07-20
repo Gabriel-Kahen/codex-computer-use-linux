@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -1377,6 +1378,9 @@ const LOCAL_AUDIO_OPEN_TAG_PREFIX: &str = "<audio name=";
 const LOCAL_AUDIO_OPEN_TAG_SUFFIX: &str = ">";
 const LOCAL_AUDIO_CLOSE_TAG: &str = AUDIO_CLOSE_TAG;
 
+/// Maximum decoded byte length accepted for one prompt audio input.
+pub const MAX_AUDIO_INPUT_BYTES: usize = 50 * 1024 * 1024;
+
 pub fn image_open_tag_text() -> String {
     IMAGE_OPEN_TAG.to_string()
 }
@@ -1563,6 +1567,27 @@ fn local_audio_content_items(
             text: LOCAL_AUDIO_CLOSE_TAG.to_string(),
         },
     ]
+}
+
+fn read_local_audio(path: &Path) -> io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_AUDIO_INPUT_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("audio input exceeds the {MAX_AUDIO_INPUT_BYTES}-byte size limit"),
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    file.take((MAX_AUDIO_INPUT_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_AUDIO_INPUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("audio input exceeds the {MAX_AUDIO_INPUT_BYTES}-byte size limit"),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn local_image_content_items(
@@ -1774,7 +1799,7 @@ impl ResponseInputItem {
                     }
                     UserInput::LocalAudio { path } => {
                         audio_index += 1;
-                        match std::fs::read(&path) {
+                        match read_local_audio(&path) {
                             Ok(file_bytes) => {
                                 local_audio_content_items(&path, &file_bytes, audio_index)
                             }
@@ -3765,6 +3790,25 @@ mod tests {
             text.starts_with("Codex could not read the local audio at `missing.wav`: "),
             "unexpected placeholder: {text}"
         );
+    }
+
+    #[test]
+    fn rejects_oversized_local_audio_before_reading_it() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let audio_path = temp_dir.path().join("oversized.wav");
+        let file = std::fs::File::create(&audio_path)?;
+        file.set_len((MAX_AUDIO_INPUT_BYTES as u64).saturating_add(1))?;
+
+        let item = ResponseInputItem::from(vec![UserInput::LocalAudio { path: audio_path }]);
+
+        let ResponseInputItem::Message { content, .. } = item else {
+            panic!("expected message response");
+        };
+        let [ContentItem::InputText { text }] = content.as_slice() else {
+            panic!("expected local audio error placeholder");
+        };
+        assert!(text.contains("audio input exceeds the 52428800-byte size limit"));
+        Ok(())
     }
 
     #[test]
