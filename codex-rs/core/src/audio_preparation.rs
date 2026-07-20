@@ -2,6 +2,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::MAX_AUDIO_INPUT_BYTES;
 use codex_protocol::models::ResponseItem;
 use tracing::warn;
 
@@ -15,8 +16,7 @@ const UNSUPPORTED_AUDIO_FORMAT_PLACEHOLDER: &str =
 /// Maximum accepted decoded byte length for prompt audio inputs.
 ///
 /// This matches the Responses API audio input limit.
-const MAX_PROMPT_AUDIO_INPUT_BYTES: usize = 50 * 1024 * 1024;
-const MAX_PROMPT_AUDIO_BASE64_BYTES: usize = MAX_PROMPT_AUDIO_INPUT_BYTES.div_ceil(3) * 4;
+const MAX_PROMPT_AUDIO_BASE64_BYTES: usize = MAX_AUDIO_INPUT_BYTES.div_ceil(3) * 4;
 
 #[derive(Debug, thiserror::Error)]
 enum AudioPreparationError {
@@ -24,7 +24,7 @@ enum AudioPreparationError {
     InvalidDataUrl { reason: &'static str },
     #[error("unsupported audio format")]
     UnsupportedFormat,
-    #[error("audio input is too large ({size} bytes; max {MAX_PROMPT_AUDIO_INPUT_BYTES} bytes)")]
+    #[error("audio input is too large ({size} bytes; max {MAX_AUDIO_INPUT_BYTES} bytes)")]
     AudioTooLarge { size: usize },
 }
 
@@ -165,7 +165,7 @@ fn prepare_audio(audio_url: &mut String) -> Result<(), AudioPreparationError> {
             .map_err(|_| AudioPreparationError::InvalidDataUrl {
                 reason: "invalid base64 payload",
             })?;
-    if bytes.len() > MAX_PROMPT_AUDIO_INPUT_BYTES {
+    if bytes.len() > MAX_AUDIO_INPUT_BYTES {
         return Err(AudioPreparationError::AudioTooLarge { size: bytes.len() });
     }
 

@@ -111,24 +111,19 @@ jobs:
           path: ${{ runner.temp }}/upstream-sync-conflict-state
           key: upstream-sync-conflict-${{ steps.merge.outputs.conflict_fingerprint }}
 
-      - name: Report new or manually checked conflict
-        if: >-
-          steps.merge.outputs.conflict == 'true' &&
-          (github.event_name != 'schedule' || steps.conflict_cache.outputs.cache-hit != 'true')
+      - name: Report or suppress merge conflict
+        if: steps.merge.outputs.conflict == 'true'
         env:
+          CACHE_HIT: ${{ steps.conflict_cache.outputs.cache-hit }}
           CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          echo "::error::Upstream sync has merge conflicts: $CONFLICTS"
-          exit 1
-
-      - name: Suppress repeated scheduled conflict failure
-        if: >-
-          steps.merge.outputs.conflict == 'true' &&
-          github.event_name == 'schedule' &&
-          steps.conflict_cache.outputs.cache-hit == 'true'
-        env:
-          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
-        run: |
+          action="$(python3 .github/scripts/upstream_sync_conflict_policy.py \
+            "$EVENT_NAME" "$CACHE_HIT")"
+          if [[ "$action" == report ]]; then
+            echo "::error::Upstream sync has merge conflicts: $CONFLICTS"
+            exit 1
+          fi
           echo "::warning::Upstream sync still has previously reported merge conflicts: $CONFLICTS"
 
       - name: Push sync branch
