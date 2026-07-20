@@ -2665,6 +2665,7 @@ dependencies = [
  "codex-sandboxing",
  "codex-shell-command",
  "codex-shell-escalation",
+ "codex-skills",
  "codex-state",
  "codex-terminal-detection",
  "codex-test-binary-support",
@@ -2777,6 +2778,7 @@ dependencies = [
  "codex-otel",
  "codex-plugin",
  "codex-protocol",
+ "codex-skills",
  "codex-tools",
  "codex-utils-absolute-path",
  "codex-utils-path",
@@ -3870,6 +3872,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-home-dir",
  "codex-utils-path-uri",
+ "codex-utils-pty",
  "codex-windows-sandbox",
  "dunce",
  "libc",
@@ -3949,7 +3952,9 @@ dependencies = [
 name = "codex-skills"
 version = "0.0.0"
 dependencies = [
+ "codex-protocol",
  "codex-utils-absolute-path",
+ "codex-utils-path-uri",
  "include_dir",
  "thiserror 2.0.18",
 ]
@@ -3964,6 +3969,7 @@ dependencies = [
  "codex-mcp",
  "codex-otel",
  "codex-protocol",
+ "codex-skills",
  "codex-tools",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
