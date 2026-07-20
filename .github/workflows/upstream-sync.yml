@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: upstream-sync
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   GH_REPO: ${{ github.repository }}
@@ -46,6 +46,7 @@ jobs:
 
           if git merge-base --is-ancestor upstream/main origin/main; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -70,6 +71,8 @@ jobs:
           git switch -C "$SYNC_BRANCH" origin/main
           if ! git merge --no-ff --no-edit upstream/main; then
             conflicts="$(git diff --name-only --diff-filter=U)"
+            conflict_fingerprint="$(git ls-files -u -z | git hash-object --stdin)"
+            printf '%s\n' "$conflict_fingerprint" > "$RUNNER_TEMP/upstream-sync-conflict-state"
             git merge --abort
             {
               echo "## Upstream sync requires manual resolution"
@@ -80,11 +83,53 @@ jobs:
               echo "$conflicts"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::Upstream sync has merge conflicts: ${conflicts//$'\n'/, }"
-            exit 1
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "conflict_fingerprint=$conflict_fingerprint" >> "$GITHUB_OUTPUT"
+            echo "conflicts=${conflicts//$'\n'/, }" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether conflict state is new
+        id: conflict_cache
+        if: steps.merge.outputs.conflict == 'true'
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ runner.temp }}/upstream-sync-conflict-state
+          key: upstream-sync-conflict-${{ steps.merge.outputs.conflict_fingerprint }}
+          lookup-only: true
+
+      - name: Remember new conflict state
+        if: >-
+          steps.merge.outputs.conflict == 'true' &&
+          steps.conflict_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ runner.temp }}/upstream-sync-conflict-state
+          key: upstream-sync-conflict-${{ steps.merge.outputs.conflict_fingerprint }}
+
+      - name: Report new or manually checked conflict
+        if: >-
+          steps.merge.outputs.conflict == 'true' &&
+          (github.event_name != 'schedule' || steps.conflict_cache.outputs.cache-hit != 'true')
+        env:
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          echo "::error::Upstream sync has merge conflicts: $CONFLICTS"
+          exit 1
+
+      - name: Suppress repeated scheduled conflict failure
+        if: >-
+          steps.merge.outputs.conflict == 'true' &&
+          github.event_name == 'schedule' &&
+          steps.conflict_cache.outputs.cache-hit == 'true'
+        env:
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          echo "::warning::Upstream sync still has previously reported merge conflicts: $CONFLICTS"
 
       - name: Push sync branch
         if: steps.merge.outputs.changed == 'true'
