@@ -123,7 +123,7 @@ fn truncates_across_multiple_under_limit_texts_and_reports_omitted() {
     ];
 
     let output =
-        truncate_function_output_items_with_policy(&items, TruncationPolicy::Tokens(limit));
+        truncate_function_output_items_with_policy(&items, TruncationPolicy::Tokens(limit), |_| 0);
 
     assert_eq!(output.len(), 5);
 
@@ -208,7 +208,7 @@ fn formatted_truncate_text_content_items_with_policy_preserves_empty_leading_tex
 }
 
 #[test]
-fn formatted_truncate_text_content_items_with_policy_merges_text_and_preserves_media() {
+fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_media() {
     let items = vec![
         FunctionCallOutputContentItem::InputText {
             text: "abcd".to_string(),
@@ -286,7 +286,7 @@ fn formatted_truncate_text_content_items_with_policy_preserves_encrypted_content
 }
 
 #[test]
-fn truncate_function_output_items_with_policy_preserves_non_text_content() {
+fn truncate_function_output_items_with_policy_omits_audio_over_budget() {
     let items = vec![
         FunctionCallOutputContentItem::InputText {
             text: "abcdefgh".to_string(),
@@ -299,7 +299,8 @@ fn truncate_function_output_items_with_policy_preserves_non_text_content() {
         },
     ];
 
-    let output = truncate_function_output_items_with_policy(&items, TruncationPolicy::Bytes(2));
+    let output =
+        truncate_function_output_items_with_policy(&items, TruncationPolicy::Bytes(2), |_| 1);
 
     assert_eq!(
         output,
@@ -310,8 +311,34 @@ fn truncate_function_output_items_with_policy_preserves_non_text_content() {
             FunctionCallOutputContentItem::EncryptedContent {
                 encrypted_content: "enc_opaque".to_string(),
             },
-            FunctionCallOutputContentItem::InputAudio {
-                audio_url: "audio:one".to_string(),
+            FunctionCallOutputContentItem::InputText {
+                text: "[omitted 1 audio items ...]".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn truncate_function_output_items_with_policy_charges_audio_against_byte_budget() {
+    let audio = FunctionCallOutputContentItem::InputAudio {
+        audio_url: "audio:one".to_string(),
+    };
+    let items = vec![
+        audio.clone(),
+        FunctionCallOutputContentItem::InputText {
+            text: "abcdefgh".to_string(),
+        },
+    ];
+
+    let output =
+        truncate_function_output_items_with_policy(&items, TruncationPolicy::Bytes(5), |_| 1);
+
+    assert_eq!(
+        output,
+        vec![
+            audio,
+            FunctionCallOutputContentItem::InputText {
+                text: truncate_text("abcdefgh", TruncationPolicy::Bytes(1)),
             },
         ]
     );

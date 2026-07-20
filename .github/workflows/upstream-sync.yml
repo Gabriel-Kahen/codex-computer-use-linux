@@ -43,10 +43,44 @@ jobs:
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git remote add upstream "$UPSTREAM_REPOSITORY"
           git fetch --no-tags upstream main
+          git config rerere.enabled true
+          git config rerere.autoupdate true
+
+          # Teach Git the conflict resolutions from recent reviewed upstream
+          # merge commits. Work in a disposable clone because rerere-train
+          # checks out and resets each historical merge while learning it.
+          trainer=/usr/share/git/rerere-train.sh
+          if [[ -x "$trainer" ]]; then
+            mapfile -t resolution_merges < <(
+              git log origin/main \
+                --merges \
+                --max-count=25 \
+                --format=%H \
+                --grep="Merge remote-tracking branch '.*upstream/main' into"
+            )
+            if (( ${#resolution_merges[@]} > 0 )); then
+              training_repo="$RUNNER_TEMP/upstream-rerere-training"
+              git clone --shared --quiet . "$training_repo"
+              (
+                cd "$training_repo"
+                git config rerere.enabled true
+                "$trainer" --no-walk "${resolution_merges[@]}"
+              )
+              if [[ -d "$training_repo/.git/rr-cache" ]]; then
+                mkdir -p "$(git rev-parse --git-dir)/rr-cache"
+                cp -R \
+                  "$training_repo/.git/rr-cache/." \
+                  "$(git rev-parse --git-dir)/rr-cache/"
+              fi
+            fi
+          else
+            echo "::warning::git rerere trainer not found at $trainer"
+          fi
 
           if git merge-base --is-ancestor upstream/main origin/main; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "conflict=false" >> "$GITHUB_OUTPUT"
+            echo "reused_resolution=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -71,7 +105,30 @@ jobs:
           git switch -C "$SYNC_BRANCH" origin/main
           if ! git merge --no-ff --no-edit upstream/main; then
             conflicts="$(git diff --name-only --diff-filter=U)"
-            conflict_fingerprint="$(git ls-files -u -z | git hash-object --stdin)"
+            if [[ -z "$conflicts" ]]; then
+              git commit --no-edit
+              {
+                echo "## Reused reviewed upstream conflict resolutions"
+                echo
+                echo "Git rerere resolved every conflict using prior reviewed upstream merges."
+                echo "The resulting pull request still requires overlap review and fork CI."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              echo "conflict=false" >> "$GITHUB_OUTPUT"
+              echo "reused_resolution=true" >> "$GITHUB_OUTPUT"
+              echo "overlap_review=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            merge_rr="$(git rev-parse --git-dir)/MERGE_RR"
+            if [[ -s "$merge_rr" ]]; then
+              conflict_fingerprint="$(
+                tr '\0' '\n' < "$merge_rr" \
+                  | LC_ALL=C sort \
+                  | git hash-object --stdin
+              )"
+            else
+              conflict_fingerprint="$(git ls-files -u -z | git hash-object --stdin)"
+            fi
             printf '%s\n' "$conflict_fingerprint" > "$RUNNER_TEMP/upstream-sync-conflict-state"
             git merge --abort
             {
@@ -92,6 +149,7 @@ jobs:
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "conflict=false" >> "$GITHUB_OUTPUT"
+          echo "reused_resolution=false" >> "$GITHUB_OUTPUT"
 
       - name: Check whether conflict state is new
         id: conflict_cache
@@ -146,10 +204,16 @@ jobs:
         if: steps.merge.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          REUSED_RESOLUTION: ${{ steps.merge.outputs.reused_resolution }}
         run: |
           set -euo pipefail
           head="$GITHUB_REPOSITORY_OWNER:$SYNC_BRANCH"
-          pr_body='Automated merge of the latest `openai/codex:main` into the Linux computer-use fork. Literal merge conflicts stop the workflow. Clean merges auto-merge after fork CI unless upstream and the fork changed the same paths, which requires manual review.'
+          pr_body='Automated merge of the latest `openai/codex:main` into the Linux computer-use fork. Unknown merge conflicts stop the workflow. Clean merges auto-merge after fork CI unless upstream and the fork changed the same paths, which requires manual review.'
+          if [[ "$REUSED_RESOLUTION" == true ]]; then
+            pr_body="$pr_body
+
+Git reused conflict resolutions from prior reviewed upstream merges. Automatic merging is disabled; review the reused resolution and fork CI before merging."
+          fi
           pr="$(gh api \
             --method GET \
             "repos/$GITHUB_REPOSITORY/pulls" \
@@ -183,10 +247,12 @@ jobs:
       - name: Require review for overlapping fork and upstream changes
         if: >-
           steps.merge.outputs.changed == 'true' &&
-          steps.merge.outputs.overlap_review == 'true'
+          (steps.merge.outputs.overlap_review == 'true' ||
+          steps.merge.outputs.reused_resolution == 'true')
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ steps.pull_request.outputs.number }}
+          REUSED_RESOLUTION: ${{ steps.merge.outputs.reused_resolution }}
         run: |
           set -euo pipefail
           label="upstream-fork-overlap"
@@ -222,6 +288,14 @@ jobs:
           Upstream and this fork both changed the paths below. Git merged them without textual conflicts and fork CI was dispatched, but automatic merging is disabled because the combined behavior needs manual review:
 
           ${paths}"
+          if [[ "$REUSED_RESOLUTION" == true ]]; then
+            body="${marker}
+          Git reused previously reviewed resolutions for textual conflicts in this upstream merge. Fork CI was dispatched, but automatic merging is disabled so the replayed resolution can be reviewed.
+
+          Overlapping paths:
+
+          ${paths}"
+          fi
           comment_ids="$(gh api \
             --paginate \
             "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
@@ -244,7 +318,8 @@ jobs:
       - name: Merge non-overlapping upstream changes after CI
         if: >-
           steps.merge.outputs.changed == 'true' &&
-          steps.merge.outputs.overlap_review != 'true'
+          steps.merge.outputs.overlap_review != 'true' &&
+          steps.merge.outputs.reused_resolution != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ steps.pull_request.outputs.number }}

@@ -42,6 +42,7 @@ pub fn formatted_truncate_text_content_items_with_policy(
             | FunctionCallOutputContentItem::EncryptedContent { .. } => None,
         })
         .collect::<Vec<_>>();
+
     if text_segments.is_empty() {
         return (items.to_vec(), None);
     }
@@ -88,6 +89,7 @@ pub fn formatted_truncate_text_content_items_with_policy(
 pub fn truncate_function_output_items_with_policy(
     items: &[FunctionCallOutputContentItem],
     policy: TruncationPolicy,
+    estimate_audio_token_count: impl Fn(&str) -> usize,
 ) -> Vec<FunctionCallOutputContentItem> {
     let mut out: Vec<FunctionCallOutputContentItem> = Vec::with_capacity(items.len());
     let mut remaining_budget = match policy {
@@ -95,6 +97,7 @@ pub fn truncate_function_output_items_with_policy(
         TruncationPolicy::Tokens(_) => policy.token_budget(),
     };
     let mut omitted_text_items = 0usize;
+    let mut omitted_audio_items = 0usize;
 
     for item in items {
         match item {
@@ -133,9 +136,19 @@ pub fn truncate_function_output_items_with_policy(
                 });
             }
             FunctionCallOutputContentItem::InputAudio { audio_url } => {
-                out.push(FunctionCallOutputContentItem::InputAudio {
-                    audio_url: audio_url.clone(),
-                });
+                let token_cost = estimate_audio_token_count(audio_url);
+                let cost = match policy {
+                    TruncationPolicy::Bytes(_) => approx_bytes_for_tokens(token_cost),
+                    TruncationPolicy::Tokens(_) => token_cost,
+                };
+                if cost <= remaining_budget {
+                    out.push(FunctionCallOutputContentItem::InputAudio {
+                        audio_url: audio_url.clone(),
+                    });
+                    remaining_budget = remaining_budget.saturating_sub(cost);
+                } else {
+                    omitted_audio_items += 1;
+                }
             }
             FunctionCallOutputContentItem::EncryptedContent { encrypted_content } => {
                 out.push(FunctionCallOutputContentItem::EncryptedContent {
@@ -148,6 +161,11 @@ pub fn truncate_function_output_items_with_policy(
     if omitted_text_items > 0 {
         out.push(FunctionCallOutputContentItem::InputText {
             text: format!("[omitted {omitted_text_items} text items ...]"),
+        });
+    }
+    if omitted_audio_items > 0 {
+        out.push(FunctionCallOutputContentItem::InputText {
+            text: format!("[omitted {omitted_audio_items} audio items ...]"),
         });
     }
 
