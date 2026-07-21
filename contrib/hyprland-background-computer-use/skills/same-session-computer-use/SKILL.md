@@ -23,7 +23,7 @@ Operate the real logged-in session. Never substitute a VM, nested desktop, alter
 
 ## Parallel tasks
 
-For one prompt with independent work in multiple windows, fan out one worker per window. Each worker must use its own host-provided task identity and claim only its assigned window. Different native Wayland windows can capture and mutate concurrently through this broker; actions on one window remain serialized. The generic Computer Use process shares those per-window locks for capture, but not yet for mutation. This broker's XWayland, physical-seat, and fallback operations also share a separate global lane and may wait or fail while that lane is reserved.
+For one prompt with independent work in multiple windows, fan out one worker per window. Each worker must use its own host-provided task identity and claim only its assigned window. Different native Wayland windows can capture and mutate concurrently through this broker; actions on one window remain serialized. The generic Computer Use process shares those per-window locks for capture, but not yet for mutation; a generic screenshot that raises its target also shares the global lane. This broker's XWayland, physical-seat, and fallback operations use that same global lane and may wait or fail while it is reserved.
 
 Never share a `claim_token` between workers. A claim defaults to 60 seconds; claimed broker operations renew it, and the owner can explicitly renew from 5 to 300 seconds with `claim_session_window`. Same-owner renewal keeps the token stable. If a token expires, stop acting, reacquire the window, recapture it, and use the newly returned token. A foreign active claim is authoritative even when an action omits `claim_token`.
 
