@@ -279,10 +279,7 @@ async fn select_devices(
         .unwrap_or(1);
     match (portal_version >= 2, persistence) {
         (true, PortalPersistence::Enabled { restore_token }) => {
-            options.insert(
-                "persist_mode",
-                Value::from(PERSIST_MODE_EXPLICITLY_REVOKED),
-            );
+            options.insert("persist_mode", Value::from(PERSIST_MODE_EXPLICITLY_REVOKED));
             if let Some(token) = restore_token {
                 options.insert("restore_token", Value::from(token));
             }
