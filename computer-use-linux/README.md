@@ -51,10 +51,12 @@ provenance attestations. After downloading an archive and its matching
 
 ```shell
 sha256sum --check codex-computer-use-linux-*.tar.gz.sha256
-gh attestation verify codex-computer-use-linux-*.tar.gz \
-  --repo Gabriel-Kahen/codex-computer-use-linux \
-  --signer-workflow \
-  Gabriel-Kahen/codex-computer-use-linux/.github/workflows/computer-use-prebuilt-release.yml
+for archive in codex-computer-use-linux-*.tar.gz; do
+  gh attestation verify "$archive" \
+    --repo Gabriel-Kahen/codex-computer-use-linux \
+    --signer-workflow \
+    Gabriel-Kahen/codex-computer-use-linux/.github/workflows/computer-use-prebuilt-release.yml
+done
 ```
 
 The isolated Chrome host is optional and is not started by the MCP plugin:
