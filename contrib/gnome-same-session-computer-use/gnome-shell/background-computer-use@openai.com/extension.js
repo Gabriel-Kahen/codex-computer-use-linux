@@ -14,6 +14,7 @@ import {
     renewLeaseAsync,
 } from './lease_dbus.js';
 import {
+    actAndCaptureTransaction,
     activateLeaseTransaction,
     assertInputSafe,
     injectKeyTransaction,
@@ -269,12 +270,17 @@ export default class BackgroundComputerUseExtension extends Extension {
         }
     }
 
-    _waitForWindowFrame(window, timeoutMs = 180) {
+    _armWindowFrame(window, timeoutMs = 180) {
         const actor = window.get_compositor_private();
-        if (!actor || actor.is_destroyed())
-            return Promise.resolve({reason: 'actor-unavailable'});
+        if (!actor || actor.is_destroyed()) {
+            return {
+                promise: Promise.resolve({reason: 'actor-unavailable'}),
+                cancel: () => {},
+            };
+        }
 
-        return new Promise(resolve => {
+        let cancel = null;
+        const promise = new Promise(resolve => {
             let damageId = 0;
             let destroyId = 0;
             let afterPaintId = 0;
@@ -294,6 +300,7 @@ export default class BackgroundComputerUseExtension extends Extension {
                 timeoutId = 0;
                 resolve({reason});
             };
+            cancel = () => finish('cancelled');
             damageId = actor.connect('damaged', () => {
                 if (afterPaintId)
                     return;
@@ -309,6 +316,7 @@ export default class BackgroundComputerUseExtension extends Extension {
                 return GLib.SOURCE_REMOVE;
             });
         });
+        return {promise, cancel: () => cancel()};
     }
 
     ActAndCaptureAsync([capability, serialized], invocation) {
@@ -325,39 +333,15 @@ export default class BackgroundComputerUseExtension extends Extension {
     async _actAndCapture(capability, serialized, sender) {
         const lease = this._requireLease(capability, sender, 'active');
         const request = JSON.parse(serialized);
-        const startedUsec = GLib.get_monotonic_time();
-        let actionResult = null;
-        let settle = null;
-        let captured = null;
-        let operationError = null;
-
-        try {
-            if (request.kind === 'pointer')
-                actionResult = this._injectPointer(capability, json(request.action), sender);
-            else if (request.kind === 'keys')
-                actionResult = this._injectKeys(capability, json(request.action), sender);
-            else
-                throw new Error(`unsupported transactional action kind ${request.kind}`);
-            settle = await this._waitForWindowFrame(this._find(lease.target));
-            captured = await this._captureWindow(lease.target);
-        } catch (error) {
-            operationError = error;
-        }
-
-        const restoration = this._restoreLease(lease);
-        if (restoration.recovery_complete !== true) {
-            throw new Error(
-                `transaction completed without full desktop restoration: ${json(restoration.errors ?? [])}`);
-        }
-        if (operationError)
-            throw operationError;
-
-        captured.metadata.transaction = {
-            action: actionResult,
-            settle,
-            restoration,
-            interference_milliseconds: (GLib.get_monotonic_time() - startedUsec) / 1000,
-        };
+        const {captured, transaction} = await actAndCaptureTransaction(request, {
+            armWindowFrame: () => this._armWindowFrame(this._find(lease.target)),
+            injectPointer: action => this._injectPointer(capability, json(action), sender),
+            injectKeys: action => this._injectKeys(capability, json(action), sender),
+            capture: () => this._captureWindow(lease.target),
+            restore: () => this._restoreLease(lease),
+            monotonicTimeUsec: () => GLib.get_monotonic_time(),
+        });
+        captured.metadata.transaction = transaction;
         return captured;
     }
 

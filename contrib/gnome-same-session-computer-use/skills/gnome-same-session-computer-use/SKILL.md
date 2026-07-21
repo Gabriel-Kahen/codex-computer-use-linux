@@ -14,9 +14,10 @@ Operate the real logged-in GNOME session. Never replace it with a VM, nested des
 3. Keep the returned `claim_token` private and pass it to every claimed broker action. Refresh a long-running claim before `expires_at`; a post-expiry reacquire returns a new token and is blocked while a focus-lease journal still reserves the window.
 4. Prefer semantic AT-SPI actions from `computer-use-linux@codex-computer-use-linux`: actions first, then editable text/value operations. That companion runs outside this broker, so claims coordinate AT-SPI agents by policy and do not mechanically prevent a non-cooperating external action.
 5. Capture any claimed window with the read-only `get_session_window_capture`; when `window_actor_capture_protocol` is available, capture does not change focus or require a focus lease. Use `save_session_window_capture` only when the user needs a PNG written to an absolute path, and do not use the deprecated `capture_session_window` compatibility tool in new workflows. An older extension without window-actor capture still requires the target to be focused or leased.
-6. Before `begin_focus_lease`, obtain explicit interference acknowledgment from the user in the current task. A literal tool argument is not evidence of consent. Expect another agent's active focus lease to make this lane temporarily unavailable; continue independent semantic work or retry after that agent restores it.
-7. While leased, use coordinates from the latest capture. Multiply screenshot pixels by the returned `pixel_to_window_scale` to obtain logical window-local coordinates, and keep them inside the returned dimensions.
-8. Always call `end_focus_lease` before `release_session_window`. If the broker or prior task was interrupted, call `recover_focus_lease` before starting another focus lease.
+6. Before `act_and_observe_window` or `begin_focus_lease`, obtain explicit interference acknowledgment from the user in the current task. A literal tool argument is not evidence of consent. Expect another agent's active focus lease to make this lane temporarily unavailable; continue independent semantic work or retry after that agent restores it.
+7. For one coordinate or shortcut action, prefer `act_and_observe_window`; it captures the result and restores the desktop before returning. Use coordinates from the latest capture, multiply screenshot pixels by `pixel_to_window_scale`, and keep them inside the returned dimensions.
+8. Use `begin_focus_lease` only for a sequence that cannot fit one short transaction. Always call `end_focus_lease` before `release_session_window`.
+9. If the broker or prior task was interrupted, call `recover_focus_lease` before starting another focus lease.
 
 ## Non-interference rules
 
@@ -33,4 +34,4 @@ Operate the real logged-in GNOME session. Never replace it with a VM, nested des
 - If restoration reports `recovery_complete: false`, keep the journal and retry after resolving the mismatch. A closed journaled window can instead produce a complete partial recovery with `restored: false` and no retained journal. If `recovery_outcome_unknown` is true, report the uncertainty but do not retry cleanup.
 - Never let a claim expire while its focus lease is active. Refresh first, or end the focus lease and release the claim.
 
-Pointer transactions briefly move Mutter's global virtual pointer to the target and restore the prior position immediately. The workspace and keyboard focus remain leased until cleanup. Capture itself does not introduce an additional focus change.
+Pointer transactions briefly move Mutter's global virtual pointer to the target and restore the prior position immediately. `act_and_observe_window` also restores workspace and keyboard focus before returning; longer focus leases retain them until cleanup. Capture itself does not introduce an additional focus change.
