@@ -774,17 +774,18 @@ def capture_window(
         else None
     )
     actor_capture = bool(integration and shell_supports_window_actor_capture(integration))
-    active_lease = load_lease()
-    if active_lease and active_lease.get("owner_thread_id") is not None:
-        if active_lease["owner_thread_id"] != owner:
-            raise RuntimeError("capture cannot use another computer-use agent's focus lease")
-        require_bound_claim(active_lease, claim)
-    permitted = selected.get("focused") or (
-        active_lease and active_lease.get("phase") == "active" and
-        lease_window_id(active_lease) == str(selected.get("id"))
-    )
-    if not permitted and not actor_capture:
-        raise RuntimeError("stock Mutter can only capture the focused window exactly; begin_focus_lease first")
+    if not actor_capture:
+        active_lease = load_lease()
+        if active_lease and active_lease.get("owner_thread_id") is not None:
+            if active_lease["owner_thread_id"] != owner:
+                raise RuntimeError("capture cannot use another computer-use agent's focus lease")
+            require_bound_claim(active_lease, claim)
+        permitted = selected.get("focused") or (
+            active_lease and active_lease.get("phase") == "active" and
+            lease_window_id(active_lease) == str(selected.get("id"))
+        )
+        if not permitted:
+            raise RuntimeError("stock Mutter can only capture the focused window exactly; begin_focus_lease first")
     destination_value = arguments.get("save_path")
     destination = Path(str(destination_value)).expanduser() if destination_value else None
     if destination and not destination.is_absolute():
@@ -1444,7 +1445,7 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": SERVER_INFO,
-                "instructions": "Operate the real GNOME session. Claim one window per parallel agent, treat claims as cooperative policy for the separate AT-SPI process, and use this broker's serialized acknowledged focus-lease lane for capture or global-seat input.",
+                "instructions": "Operate the real GNOME session. Claim one window per parallel agent, capture claimed windows without changing focus when window_actor_capture_protocol is available, and use an acknowledged focus lease only for global-seat input or the legacy focused-window capture fallback.",
             }
         elif method == "tools/list":
             result = {"tools": TOOLS}
