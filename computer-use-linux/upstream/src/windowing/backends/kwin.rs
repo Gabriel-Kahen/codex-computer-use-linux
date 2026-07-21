@@ -58,7 +58,7 @@ pub async fn activate_window(window_id: u64) -> Result<()> {
     call_kwin_activate_script(&uuid).await
 }
 
-async fn kwin_uuid_for_window_id(window_id: u64) -> Result<Option<String>> {
+pub(crate) async fn kwin_uuid_for_window_id(window_id: u64) -> Result<Option<String>> {
     let json = call_kwin_window_script().await?;
     let snapshot = parse_kwin_snapshot(&json)?;
     Ok(snapshot.windows.into_iter().find_map(|window| {

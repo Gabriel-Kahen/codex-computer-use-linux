@@ -191,7 +191,7 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         support: BackendSupport {
             desktop_session: "KDE Plasma / KWin",
             window_backend: "persistent KWin DBus window bridge",
-            notes: "Keeps one event-driven Plasma 5/6 window snapshot bridge loaded for the MCP process and reloads it when the `org.kde.KWin` bus owner changes; focus actions still use short-lived scripts.",
+            notes: "Keeps one event-driven Plasma 5/6 window snapshot bridge loaded for the MCP process and reloads it when the `org.kde.KWin` bus owner changes; focus actions still use short-lived scripts. Exact target capture calls `org.kde.KWin.ScreenShot2` directly from Rust, including inactive windows, without a screenshot helper process.",
         },
     },
     BackendDescriptor {

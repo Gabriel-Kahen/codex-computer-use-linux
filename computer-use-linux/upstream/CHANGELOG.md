@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Plasma/KWin window observations now call `org.kde.KWin.ScreenShot2.CaptureWindow`
+  directly from Rust, with bounded FD transport and QImage-to-PNG conversion. This
+  removes the per-capture Qt helper process and preserves compositor-native capture
+  for inactive windows.
 - **Breaking:** Element-targeted `scroll` calls now require the originating
   `observation_id` alongside `element_index`. Coordinate scrolls must provide
   both `x` and `y` and cannot be combined with `element_index`.
