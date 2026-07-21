@@ -47,6 +47,13 @@ def focus_state() -> dict:
 
 
 class ServerRouteTests(TestCase):
+    def test_read_only_capture_rejects_save_path(self) -> None:
+        with self.assertRaisesRegex(ValueError, "save_plasma_window_capture"):
+            server.call_tool(
+                "get_plasma_window_capture",
+                {"window": "Editor", "save_path": "/tmp/capture.png"},
+            )
+
     @patch.object(server.kwin, "list_windows", return_value=[])
     def test_existing_window_list_accepts_large_nonnegative_offsets(self, _list_windows) -> None:
         schema = next(tool for tool in server.TOOLS if tool["name"] == "list_plasma_windows")["inputSchema"]
@@ -87,7 +94,25 @@ class ServerRouteTests(TestCase):
         ):
             server.call_tool(
                 "capture_plasma_window",
+                {
+                    "window": "Editor",
+                    "claim_token": "claim-input",
+                    "save_path": "/tmp/legacy-capture.png",
+                },
+                thread_id="thread-a",
+            )
+            server.call_tool(
+                "get_plasma_window_capture",
                 {"window": "Editor", "claim_token": "claim-input"},
+                thread_id="thread-a",
+            )
+            server.call_tool(
+                "save_plasma_window_capture",
+                {
+                    "window": "Editor",
+                    "claim_token": "claim-input",
+                    "save_path": "/tmp/new-capture.png",
+                },
                 thread_id="thread-a",
             )
             server.call_tool(
@@ -98,7 +123,31 @@ class ServerRouteTests(TestCase):
             server.call_tool("release_session_window", {"claim_token": "claim-input"}, thread_id="thread-a")
             server.call_tool("list_window_claims", {"offset": 2, "limit": 3}, thread_id="thread-a")
 
-        capture.assert_called_once_with({"window": "Editor", "claim_token": "claim-input"}, "thread-a")
+        self.assertEqual(
+            capture.call_args_list,
+            [
+                call(
+                    {
+                        "window": "Editor",
+                        "claim_token": "claim-input",
+                        "save_path": "/tmp/legacy-capture.png",
+                    },
+                    "thread-a",
+                ),
+                call(
+                    {"window": "Editor", "claim_token": "claim-input"},
+                    "thread-a",
+                ),
+                call(
+                    {
+                        "window": "Editor",
+                        "claim_token": "claim-input",
+                        "save_path": "/tmp/new-capture.png",
+                    },
+                    "thread-a",
+                ),
+            ],
+        )
         claim_window.assert_called_once_with(
             server.coordination.window_for_model(WINDOW),
             "thread-a",

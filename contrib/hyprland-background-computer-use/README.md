@@ -41,12 +41,14 @@ The fallback reuses the same application process. It does not create another pro
 
 Window discovery is paginated and bounds compositor-provided text only when returning it over MCP, preserving full internal titles for reliable matching. PNG captures must pass bounded structural and pixel-stream validation before base64 encoding, and captures larger than 5 MiB are rejected so responses remain below Codex's stdio transport limit. Image results omit `structuredContent` so Codex receives the actual screenshot content blocks.
 
+`get_session_window_capture` is read-only and returns its PNG inline. To persist a capture, use the separately destructive `save_session_window_capture` tool with an absolute `save_path`; it atomically replaces the destination only after a valid capture succeeds. The original `capture_session_window` tool remains as a deprecated compatibility route with its optional `save_path` behavior and destructive annotation.
+
 ## Parallel-agent workflow
 
 For a prompt that can be split across windows, the coordinating agent should enumerate the current windows and give each worker a distinct target. Every worker then:
 
 1. Calls `claim_session_window` before its first capture or action.
-2. Passes the returned `claim_token` to `capture_session_window`, targeted pointer/shortcut tools, and `begin_coordinate_lease`.
+2. Passes the returned `claim_token` to `get_session_window_capture` or `save_session_window_capture`, targeted pointer/shortcut tools, and `begin_coordinate_lease`.
 3. Lets claimed broker operations renew automatically, and calls `claim_session_window` before `expires_at` during longer external semantic work. A renewal from the same task keeps the token stable.
 4. Recaptures immediately before coordinate selection and after each mutation.
 5. Ends any coordinate lease and calls `release_session_window` in cleanup, including after failures.

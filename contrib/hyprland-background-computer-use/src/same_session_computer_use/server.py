@@ -101,7 +101,7 @@ TOOLS = [
     },
     {
         "name": "capture_session_window",
-        "description": "Capture one exact real window without focusing it, moving it, changing workspace, or moving the pointer. Identify it by Hyprland address, exact-capture identifier, class, or title.",
+        "description": "Deprecated compatibility tool. Capture one exact real window and optionally atomically create or replace an absolute PNG path with save_path. Prefer get_session_window_capture for inline capture or save_session_window_capture for writes.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -112,6 +112,33 @@ TOOLS = [
             "required": ["window"],
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "get_session_window_capture",
+        "description": "Return an inline PNG of one exact real window without focusing it, moving it, changing workspace, moving the pointer, or creating a caller-selected file.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS, "description": "Hyprland address, exact-capture identifier, exact class, or title substring."},
+                "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."},
+            },
+            "required": ["window"],
+        },
+        "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "save_session_window_capture",
+        "description": "Capture one exact real window and atomically create or replace an absolute PNG path. Also returns the PNG inline.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS, "description": "Hyprland address, exact-capture identifier, exact class, or title substring."},
+                "save_path": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Absolute PNG path to atomically create or replace after capture succeeds."},
+                "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Optional fencing token returned by claim_session_window."},
+            },
+            "required": ["window", "save_path"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
     },
     {
         "name": "send_window_shortcut",
@@ -1455,7 +1482,17 @@ def call_tool(
                 "next_cursor": str(end) if end < len(claims) else None,
             }
         )
-    if name == "capture_session_window":
+    if name in {"capture_session_window", "get_session_window_capture", "save_session_window_capture"}:
+        if name == "get_session_window_capture" and arguments.get("save_path") not in (None, ""):
+            raise ValueError(
+                "get_session_window_capture does not accept save_path; use save_session_window_capture to write a PNG"
+            )
+        if name == "save_session_window_capture" and (
+            not isinstance(arguments.get("save_path"), str)
+            or not arguments["save_path"]
+            or len(arguments["save_path"]) > 4096
+        ):
+            raise ValueError("save_path must be a non-empty string of at most 4096 characters")
         window = resolve_window(str(arguments["window"]))
         binding = session_binding()
         with coordination.window_guard(binding, window):
