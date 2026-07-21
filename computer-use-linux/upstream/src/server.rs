@@ -26,9 +26,9 @@ use crate::pointer_dispatch::{
     PointerDispatchVerification,
 };
 use crate::remote_desktop::{
-    keysyms_for_text, press_keycode_chord, scroll as portal_scroll, start_portal_keyboard_session,
-    start_portal_pointer_session, type_text_with_keysyms, PortalActionError, PortalKeyboardSession,
-    PortalPointerSession, ScrollDirection,
+    keysyms_for_text, press_keycode_chord, scroll as portal_scroll, start_portal_session,
+    type_text_with_keysyms, PortalActionError, PortalKeyboardSession, PortalPointerSession,
+    PortalSession, ScrollDirection,
 };
 use crate::screenshot::{
     capture_screenshot_raw, capture_screenshot_raw_recent, prepare_screenshot_payload,
@@ -95,11 +95,10 @@ pub struct ComputerUseLinux {
     accessibility_snapshots: Arc<Mutex<AccessibilitySnapshotStore>>,
     observation_tracker: Arc<Mutex<ObservationTracker>>,
     adaptive_observation_lock: Arc<tokio::sync::Mutex<()>>,
-    portal_pointer_session: Arc<Mutex<Option<PortalPointerSession>>>,
-    portal_keyboard_session: Arc<Mutex<Option<PortalKeyboardSession>>>,
+    portal_session: Arc<Mutex<Option<PortalSession>>>,
     /// Lazily-created uinput absolute pointer (preferred coordinate backend).
     abs_pointer: Arc<Mutex<Option<crate::abs_pointer::AbsPointer>>>,
-    portal_keyboard_init_lock: Arc<tokio::sync::Mutex<()>>,
+    portal_session_init_lock: Arc<tokio::sync::Mutex<()>>,
     kde_clipboard_lock: Arc<tokio::sync::Mutex<()>>,
     desktop_transaction: DesktopTransaction,
     /// Cached logical desktop size (union of monitors) from the most recent
@@ -3264,10 +3263,11 @@ impl ComputerUseLinux {
     }
 
     fn cached_portal_pointer_session(&self) -> Option<PortalPointerSession> {
-        self.portal_pointer_session
+        self.portal_session
             .lock()
             .ok()
             .and_then(|cached| cached.clone())
+            .filter(PortalSession::has_pointer)
     }
 
     async fn portal_pointer_session_for_action(&self) -> Option<PortalPointerSession> {
@@ -3287,7 +3287,7 @@ impl ComputerUseLinux {
     where
         F: Future<Output = std::result::Result<(), PortalActionError>> + Send + 'static,
     {
-        let cached_session = Arc::clone(&self.portal_pointer_session);
+        let cached_session = Arc::clone(&self.portal_session);
         let task = tokio::spawn(async move {
             let result = action.await;
             if result.is_err() {
@@ -3309,22 +3309,50 @@ impl ComputerUseLinux {
     }
 
     fn clear_portal_pointer_session(&self) {
-        if let Ok(mut cached) = self.portal_pointer_session.lock() {
+        if let Ok(mut cached) = self.portal_session.lock() {
             *cached = None;
         }
     }
 
     fn cached_portal_keyboard_session(&self) -> Option<PortalKeyboardSession> {
-        self.portal_keyboard_session
+        self.portal_session
             .lock()
             .ok()
             .and_then(|cached| cached.clone())
+            .filter(PortalSession::has_keyboard)
     }
 
     fn clear_portal_keyboard_session(&self) {
-        if let Ok(mut cached) = self.portal_keyboard_session.lock() {
+        if let Ok(mut cached) = self.portal_session.lock() {
             *cached = None;
         }
+    }
+
+    async fn ensure_portal_session(&self) -> Result<PortalSession> {
+        if let Some(session) = self
+            .portal_session
+            .lock()
+            .ok()
+            .and_then(|cached| cached.clone())
+        {
+            return Ok(session);
+        }
+
+        let _guard = self.portal_session_init_lock.lock().await;
+        if let Some(session) = self
+            .portal_session
+            .lock()
+            .ok()
+            .and_then(|cached| cached.clone())
+        {
+            return Ok(session);
+        }
+
+        let session = start_portal_session().await?;
+        if let Ok(mut cached) = self.portal_session.lock() {
+            *cached = Some(session.clone());
+        }
+        Ok(session)
     }
 
     async fn ensure_portal_pointer_session(&self) -> Result<Option<PortalPointerSession>> {
@@ -3335,11 +3363,8 @@ impl ComputerUseLinux {
             return Ok(Some(session));
         }
 
-        let session = start_portal_pointer_session().await?;
-        if let Ok(mut cached) = self.portal_pointer_session.lock() {
-            *cached = Some(session.clone());
-        }
-        Ok(Some(session))
+        let session = self.ensure_portal_session().await?;
+        Ok(session.has_pointer().then_some(session))
     }
 
     async fn ensure_portal_keyboard_session(&self) -> Result<Option<PortalKeyboardSession>> {
@@ -3352,16 +3377,8 @@ impl ComputerUseLinux {
             return Ok(Some(session));
         }
 
-        let _guard = self.portal_keyboard_init_lock.lock().await;
-        if let Some(session) = self.cached_portal_keyboard_session() {
-            return Ok(Some(session));
-        }
-
-        let session = start_portal_keyboard_session().await?;
-        if let Ok(mut cached) = self.portal_keyboard_session.lock() {
-            *cached = Some(session.clone());
-        }
-        Ok(Some(session))
+        let session = self.ensure_portal_session().await?;
+        Ok(session.has_keyboard().then_some(session))
     }
 
     async fn resolve_window_context(

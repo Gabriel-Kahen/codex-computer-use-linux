@@ -69,8 +69,13 @@ class CaptureBoundaryTests(TestCase):
                 "generation": None,
             },
         }
+        unrelated_lease = {
+            "owner_thread_id": "other-agent",
+            "phase": "active",
+            "window": {"id": "22"},
+        }
         with (
-            patch.object(server, "load_lease", return_value=None),
+            patch.object(server, "load_lease", return_value=unrelated_lease) as load_lease,
             patch.object(server, "shell_status", return_value=integration),
             patch.object(server, "dbus_capture_window", return_value=(png(800, 600), captured)) as capture,
             patch.object(server, "run") as run,
@@ -82,6 +87,7 @@ class CaptureBoundaryTests(TestCase):
             )
 
         capture.assert_called_once_with("11")
+        load_lease.assert_not_called()
         run.assert_not_called()
         metadata = json.loads(result["content"][0]["text"])
         self.assertFalse(metadata["capture_requires_focus"])

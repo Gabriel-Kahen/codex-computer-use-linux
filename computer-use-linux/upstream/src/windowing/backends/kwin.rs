@@ -7,17 +7,19 @@ use serde::Deserialize;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    sync::mpsc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::{sleep, timeout};
 use zbus::Proxy;
 
+#[path = "kwin_bridge.rs"]
+mod bridge;
+
 pub const KWIN_BACKEND: &str = "kwin";
 const KWIN_SCRIPT_TIMEOUT: Duration = Duration::from_secs(2);
-const KWIN_SCRIPTING_SERVICE: &str = "org.kde.KWin";
-const KWIN_SCRIPTING_OBJECT_PATH: &str = "/Scripting";
-const KWIN_SCRIPTING_INTERFACE: &str = "org.kde.kwin.Scripting";
+pub(super) const KWIN_SCRIPTING_SERVICE: &str = "org.kde.KWin";
+pub(super) const KWIN_SCRIPTING_OBJECT_PATH: &str = "/Scripting";
+pub(super) const KWIN_SCRIPTING_INTERFACE: &str = "org.kde.kwin.Scripting";
 const KWIN_CALLBACK_OBJECT_PATH_PREFIX: &str = "/dev/avifenesh/ComputerUseLinux/KWinWindowQuery";
 const KWIN_CALLBACK_INTERFACE: &str = "dev.avifenesh.ComputerUseLinux.KWinWindowQuery";
 
@@ -92,7 +94,7 @@ async fn call_kwin_activate_script(uuid: &str) -> Result<()> {
 }
 
 async fn call_kwin_window_script() -> Result<String> {
-    call_kwin_script(write_kwin_window_script).await
+    bridge::window_snapshot().await
 }
 
 async fn call_kwin_script<F>(write_script: F) -> Result<String>
@@ -110,7 +112,7 @@ where
         .to_string();
     let plugin_name = temporary_kwin_plugin_name();
     let callback_object_path = format!("{KWIN_CALLBACK_OBJECT_PATH_PREFIX}/{plugin_name}");
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = std::sync::mpsc::channel();
     connection
         .object_server()
         .at(callback_object_path.as_str(), KwinWindowCallback { sender })
@@ -151,10 +153,12 @@ where
             loop {
                 match receiver.try_recv() {
                     Ok(json) => return Ok(json),
-                    Err(mpsc::TryRecvError::Disconnected) => {
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         bail!("KWin temporary script callback disconnected before returning data");
                     }
-                    Err(mpsc::TryRecvError::Empty) => sleep(Duration::from_millis(20)).await,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        sleep(Duration::from_millis(20)).await
+                    }
                 }
             }
         })
@@ -189,7 +193,7 @@ where
 }
 
 struct KwinWindowCallback {
-    sender: mpsc::Sender<String>,
+    sender: std::sync::mpsc::Sender<String>,
 }
 
 #[zbus::interface(name = "dev.avifenesh.ComputerUseLinux.KWinWindowQuery")]
@@ -216,158 +220,22 @@ fn temporary_kwin_plugin_name() -> String {
     format!("computer_use_linux_kwin_window_query_{pid}_{nanos}")
 }
 
-fn write_kwin_window_script(
-    service_name: &str,
-    callback_object_path: &str,
-    plugin_name: &str,
-) -> Result<std::path::PathBuf> {
-    let script = kwin_window_script_source(service_name, callback_object_path, plugin_name)?;
-    write_kwin_script_file(plugin_name, &script)
-}
-
+#[cfg(test)]
 pub(crate) fn kwin_window_script_source(
     service_name: &str,
     callback_object_path: &str,
     plugin_name: &str,
 ) -> Result<String> {
-    let service_name = serde_json::to_string(service_name)?;
-    let object_path = serde_json::to_string(callback_object_path)?;
-    let interface = serde_json::to_string(KWIN_CALLBACK_INTERFACE)?;
-    let plugin_name_json = serde_json::to_string(plugin_name)?;
-    Ok(format!(
-        r#"(function() {{
-    var serviceName = {service_name};
-    var objectPath = {object_path};
-    var iface = {interface};
-    var pluginName = {plugin_name_json};
+    bridge::script_source(
+        service_name,
+        callback_object_path,
+        KWIN_CALLBACK_INTERFACE,
+        plugin_name,
+    )
+}
 
-    function read(obj, key) {{
-        try {{
-            if (obj === null || obj === undefined) {{
-                return null;
-            }}
-            var value = obj[key];
-            if (typeof value === "function") {{
-                return null;
-            }}
-            return serialize(value);
-        }} catch (error) {{
-            return null;
-        }}
-    }}
-
-    function serialize(value) {{
-        if (value === null || value === undefined) {{
-            return null;
-        }}
-        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {{
-            return value;
-        }}
-        if (Array.isArray(value)) {{
-            return value.map(serialize);
-        }}
-        try {{
-            if (typeof value.toString === "function") {{
-                return value.toString();
-            }}
-        }} catch (error) {{}}
-        return null;
-    }}
-
-    function geometry(window) {{
-        var frame = null;
-        try {{
-            frame = window.frameGeometry;
-        }} catch (error) {{}}
-        var x = read(window, "x");
-        var y = read(window, "y");
-        var width = read(window, "width");
-        var height = read(window, "height");
-        return {{
-            x: x !== null ? x : read(frame, "x"),
-            y: y !== null ? y : read(frame, "y"),
-            width: width !== null ? width : read(frame, "width"),
-            height: height !== null ? height : read(frame, "height")
-        }};
-    }}
-
-    function firstDesktop(window) {{
-        var desktops = read(window, "desktops");
-        if (!Array.isArray(desktops) || desktops.length === 0) {{
-            return null;
-        }}
-        var first = desktops[0];
-        var parsed = parseInt(first, 10);
-        return isFinite(parsed) ? parsed : null;
-    }}
-
-    function clientType(window) {{
-        if (read(window, "waylandClient")) {{
-            return "wayland";
-        }}
-        if (read(window, "x11Client")) {{
-            return "x11";
-        }}
-        return null;
-    }}
-
-    function listWindows() {{
-        try {{
-            if (typeof workspace.windowList === "function") {{
-                return workspace.windowList();
-            }}
-        }} catch (error) {{}}
-        try {{
-            if (typeof workspace.clientList === "function") {{
-                return workspace.clientList();
-            }}
-        }} catch (error) {{}}
-        try {{
-            if (workspace.stackingOrder && typeof workspace.stackingOrder.length === "number") {{
-                return workspace.stackingOrder;
-            }}
-        }} catch (error) {{}}
-        return [];
-    }}
-
-    var activeWindow = null;
-    try {{
-        activeWindow = "activeWindow" in workspace ? workspace.activeWindow : workspace.activeClient;
-    }} catch (error) {{}}
-    var windows = listWindows().map(function(window) {{
-        var geo = geometry(window);
-        return {{
-            uuid: read(window, "uuid"),
-            internalId: read(window, "internalId"),
-            caption: read(window, "caption"),
-            desktopFile: read(window, "desktopFile"),
-            resourceClass: read(window, "resourceClass"),
-            resourceName: read(window, "resourceName"),
-            windowClass: read(window, "windowClass"),
-            pid: read(window, "pid"),
-            x: geo.x,
-            y: geo.y,
-            width: geo.width,
-            height: geo.height,
-            workspace: firstDesktop(window),
-            minimized: read(window, "minimized"),
-            active: read(window, "active") || window === activeWindow,
-            clientType: clientType(window),
-            normalWindow: read(window, "normalWindow"),
-            desktopWindow: read(window, "desktopWindow"),
-            skipTaskbar: read(window, "skipTaskbar"),
-            dock: read(window, "dock")
-        }};
-    }});
-
-    callDBus(serviceName, objectPath, iface, "ReceiveWindows", JSON.stringify({{
-        backend: "kwin",
-        pluginName: pluginName,
-        windows: windows
-    }}));
-}})();
-"#
-    ))
+pub(crate) async fn shutdown_bridge() {
+    bridge::shutdown().await;
 }
 
 fn write_kwin_activate_script(
@@ -556,7 +424,10 @@ pub(crate) fn kwin_activate_script_source(
     ))
 }
 
-fn write_kwin_script_file(plugin_name: &str, script: &str) -> Result<std::path::PathBuf> {
+pub(super) fn write_kwin_script_file(
+    plugin_name: &str,
+    script: &str,
+) -> Result<std::path::PathBuf> {
     for attempt in 0..4 {
         let filename = if attempt == 0 {
             format!("{plugin_name}.js")
@@ -602,7 +473,7 @@ pub(crate) fn parse_kwin_windows(json: &str) -> Result<Vec<WindowInfo>> {
 }
 
 fn parse_kwin_snapshot(json: &str) -> Result<KwinWindowSnapshot> {
-    serde_json::from_str(json).context("failed to parse KWin temporary script output")
+    serde_json::from_str(json).context("failed to parse KWin window snapshot")
 }
 
 #[derive(Debug, Deserialize)]
