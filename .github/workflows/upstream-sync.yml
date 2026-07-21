@@ -96,6 +96,24 @@ jobs:
             exit 0
           fi
 
+          protected_paths="$RUNNER_TEMP/upstream-sync-protected-paths.txt"
+          grep -Ev '^[[:space:]]*(#|$)' \
+            .github/upstream-sync-protected-paths.txt \
+            | LC_ALL=C sort -u \
+            > "$protected_paths"
+          while IFS= read -r protected_path; do
+            case "$protected_path" in
+              /* | .. | ../* | */.. | */../*)
+                echo "Invalid protected path: $protected_path" >&2
+                exit 1
+                ;;
+            esac
+            if ! git cat-file -e "origin/main:$protected_path"; then
+              echo "Protected path is missing from fork main: $protected_path" >&2
+              exit 1
+            fi
+          done < "$protected_paths"
+
           merge_base="$(git merge-base origin/main upstream/main)"
           # Computer-use changes are safe to merge when they do not overlap
           # paths changed by this fork. Same-path edits receive human review
@@ -108,6 +126,15 @@ jobs:
             "$RUNNER_TEMP/fork-files.txt" \
             "$RUNNER_TEMP/upstream-files.txt" \
             > "$RUNNER_TEMP/overlap-files.txt"
+          # Upstream changes to fork-owned paths are discarded below, so they
+          # do not require overlap review by themselves.
+          comm -23 \
+            "$RUNNER_TEMP/overlap-files.txt" \
+            "$protected_paths" \
+            > "$RUNNER_TEMP/unprotected-overlap-files.txt"
+          mv \
+            "$RUNNER_TEMP/unprotected-overlap-files.txt" \
+            "$RUNNER_TEMP/overlap-files.txt"
           if [[ -s "$RUNNER_TEMP/overlap-files.txt" ]]; then
             echo "overlap_review=true" >> "$GITHUB_OUTPUT"
           else
@@ -115,14 +142,39 @@ jobs:
           fi
 
           git switch -C "$SYNC_BRANCH" origin/main
-          if ! git merge --no-ff --no-edit upstream/main; then
+          merge_failed=false
+          if ! git merge --no-ff --no-edit --no-commit upstream/main; then
+            merge_failed=true
+          fi
+
+          # These paths define this fork's identity and policies. Always restore
+          # their exact fork-main versions, including when upstream changed or
+          # deleted them and when they have textual merge conflicts.
+          while IFS= read -r protected_path; do
+            git restore \
+              --source=origin/main \
+              --staged \
+              --worktree \
+              -- \
+              "$protected_path"
+          done < "$protected_paths"
+
+          while IFS= read -r protected_path; do
+            if ! git diff --quiet origin/main -- "$protected_path"; then
+              echo "Upstream sync changed protected path: $protected_path" >&2
+              git merge --abort
+              exit 1
+            fi
+          done < "$protected_paths"
+
+          if [[ "$merge_failed" == true ]]; then
             conflicts="$(git diff --name-only --diff-filter=U)"
             if [[ -z "$conflicts" ]]; then
               git commit --no-edit
               {
-                echo "## Reused reviewed upstream conflict resolutions"
+                echo "## Resolved upstream conflicts using fork policy"
                 echo
-                echo "Git rerere resolved every conflict using prior reviewed upstream merges."
+                echo "Fork-owned paths were restored from fork main. Git rerere may also have reused prior reviewed conflict resolutions."
                 echo "The resulting pull request still requires overlap review and fork CI."
               } >> "$GITHUB_STEP_SUMMARY"
               echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -159,6 +211,7 @@ jobs:
             exit 0
           fi
 
+          git commit --no-edit
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "conflict=false" >> "$GITHUB_OUTPUT"
           echo "reused_resolution=false" >> "$GITHUB_OUTPUT"
