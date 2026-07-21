@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Niri window discovery now connects directly to `NIRI_SOCKET`, consumes the
+  compositor's complete initial event-stream state, and applies incremental
+  window, focus, close, and layout events without spawning `niri msg` for every
+  query. The client reconnects after compositor or socket replacement, sends
+  focus actions over direct IPC, and retains `niri msg` as a compatibility
+  fallback.
+- Niri targeted screenshots can now capture exact inactive window pixels
+  through the compositor's stable window-ID ScreenCast interface and a
+  one-frame GStreamer PipeWire pipeline. Capture revalidates identity before
+  and after the frame and refuses desktop substitution for missing, closed,
+  hidden, or reidentified windows.
+
 ### Changed
+- Plasma/KWin window observations now call `org.kde.KWin.ScreenShot2.CaptureWindow`
+  directly from Rust, with bounded FD transport and QImage-to-PNG conversion. This
+  removes the per-capture Qt helper process and preserves compositor-native capture
+  for inactive windows.
+- RemoteDesktop pointer sessions can now share a ScreenCast selection and map
+  logical AT-SPI/window coordinates to the correct monitor stream for portal
+  clicks and targeted scrolling. Raw screenshot coordinates, including drag
+  coordinates, continue to fail closed when no safe transform exists.
 - **Breaking:** Element-targeted `scroll` calls now require the originating
   `observation_id` alongside `element_index`. Coordinate scrolls must provide
   both `x` and `y` and cannot be combined with `element_index`.

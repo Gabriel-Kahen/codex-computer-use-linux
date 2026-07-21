@@ -47,7 +47,15 @@ export class LeaseProtocol {
         this.lease = null;
     }
 
-    begin({capability, owner, target, targetMinimized, original, recoveryDeadlineUsec = null}) {
+    begin({
+        capability,
+        owner,
+        target,
+        targetMinimized,
+        original,
+        generation,
+        recoveryDeadlineUsec = null,
+    }) {
         if (this.lease)
             throw new Error('a Shell lease is already pending or active');
         if (typeof capability !== 'string' || capability.length < 64)
@@ -56,6 +64,8 @@ export class LeaseProtocol {
             throw new Error('invalid D-Bus lease owner');
         if (typeof target !== 'string' || !target)
             throw new Error('invalid lease target');
+        if (typeof generation !== 'string' || generation.length < 32)
+            throw new Error('invalid lease generation');
         if (recoveryDeadlineUsec !== null &&
             (!Number.isSafeInteger(recoveryDeadlineUsec) || recoveryDeadlineUsec <= 0))
             throw new Error('invalid lease recovery deadline');
@@ -65,6 +75,7 @@ export class LeaseProtocol {
             target,
             targetMinimized: Boolean(targetMinimized),
             original,
+            generation,
             recoveryDeadlineUsec,
             phase: 'pending',
         };
