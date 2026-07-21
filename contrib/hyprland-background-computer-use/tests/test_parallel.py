@@ -24,6 +24,14 @@ def completed(args: list[str], stdout: str = "") -> subprocess.CompletedProcess[
     return subprocess.CompletedProcess(args, 0, stdout, "")
 
 
+def native_transaction() -> dict[str, object]:
+    return {
+        "ok": True,
+        "physical_state_before": {},
+        "physical_state_after": {},
+    }
+
+
 class ParallelBackendTests(TestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
@@ -66,9 +74,9 @@ class ParallelBackendTests(TestCase):
         overlap = threading.Barrier(2)
         errors: list[Exception] = []
 
-        def run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        def transaction(*_: object, **__: object) -> dict[str, object]:
             overlap.wait(timeout=2)
-            return completed(args, '{"ok":true}')
+            return native_transaction()
 
         def act(address: str) -> None:
             try:
@@ -80,9 +88,9 @@ class ParallelBackendTests(TestCase):
 
         with (
             patch.object(server, "resolve_window", side_effect=lambda query: windows[query]),
-            patch.object(server, "ensure_target_pointer_plugin"),
-            patch.object(server, "physical_snapshot", return_value={}),
-            patch.object(server, "run", side_effect=run),
+            patch.object(
+                server, "run_target_pointer_action", side_effect=transaction
+            ),
         ):
             threads = [threading.Thread(target=act, args=(address,)) for address in windows]
             for thread in threads:
@@ -99,14 +107,14 @@ class ParallelBackendTests(TestCase):
         state_lock = threading.Lock()
         errors: list[Exception] = []
 
-        def run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        def transaction(*_: object, **__: object) -> dict[str, object]:
             with state_lock:
                 state["active"] += 1
                 state["maximum"] = max(state["maximum"], state["active"])
             time.sleep(0.05)
             with state_lock:
                 state["active"] -= 1
-            return completed(args, '{"ok":true}')
+            return native_transaction()
 
         def act() -> None:
             try:
@@ -116,9 +124,9 @@ class ParallelBackendTests(TestCase):
 
         with (
             patch.object(server, "resolve_window", return_value=window),
-            patch.object(server, "ensure_target_pointer_plugin"),
-            patch.object(server, "physical_snapshot", return_value={}),
-            patch.object(server, "run", side_effect=run),
+            patch.object(
+                server, "run_target_pointer_action", side_effect=transaction
+            ),
         ):
             threads = [threading.Thread(target=act) for _ in range(2)]
             for thread in threads:

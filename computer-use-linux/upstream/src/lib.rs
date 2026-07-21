@@ -24,6 +24,7 @@ mod server;
 mod terminal;
 mod windowing;
 mod windows;
+mod x11_capture_worker;
 mod ydotool;
 
 pub mod atspi_tree {

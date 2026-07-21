@@ -11,6 +11,90 @@ export function assertInputSafe(status) {
         throw new Error('a compositor move, resize, or input grab is active');
 }
 
+export async function actAndCaptureTransaction(request, adapter) {
+    const startedUsec = adapter.monotonicTimeUsec();
+    let observation = null;
+    let action = null;
+    let settle = null;
+    let captured = null;
+    let operationError = null;
+    try {
+        observation = adapter.armWindowFrame();
+        if (request.kind === 'pointer')
+            action = adapter.injectPointer(request.action);
+        else if (request.kind === 'keys')
+            action = adapter.injectKeys(request.action);
+        else
+            throw new Error(`unsupported transactional action kind ${request.kind}`);
+        settle = await observation.promise;
+        captured = await adapter.capture();
+    } catch (error) {
+        operationError = error;
+    } finally {
+        try {
+            observation?.cancel();
+        } catch (error) {
+            operationError ??= error;
+        }
+    }
+
+    const restoration = adapter.restore();
+    if (restoration.recovery_complete !== true) {
+        throw new Error(
+            `transaction completed without full desktop restoration: ${JSON.stringify(restoration.errors ?? [])}`);
+    }
+    if (operationError)
+        throw operationError;
+    return {
+        captured,
+        transaction: {
+            action,
+            settle,
+            restoration,
+            interference_milliseconds: (adapter.monotonicTimeUsec() - startedUsec) / 1000,
+        },
+    };
+}
+
+export async function captureMinimizedWindowTransaction(targetId, adapter) {
+    const startedUsec = adapter.monotonicTimeUsec();
+    let observation = null;
+    let settle = null;
+    let captured = null;
+    let operationError = null;
+    try {
+        observation = adapter.armWindowFrame();
+        adapter.activate();
+        settle = await observation.promise;
+        assertFreshWindowFrame(settle, targetId);
+        captured = await adapter.capture();
+    } catch (error) {
+        operationError = error;
+    } finally {
+        try {
+            observation?.cancel();
+        } catch (error) {
+            operationError ??= error;
+        }
+    }
+
+    const restoration = adapter.restore();
+    if (restoration.recovery_complete !== true) {
+        throw new Error(
+            `fresh minimized capture completed without full desktop restoration: ${JSON.stringify(restoration.errors ?? [])}`);
+    }
+    if (operationError)
+        throw operationError;
+    return {
+        captured,
+        transaction: {
+            settle,
+            restoration,
+            interference_milliseconds: (adapter.monotonicTimeUsec() - startedUsec) / 1000,
+        },
+    };
+}
+
 export function activateLeaseTransaction(lease, adapter) {
     const target = adapter.findWindow(lease.target);
     if (!target)
@@ -75,6 +159,11 @@ export function restoreLeaseTransaction(lease, adapter) {
         missing_windows: missingWindows,
         state,
     };
+}
+
+export function assertFreshWindowFrame(settle, targetId) {
+    if (settle?.reason !== 'damaged-and-painted')
+        throw new Error(`window ${targetId} did not submit and paint a fresh buffer after unminimize`);
 }
 
 export function injectPointerTransaction(request, frame, adapter) {

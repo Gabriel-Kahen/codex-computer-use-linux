@@ -174,6 +174,45 @@ class LeaseTests(TestCase):
                 call.assert_called_once_with("BeginLease", "11")
                 self.assertFalse(lease_file.exists())
 
+    def test_protocol_five_requires_a_shell_generated_lease_generation(self) -> None:
+        integration = {
+            "shell_instance": "shell-a",
+            "protocol_version": server.BRIDGE_CONTRACT_PROTOCOL_VERSION,
+            "capabilities": [server.BRIDGE_CONTRACT_CAPABILITY],
+            "bridge_contract": {
+                **server.BRIDGE_CONTRACT,
+                "role": "background-computer-use",
+                "features": [],
+            },
+        }
+
+        def call(method: str, *_args: str):
+            if method == "Status":
+                return integration
+            if method == "BeginLease":
+                return {
+                    "capability": CAPABILITY,
+                    "target": WINDOWS[0],
+                    "shell_instance": "shell-a",
+                }
+            self.fail(f"unexpected D-Bus call {method}")
+
+        with TemporaryDirectory() as directory:
+            lease_file = Path(directory) / "lease.json"
+            with (
+                patch.object(server, "LEASE_FILE", lease_file),
+                patch.object(server, "load_lease", return_value=None),
+                patch.object(server, "dbus_call", side_effect=call),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invalid lease generation"):
+                    server.begin_lease(
+                        {"window": "11", "acknowledge_interference": True},
+                        selected=WINDOWS[0],
+                        expected_shell_instance="shell-a",
+                    )
+
+            self.assertFalse(lease_file.exists())
+
     def test_shell_restart_during_begin_cleans_pending_lease_without_activation(self) -> None:
         events: list[str] = []
 
@@ -723,6 +762,32 @@ class InputTests(TestCase):
 
 
 class StatusTests(TestCase):
+    def test_protocol_five_requires_the_shared_bridge_contract(self) -> None:
+        invalid = {
+            "shell_instance": "shell-1",
+            "protocol_version": server.BRIDGE_CONTRACT_PROTOCOL_VERSION,
+            "capabilities": [server.BRIDGE_CONTRACT_CAPABILITY],
+        }
+        with patch.object(server, "dbus_call", return_value=invalid):
+            with self.assertRaisesRegex(RuntimeError, "incompatible Shell bridge identity"):
+                server.shell_status()
+
+        valid = {
+            **invalid,
+            "bridge_contract": {
+                **server.BRIDGE_CONTRACT,
+                "role": "background-computer-use",
+                "features": [],
+            },
+        }
+        with patch.object(server, "dbus_call", return_value=valid):
+            self.assertEqual(server.shell_status(), valid)
+
+        malformed_capabilities = {**valid, "capabilities": None}
+        with patch.object(server, "dbus_call", return_value=malformed_capabilities):
+            with self.assertRaisesRegex(RuntimeError, "incompatible Shell bridge identity"):
+                server.shell_status()
+
     def test_does_not_claim_background_capture_or_targeted_input(self) -> None:
         with (
             patch.dict(server.os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}),
@@ -742,6 +807,34 @@ class StatusTests(TestCase):
         self.assertFalse(capabilities["targeted_background_keyboard"])
         self.assertTrue(capabilities["recoverable_focus_lease"])
         self.assertTrue(capabilities["parallel_window_claims"])
+
+    def test_reports_window_actor_capture_without_claiming_background_input(self) -> None:
+        integration = {
+            "shell_version": "45",
+            "shell_instance": "shell-1",
+            "protocol_version": server.WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION,
+            "capabilities": [
+                server.CLAIMED_LEASE_CAPABILITY,
+                server.WINDOW_ACTOR_CAPTURE_CAPABILITY,
+            ],
+        }
+        with (
+            patch.dict(server.os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}),
+            patch.object(server, "Gio", object()),
+            patch.object(server, "GLib", object()),
+            patch.object(server.shutil, "which", return_value=None),
+            patch.object(server, "dbus_call", return_value=integration),
+            patch.object(server, "load_lease", return_value=None),
+            patch.object(server.CLAIMS, "list", return_value=[]),
+        ):
+            result = server.status()
+
+        capabilities = result["capabilities"]
+        self.assertTrue(capabilities["exact_background_window_capture"])
+        self.assertTrue(capabilities["exact_focused_window_capture"])
+        self.assertFalse(capabilities["targeted_background_pointer"])
+        self.assertFalse(capabilities["targeted_background_keyboard"])
+        self.assertTrue(result["requirements"]["window_actor_capture_protocol"])
 
     def test_old_extension_keeps_legacy_leases_but_disables_claimed_leases(self) -> None:
         legacy = {"shell_version": "45", "shell_instance": "shell-1"}
@@ -1256,7 +1349,7 @@ class McpTests(TestCase):
 
         self.assertEqual(manifest["name"], "gnome-same-session-computer-use")
         self.assertEqual(len(tools), len({item["name"] for item in tools}))
-        self.assertEqual(len(tools), 15)
+        self.assertEqual(len(tools), 17)
         annotations = {item["name"]: item["annotations"] for item in tools}
         self.assertFalse(annotations["end_focus_lease"]["idempotentHint"])
         self.assertEqual(

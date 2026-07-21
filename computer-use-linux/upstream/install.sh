@@ -187,6 +187,9 @@ install_system_deps() {
     case "${PKG_MANAGER}" in
         apt)
             local pkgs=(build-essential pkg-config libdbus-1-dev libssl-dev curl ydotool at-spi2-core)
+            if [[ "${desktop,,}" == *niri* ]]; then
+                pkgs+=(gstreamer1.0-tools gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-good)
+            fi
             sudo apt-get update -qq
             if [[ "${desktop}" == *GNOME* ]] && ! command -v gnome-extensions >/dev/null 2>&1; then
                 if apt-cache show gnome-shell >/dev/null 2>&1; then
@@ -200,11 +203,17 @@ install_system_deps() {
             ;;
         dnf)
             local pkgs=(gcc pkgconfig dbus-devel openssl-devel curl ydotool at-spi2-core)
+            if [[ "${desktop,,}" == *niri* ]]; then
+                pkgs+=(gstreamer1 gstreamer1-plugin-pipewire gstreamer1-plugins-base gstreamer1-plugins-good)
+            fi
             log_info "sudo dnf install -y ${pkgs[*]}"
             sudo dnf install -y "${pkgs[@]}" || { log_fail "dnf install failed"; return 1; }
             ;;
         pacman)
             local pkgs=(base-devel pkgconf dbus openssl curl ydotool at-spi2-core)
+            if [[ "${desktop,,}" == *niri* ]]; then
+                pkgs+=(gstreamer gst-plugin-pipewire gst-plugins-base gst-plugins-good)
+            fi
             log_info "sudo pacman -S --needed --noconfirm ${pkgs[*]}"
             sudo pacman -S --needed --noconfirm "${pkgs[@]}" || { log_fail "pacman install failed"; return 1; }
             ;;

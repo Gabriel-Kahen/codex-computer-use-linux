@@ -5,7 +5,11 @@ pub(crate) async fn run_from_env() -> Result<()> {
     diagnostics::hydrate_session_bus_env();
 
     match std::env::args().nth(1).as_deref() {
-        Some("mcp") => server::serve_mcp().await,
+        Some("mcp") => {
+            let result = server::serve_mcp().await;
+            crate::windowing::shutdown_backends().await;
+            result
+        }
         Some("doctor") => {
             let report = diagnostics::doctor_report();
             println!(
@@ -113,8 +117,12 @@ pub(crate) async fn run_from_env() -> Result<()> {
                 }
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
+            crate::windowing::shutdown_backends().await;
             Ok(())
         }
+        Some("x11-capture-worker") => tokio::task::spawn_blocking(crate::x11_capture_worker::serve)
+            .await
+            .context("native X11 capture worker task failed")?,
         Some("setup-window-targeting") => {
             let report = gnome_extension::setup_window_targeting_report().await;
             println!(
@@ -130,7 +138,7 @@ pub(crate) async fn run_from_env() -> Result<()> {
         }
         Some(command) => {
             anyhow::bail!(
-                "unknown command '{command}'. Expected one of: mcp, doctor, setup, apps, state, screenshot, windows, setup-window-targeting"
+                "unknown command '{command}'. Expected one of: mcp, doctor, setup, apps, state, screenshot, windows, setup-window-targeting, x11-capture-worker"
             );
         }
         None => {
@@ -142,6 +150,6 @@ pub(crate) async fn run_from_env() -> Result<()> {
 
 fn print_help() {
     println!(
-        "computer-use-linux\n\nUsage:\n  computer-use-linux mcp\n  computer-use-linux doctor\n  computer-use-linux setup\n  computer-use-linux setup-window-targeting\n  computer-use-linux apps\n  computer-use-linux state [APP_NAME]\n  computer-use-linux screenshot\n  computer-use-linux windows"
+        "computer-use-linux\n\nUsage:\n  computer-use-linux mcp\n  computer-use-linux doctor\n  computer-use-linux setup\n  computer-use-linux setup-window-targeting\n  computer-use-linux apps\n  computer-use-linux state [APP_NAME]\n  computer-use-linux screenshot\n  computer-use-linux windows\n  computer-use-linux x11-capture-worker"
     );
 }
