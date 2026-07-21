@@ -11,6 +11,7 @@ use std::env;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
+use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent,
     ConnectionExt, EventMask, Window,
@@ -43,13 +44,24 @@ struct CachedSnapshot {
     windows: Vec<WindowInfo>,
 }
 
+#[derive(Default)]
+struct SnapshotCache {
+    dirty: bool,
+    snapshot: Option<CachedSnapshot>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum NativeActivation {
+    Activated,
+    WindowNotManaged,
+}
+
 struct NativeSession {
     connection: RustConnection,
     display: String,
     root: Window,
     atoms: Atoms,
-    dirty: bool,
-    snapshot: Option<CachedSnapshot>,
+    cache: SnapshotCache,
 }
 
 pub(super) fn probe() -> Result<String> {
@@ -67,8 +79,10 @@ pub(super) fn focused_window() -> Result<Option<WindowInfo>> {
     with_session(NativeSession::focused_window)
 }
 
-pub(super) fn activate_window(window_id: u64) -> Result<()> {
-    let window_id = u32::try_from(window_id).context("X11 window id exceeds 32 bits")?;
+pub(super) fn activate_window(window_id: u64) -> Result<NativeActivation> {
+    let Ok(window_id) = u32::try_from(window_id) else {
+        return Ok(NativeActivation::WindowNotManaged);
+    };
     with_session(|session| session.activate_window(window_id))
 }
 
@@ -82,10 +96,22 @@ fn with_session<T>(operation: impl FnOnce(&mut NativeSession) -> Result<T>) -> R
         *guard = Some(NativeSession::connect(display)?);
     }
     let result = operation(guard.as_mut().expect("native X11 session initialized"));
-    if result.is_err() {
+    if result.as_ref().is_err_and(is_connection_failure) {
         *guard = None;
     }
     result
+}
+
+fn is_connection_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<ConnectionError>()
+            || cause
+                .downcast_ref::<ReplyError>()
+                .is_some_and(|error| matches!(error, ReplyError::ConnectionError(_)))
+            || cause
+                .downcast_ref::<ReplyOrIdError>()
+                .is_some_and(|error| matches!(error, ReplyOrIdError::ConnectionError(_)))
+    })
 }
 
 fn native_session() -> MutexGuard<'static, Option<NativeSession>> {
@@ -121,8 +147,7 @@ impl NativeSession {
             display,
             root,
             atoms,
-            dirty: true,
-            snapshot: None,
+            cache: SnapshotCache::default(),
         })
     }
 
@@ -148,7 +173,7 @@ impl NativeSession {
                 | Event::ReparentNotify(_)
                 | Event::ConfigureNotify(_)
                 | Event::MapNotify(_)
-                | Event::UnmapNotify(_) => self.dirty = true,
+                | Event::UnmapNotify(_) => self.cache.invalidate(),
                 _ => {}
             }
         }
@@ -158,12 +183,7 @@ impl NativeSession {
     fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
         self.drain_events()?;
         let now = Instant::now();
-        let cached_windows = (!self.dirty)
-            .then_some(self.snapshot.as_ref())
-            .flatten()
-            .filter(|snapshot| now.saturating_duration_since(snapshot.captured_at) < SNAPSHOT_TTL)
-            .map(|snapshot| snapshot.windows.clone());
-        if let Some(windows) = cached_windows {
+        if let Some(windows) = self.cache.fresh_windows(now) {
             return Ok(windows);
         }
         self.require_ewmh_support()?;
@@ -182,11 +202,7 @@ impl NativeSession {
             bail!("native X11 client list contained windows, but none could be inspected");
         }
         windows.sort_by_key(|window| window.window_id);
-        self.snapshot = Some(CachedSnapshot {
-            captured_at: now,
-            windows: windows.clone(),
-        });
-        self.dirty = false;
+        self.cache.replace(now, windows.clone());
         Ok(windows)
     }
 
@@ -195,15 +211,7 @@ impl NativeSession {
         let Some(active) = self.active_window_id()? else {
             return Ok(None);
         };
-        let cached_window = (!self.dirty)
-            .then_some(self.snapshot.as_ref())
-            .flatten()
-            .and_then(|snapshot| {
-                snapshot
-                    .windows
-                    .iter()
-                    .find(|window| window.window_id == u64::from(active))
-            });
+        let cached_window = self.cache.window(active);
         if let Some(window) = cached_window {
             let mut window = window.clone();
             window.focused = true;
@@ -212,7 +220,7 @@ impl NativeSession {
         self.window_info(active, Some(active)).map(Some)
     }
 
-    fn activate_window(&mut self, window: Window) -> Result<()> {
+    fn activate_window(&mut self, window: Window) -> Result<NativeActivation> {
         self.require_ewmh_support()?;
         let mut clients = self.property_u32(self.root, self.atoms.client_list, AtomEnum::WINDOW)?;
         if clients.is_empty() {
@@ -220,7 +228,7 @@ impl NativeSession {
                 self.property_u32(self.root, self.atoms.client_list_stacking, AtomEnum::WINDOW)?;
         }
         if !clients.contains(&window) {
-            bail!("X11 window 0x{window:08x} is not in the current EWMH client list");
+            return Ok(NativeActivation::WindowNotManaged);
         }
         let event = ClientMessageEvent::new(
             32,
@@ -238,8 +246,8 @@ impl NativeSession {
             .check()
             .context("window manager rejected _NET_ACTIVE_WINDOW")?;
         self.connection.flush()?;
-        self.dirty = true;
-        Ok(())
+        self.cache.invalidate();
+        Ok(NativeActivation::Activated)
     }
 
     fn active_window_id(&self) -> Result<Option<Window>> {
@@ -346,6 +354,40 @@ impl NativeSession {
             )?
             .reply()?;
         Ok((reply.type_ != u32::from(AtomEnum::NONE)).then_some(reply.value))
+    }
+}
+
+impl SnapshotCache {
+    fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
+    fn fresh_windows(&self, now: Instant) -> Option<Vec<WindowInfo>> {
+        (!self.dirty)
+            .then_some(self.snapshot.as_ref())
+            .flatten()
+            .filter(|snapshot| now.saturating_duration_since(snapshot.captured_at) < SNAPSHOT_TTL)
+            .map(|snapshot| snapshot.windows.clone())
+    }
+
+    fn window(&self, window: Window) -> Option<&WindowInfo> {
+        (!self.dirty)
+            .then_some(self.snapshot.as_ref())
+            .flatten()
+            .and_then(|snapshot| {
+                snapshot
+                    .windows
+                    .iter()
+                    .find(|info| info.window_id == u64::from(window))
+            })
+    }
+
+    fn replace(&mut self, captured_at: Instant, windows: Vec<WindowInfo>) {
+        self.snapshot = Some(CachedSnapshot {
+            captured_at,
+            windows,
+        });
+        self.dirty = false;
     }
 }
 

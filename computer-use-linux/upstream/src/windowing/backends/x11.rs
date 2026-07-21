@@ -120,8 +120,12 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
 }
 
 pub fn activate_window(window_id: u64) -> Result<()> {
-    if x11_native::activate_window(window_id).is_ok() {
-        return Ok(());
+    match x11_native::activate_window(window_id) {
+        Ok(x11_native::NativeActivation::Activated) => return Ok(()),
+        Ok(x11_native::NativeActivation::WindowNotManaged) => {
+            bail!("X11 window 0x{window_id:08x} is not in the current EWMH client list");
+        }
+        Err(_) => {}
     }
     let id = window_id_arg(window_id);
     run_wmctrl(&["-i", "-a", id.as_str()], "activate window", window_id)
