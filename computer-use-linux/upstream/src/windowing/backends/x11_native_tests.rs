@@ -82,3 +82,33 @@ fn rejects_window_ids_outside_the_x11_protocol_range_without_connecting() {
         NativeActivation::WindowNotManaged
     );
 }
+
+#[test]
+fn decodes_common_true_color_visual_masks() {
+    let layout = pixel_layout(Visualtype {
+        class: x11rb::protocol::xproto::VisualClass::TRUE_COLOR,
+        red_mask: 0x00ff_0000,
+        green_mask: 0x0000_ff00,
+        blue_mask: 0x0000_00ff,
+        ..Visualtype::default()
+    })
+    .unwrap();
+
+    assert_eq!(layout.decode(0x0012_3456), (0x1212, 0x3434, 0x5656));
+}
+
+#[test]
+fn rejects_indexed_color_visuals() {
+    let result = pixel_layout(Visualtype {
+        class: x11rb::protocol::xproto::VisualClass::PSEUDO_COLOR,
+        red_mask: 0x00ff_0000,
+        green_mask: 0x0000_ff00,
+        blue_mask: 0x0000_00ff,
+        ..Visualtype::default()
+    });
+
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("supported direct-color visual"));
+}

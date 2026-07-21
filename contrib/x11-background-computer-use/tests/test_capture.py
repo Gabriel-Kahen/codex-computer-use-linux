@@ -59,6 +59,7 @@ class BrokerCaptureTests(TestCase):
     def setUp(self) -> None:
         self.window = {
             "xid": "0x01200007",
+            "pid": 1234,
             "width": 640,
             "height": 480,
             "mapped": True,
@@ -72,7 +73,7 @@ class BrokerCaptureTests(TestCase):
             Path(args[2]).write_bytes(raw)
             return CompletedProcess(args, 0, "", "")
 
-        with patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
+        with patch.object(capture, "_native_capture", side_effect=capture.NativeTransportUnavailable), patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
             result = capture.capture_window(self.window, None)
 
         self.assertEqual(base64.b64decode(result["content"][1]["data"]), raw)
@@ -84,6 +85,49 @@ class BrokerCaptureTests(TestCase):
         })
         self.assertEqual(metadata["capture_backend"], "XComposite named window pixmap")
 
+    def test_native_capture_reuses_transport_and_checks_identity_and_bounds(self) -> None:
+        raw = png(640, 480)
+
+        def native_request(request):
+            self.assertEqual(request, {
+                "op": "capture",
+                "window_id": int(self.window["xid"], 0),
+                "expected_pid": self.window["pid"],
+                "expected_width": self.window["width"],
+                "expected_height": self.window["height"],
+            })
+            return ({
+                "authenticated_pid": self.window["pid"],
+                "width": self.window["width"],
+                "height": self.window["height"],
+            }, raw)
+
+        with patch.object(capture, "_native_request", side_effect=native_request), patch.object(capture, "ensure_capture_helper") as helper:
+            first = capture.capture_window(self.window, None)
+            second = capture.capture_window(self.window, None)
+
+        helper.assert_not_called()
+        self.assertEqual(base64.b64decode(first["content"][1]["data"]), raw)
+        self.assertEqual(base64.b64decode(second["content"][1]["data"]), raw)
+        metadata = json.loads(first["content"][0]["text"])
+        self.assertEqual(metadata["capture_backend"], "persistent native XComposite/XRes transport")
+
+    def test_native_security_error_does_not_fall_back_to_legacy_helper(self) -> None:
+        with patch.object(capture, "_native_capture", side_effect=RuntimeError("XRes PID identity changed")), patch.object(capture, "ensure_capture_helper") as helper:
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                capture.capture_window(self.window, None)
+
+        helper.assert_not_called()
+
+    def test_authenticated_pid_falls_back_only_when_transport_is_unavailable(self) -> None:
+        with patch.object(capture, "_native_request", return_value=({"authenticated_pid": 77}, b"")), patch.object(capture, "ensure_capture_helper") as helper:
+            self.assertEqual(capture.authenticated_pid("0x20"), 77)
+        helper.assert_not_called()
+
+        completed = CompletedProcess([], 0, "88\n", "")
+        with patch.object(capture, "_native_request", side_effect=capture.NativeTransportUnavailable), patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", return_value=completed):
+            self.assertEqual(capture.authenticated_pid("0x20"), 88)
+
     def test_largest_capture_fits_the_stdio_json_rpc_limit(self) -> None:
         raw = png(1280, 960) + b"x" * (capture.MAX_CAPTURE_BYTES - 24)
 
@@ -91,7 +135,7 @@ class BrokerCaptureTests(TestCase):
             Path(args[2]).write_bytes(raw)
             return CompletedProcess(args, 0, "", "")
 
-        with patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
+        with patch.object(capture, "_native_capture", side_effect=capture.NativeTransportUnavailable), patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
             result = capture.capture_window(self.window, None)
 
         response = {"jsonrpc": "2.0", "id": 1, "result": result}
@@ -110,7 +154,7 @@ class BrokerCaptureTests(TestCase):
                 output.write_bytes(raw)
                 return CompletedProcess(args, 0, "", "")
 
-            with patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
+            with patch.object(capture, "_native_capture", side_effect=capture.NativeTransportUnavailable), patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
                 result = capture.capture_window(self.window, str(destination))
 
             self.assertEqual(destination.read_bytes(), raw)
@@ -123,7 +167,7 @@ class BrokerCaptureTests(TestCase):
             destination.write_bytes(b"old")
             failed = CompletedProcess([], 1, "", "capture failed")
 
-            with patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", return_value=failed):
+            with patch.object(capture, "_native_capture", side_effect=capture.NativeTransportUnavailable), patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", return_value=failed):
                 with self.assertRaisesRegex(RuntimeError, "capture failed"):
                     capture.capture_window(self.window, str(destination))
 
@@ -139,7 +183,7 @@ class BrokerCaptureTests(TestCase):
                 Path(args[2]).write_bytes(b"not a PNG")
                 return CompletedProcess(args, 0, "", "")
 
-            with patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
+            with patch.object(capture, "_native_capture", side_effect=capture.NativeTransportUnavailable), patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run):
                 with self.assertRaisesRegex(RuntimeError, "invalid PNG"):
                     capture.capture_window(self.window, str(destination))
 
@@ -161,7 +205,7 @@ class BrokerCaptureTests(TestCase):
                     self.fail("oversized capture was read into memory")
                 return original_read_bytes(path)
 
-            with patch.object(capture, "MAX_CAPTURE_BYTES", 31), patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run), patch.object(Path, "read_bytes", checked_read_bytes):
+            with patch.object(capture, "MAX_CAPTURE_BYTES", 31), patch.object(capture, "_native_capture", side_effect=capture.NativeTransportUnavailable), patch.object(capture, "ensure_capture_helper", return_value=Path("/helper")), patch.object(capture.subprocess, "run", side_effect=fake_run), patch.object(Path, "read_bytes", checked_read_bytes):
                 with self.assertRaisesRegex(RuntimeError, "maximum transport size is 31 bytes"):
                     capture.capture_window(self.window, str(destination))
 
