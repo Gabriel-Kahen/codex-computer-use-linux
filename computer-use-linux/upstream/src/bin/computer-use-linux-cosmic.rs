@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use computer_use_linux::cosmic_helper_protocol::{
-    CosmicServiceCommand, CosmicServiceRequest, CosmicServiceResponse,
+    read_cosmic_service_message, CosmicServiceCommand, CosmicServiceRequest, CosmicServiceResponse,
+    COSMIC_SERVICE_PROTOCOL_VERSION,
 };
 use cosmic_protocols::{
     toplevel_info::v1::client::{zcosmic_toplevel_handle_v1, zcosmic_toplevel_info_v1},
@@ -8,7 +9,7 @@ use cosmic_protocols::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use wayland_client::{
     event_created_child,
     globals::{registry_queue_init, GlobalListContents},
@@ -94,6 +95,7 @@ impl ToplevelRecord {
 struct AppData {
     toplevel_info: Option<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1>,
     toplevel_manager: Option<zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1>,
+    toplevel_list_available: bool,
     seats: Vec<wl_seat::WlSeat>,
     capabilities:
         Vec<WEnum<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>>,
@@ -168,9 +170,11 @@ fn activate_window(window_id: u64) -> Result<ActivationOutput> {
 fn serve() -> Result<()> {
     let mut snapshot = Snapshot::collect()?;
     let stdin = io::stdin();
+    let mut stdin = stdin.lock();
     let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line.context("failed to read COSMIC service request")?;
+    while let Some(line) =
+        read_cosmic_service_message(&mut stdin).context("failed to read COSMIC service request")?
+    {
         let request = match serde_json::from_str::<CosmicServiceRequest>(&line) {
             Ok(request) => request,
             Err(error) => {
@@ -181,6 +185,19 @@ fn serve() -> Result<()> {
                 continue;
             }
         };
+        if request.version != COSMIC_SERVICE_PROTOCOL_VERSION {
+            write_service_response(
+                &mut stdout,
+                &CosmicServiceResponse::error(
+                    request.id,
+                    format!(
+                        "unsupported protocol version {}; expected {COSMIC_SERVICE_PROTOCOL_VERSION}",
+                        request.version
+                    ),
+                ),
+            )?;
+            continue;
+        }
 
         snapshot.refresh()?;
         let response = match execute_service_command(&mut snapshot, request.command) {
@@ -221,7 +238,6 @@ fn write_service_response(stdout: &mut impl Write, response: &CosmicServiceRespo
 struct Snapshot {
     event_queue: wayland_client::EventQueue<AppData>,
     app_data: AppData,
-    toplevel_list_available: bool,
 }
 
 impl Snapshot {
@@ -232,11 +248,10 @@ impl Snapshot {
         let mut snapshot = Self {
             event_queue,
             app_data: AppData::default(),
-            toplevel_list_available: false,
         };
         let qh = snapshot.event_queue.handle();
         snapshot.app_data.toplevel_info = globals
-            .bind::<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _, _>(&qh, 1..=3, ())
+            .bind::<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _, _>(&qh, 2..=3, ())
             .ok();
         snapshot.app_data.toplevel_manager = globals
             .bind::<zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, _, _>(&qh, 1..=4, ())
@@ -256,7 +271,7 @@ impl Snapshot {
                 }
             }
         });
-        snapshot.toplevel_list_available = globals
+        snapshot.app_data.toplevel_list_available = globals
             .bind::<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, _, _>(&qh, 1..=1, ())
             .is_ok();
         snapshot.prime()?;
@@ -298,10 +313,10 @@ impl Snapshot {
         let window_count = self.windows().len();
         let can_activate = self.can_activate_windows();
         ProbeOutput {
-            ok: self.toplevel_list_available,
-            can_list_windows: self.toplevel_list_available,
+            ok: self.app_data.toplevel_list_available,
+            can_list_windows: self.app_data.toplevel_list_available,
             can_activate_windows: can_activate,
-            detail: if !self.toplevel_list_available {
+            detail: if !self.app_data.toplevel_list_available {
                 "COSMIC foreign toplevel listing is unavailable in this session.".to_string()
             } else if can_activate {
                 format!(
@@ -404,7 +419,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for AppData {
         if let wl_registry::Event::Global {
             name,
             interface,
-            version: _,
+            version,
         } = event
         {
             match interface.as_str() {
@@ -415,32 +430,49 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for AppData {
                         qh,
                         (),
                     );
+                    app_data.toplevel_list_available = true;
                 }
-                "zcosmic_toplevel_info_v1" => {
-                    app_data.toplevel_info = Some(
-                        registry.bind::<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _, _>(
+                "zcosmic_toplevel_info_v1" if version >= 2 => {
+                    let info = registry
+                        .bind::<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _, _>(
                             name,
-                            3,
+                            version.min(3),
                             qh,
                             (),
-                        ),
-                    );
+                        );
+                    for (foreign_id, record) in &mut app_data.records {
+                        if record.cosmic.is_some() {
+                            continue;
+                        }
+                        let Some(foreign) = record.foreign.as_ref() else {
+                            continue;
+                        };
+                        let cosmic = info.get_cosmic_toplevel(foreign, qh, ());
+                        app_data
+                            .by_cosmic_id
+                            .insert(cosmic.id().protocol_id(), *foreign_id);
+                        record.cosmic = Some(cosmic);
+                    }
+                    app_data.toplevel_info = Some(info);
                 }
                 "zcosmic_toplevel_manager_v1" => {
                     app_data.toplevel_manager = Some(
                         registry
                             .bind::<zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, _, _>(
                                 name,
-                                4,
+                                version.min(4),
                                 qh,
                                 (),
                             ),
                     );
                 }
                 "wl_seat" => {
-                    app_data
-                        .seats
-                        .push(registry.bind::<wl_seat::WlSeat, _, _>(name, 9, qh, ()));
+                    app_data.seats.push(registry.bind::<wl_seat::WlSeat, _, _>(
+                        name,
+                        version.min(9),
+                        qh,
+                        (),
+                    ));
                 }
                 _ => {}
             }
@@ -451,7 +483,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for AppData {
 impl Dispatch<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, ()> for AppData {
     fn event(
         app_data: &mut Self,
-        _list: &ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1,
+        list: &ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1,
         event: ext_foreign_toplevel_list_v1::Event,
         _: &(),
         _conn: &Connection,
@@ -473,7 +505,10 @@ impl Dispatch<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, ()> for Ap
                 }
                 app_data.records.insert(foreign_id, record);
             }
-            ext_foreign_toplevel_list_v1::Event::Finished => {}
+            ext_foreign_toplevel_list_v1::Event::Finished => {
+                app_data.toplevel_list_available = false;
+                list.destroy();
+            }
             _ => unreachable!(),
         }
     }
@@ -515,7 +550,9 @@ impl Dispatch<ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()> fo
                 if let Some(record) = app_data.records.remove(&foreign_id) {
                     if let Some(cosmic) = record.cosmic {
                         app_data.by_cosmic_id.remove(&cosmic.id().protocol_id());
+                        cosmic.destroy();
                     }
+                    handle.destroy();
                 }
             }
             _ => unreachable!(),
@@ -563,6 +600,7 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppDa
                 record.focused = false;
                 record.hidden = false;
             }
+            handle.destroy();
             return;
         }
         let Some(record) = app_data.records.get_mut(&foreign_id) else {

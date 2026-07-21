@@ -38,7 +38,7 @@ fn persistent_manager_reuses_one_helper_for_multiple_requests() {
     fs::write(
         &helper,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n  printf '{{\"id\":%s,\"ok\":true,\"result\":{{\"served\":true}}}}\\n' \"$id\"\ndone\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n  printf '{{\"version\":1,\"id\":%s,\"ok\":true,\"result\":{{\"served\":true}}}}\\n' \"$id\"\ndone\n",
             starts.display()
         ),
     )
@@ -64,7 +64,7 @@ fn persistent_manager_restarts_a_helper_that_exits_between_requests() {
     fs::write(
         &helper,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nIFS= read -r line || exit 1\nid=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\nprintf '{{\"id\":%s,\"ok\":true,\"result\":{{\"served\":true}}}}\\n' \"$id\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nIFS= read -r line || exit 1\nid=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\nprintf '{{\"version\":1,\"id\":%s,\"ok\":true,\"result\":{{\"served\":true}}}}\\n' \"$id\"\n",
             starts.display()
         ),
     )
@@ -90,7 +90,7 @@ fn rejects_out_of_sequence_service_responses() {
     let helper = temporary.0.join("bad-cosmic-helper");
     fs::write(
         &helper,
-        "#!/bin/sh\nIFS= read -r line || exit 1\nprintf '{\"id\":999,\"ok\":true,\"result\":null}\\n'\n",
+        "#!/bin/sh\nIFS= read -r line || exit 1\nprintf '{\"version\":1,\"id\":999,\"ok\":true,\"result\":null}\\n'\n",
     )
     .unwrap();
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
@@ -102,6 +102,26 @@ fn rejects_out_of_sequence_service_responses() {
         .to_string();
 
     assert!(error.contains("response id mismatch"));
+}
+
+#[test]
+fn rejects_unsupported_service_protocol_versions() {
+    let temporary = TestDir::new();
+    let helper = temporary.0.join("future-cosmic-helper");
+    fs::write(
+        &helper,
+        "#!/bin/sh\nIFS= read -r line || exit 1\nprintf '{\"version\":2,\"id\":1,\"ok\":true,\"result\":null}\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut persistent = PersistentHelper::spawn(helper).unwrap();
+    let error = persistent
+        .request(CosmicServiceCommand::Probe)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("protocol version mismatch"));
 }
 
 #[test]
