@@ -12,6 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RepositorySmokeTests(TestCase):
+    def test_read_only_capture_rejects_save_path(self) -> None:
+        with self.assertRaisesRegex(ValueError, "save_session_window_capture"):
+            server.call_tool(
+                "get_session_window_capture",
+                {"window": "0x1", "save_path": "/tmp/capture.png"},
+            )
+
     def test_plugin_metadata_references_an_executable_launcher(self) -> None:
         manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text())
         mcp = json.loads((ROOT / manifest["mcpServers"]).read_text())
@@ -44,7 +51,7 @@ class RepositorySmokeTests(TestCase):
         self.assertEqual(responses[3]["result"], {})
         tools = responses[2]["result"]["tools"]
         names = [tool["name"] for tool in tools]
-        self.assertEqual(len(names), 14)
+        self.assertEqual(len(names), 16)
         self.assertEqual(len(names), len(set(names)))
         for tool in tools:
             schema = tool["inputSchema"]
@@ -54,6 +61,11 @@ class RepositorySmokeTests(TestCase):
 
         annotations = {tool["name"]: tool["annotations"] for tool in tools}
         self.assertTrue(annotations["capture_session_window"]["destructiveHint"])
+        self.assertFalse(annotations["capture_session_window"]["readOnlyHint"])
+        self.assertTrue(annotations["get_session_window_capture"]["readOnlyHint"])
+        self.assertFalse(annotations["get_session_window_capture"]["destructiveHint"])
+        self.assertTrue(annotations["save_session_window_capture"]["destructiveHint"])
+        self.assertFalse(annotations["save_session_window_capture"]["readOnlyHint"])
         self.assertTrue(annotations["send_window_shortcut"]["destructiveHint"])
         self.assertTrue(annotations["send_window_shortcut"]["openWorldHint"])
         self.assertTrue(annotations["begin_coordinate_lease"]["destructiveHint"])
@@ -61,6 +73,8 @@ class RepositorySmokeTests(TestCase):
         schemas = {tool["name"]: tool["inputSchema"] for tool in tools}
         for name in (
             "capture_session_window",
+            "get_session_window_capture",
+            "save_session_window_capture",
             "send_window_shortcut",
             "targeted_pointer_click",
             "targeted_pointer_scroll",
@@ -68,6 +82,12 @@ class RepositorySmokeTests(TestCase):
             "begin_coordinate_lease",
         ):
             self.assertIn("claim_token", schemas[name]["properties"])
+        self.assertIn("save_path", schemas["capture_session_window"]["properties"])
+        self.assertNotIn("save_path", schemas["get_session_window_capture"]["properties"])
+        self.assertEqual(
+            schemas["save_session_window_capture"]["required"],
+            ["window", "save_path"],
+        )
         lease_seconds = schemas["claim_session_window"]["properties"]["lease_seconds"]
         self.assertEqual(
             (lease_seconds["default"], lease_seconds["minimum"], lease_seconds["maximum"]),

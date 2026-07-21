@@ -72,7 +72,7 @@ DBUS_LOCK = threading.Lock()
 _DBUS_CONNECTION = None
 
 
-def tool(name: str, description: str, properties: dict[str, Any], required: list[str], *, read_only: bool = False, idempotent: bool = False) -> dict[str, Any]:
+def tool(name: str, description: str, properties: dict[str, Any], required: list[str], *, read_only: bool = False, idempotent: bool = False, open_world: bool | None = None) -> dict[str, Any]:
     return {
         "name": name,
         "description": description,
@@ -81,7 +81,7 @@ def tool(name: str, description: str, properties: dict[str, Any], required: list
             "readOnlyHint": read_only,
             "destructiveHint": not read_only,
             "idempotentHint": idempotent,
-            "openWorldHint": not read_only,
+            "openWorldHint": not read_only if open_world is None else open_world,
         },
     }
 
@@ -97,7 +97,9 @@ TOOLS = [
     tool("claim_session_window", "Exclusively claim one window for this Codex thread while allowing other threads to claim different windows concurrently.", {"window": WINDOW, "lease_seconds": {"type": "integer", "minimum": MIN_LEASE_SECONDS, "maximum": MAX_LEASE_SECONDS, "default": DEFAULT_LEASE_SECONDS}}, ["window"]),
     tool("release_session_window", "Release a window claim owned by this Codex thread.", {"claim_token": CLAIM_TOKEN}, ["claim_token"], idempotent=True),
     tool("list_window_claims", "List one bounded page of live window claims without exposing their capability tokens.", {"cursor": CURSOR, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_CLAIMS_PER_PAGE}}, [], read_only=True, idempotent=True),
-    tool("capture_session_window", "Capture an exact focused window. An unfocused window must first be placed under an acknowledged focus lease.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}, "claim_token": CLAIM_TOKEN}, ["window"], idempotent=True),
+    tool("capture_session_window", "Deprecated compatibility tool. Capture an exact focused window and optionally write save_path. Prefer get_session_window_capture for inline capture or save_session_window_capture for writes.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}, "claim_token": CLAIM_TOKEN}, ["window"], idempotent=True),
+    tool("get_session_window_capture", "Return an inline PNG of an exact focused window without creating a caller-selected file. An unfocused window must first be placed under an acknowledged focus lease.", {"window": WINDOW, "claim_token": CLAIM_TOKEN}, ["window"], read_only=True, idempotent=True),
+    tool("save_session_window_capture", "Capture an exact focused window and atomically create or replace an absolute PNG path. Also returns the PNG inline.", {"window": WINDOW, "save_path": {"type": "string", "minLength": 1, "maxLength": 4096}, "claim_token": CLAIM_TOKEN}, ["window", "save_path"], idempotent=True, open_world=False),
     tool("begin_focus_lease", "Journal desktop state, switch to and focus an existing window, and authorize brief global-seat contention until restored.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}, "claim_token": CLAIM_TOKEN}, ["window", "acknowledge_interference"]),
     tool("lease_pointer_click", "Click a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
     tool("lease_pointer_scroll", "Scroll in a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
@@ -1074,7 +1076,17 @@ def call_tool(name: str, arguments: dict[str, Any], owner: str | None = None) ->
             "next_cursor": str(end) if end < len(listed) else None,
             "truncated": end < len(listed),
         })
-    if name == "capture_session_window":
+    if name in {"capture_session_window", "get_session_window_capture", "save_session_window_capture"}:
+        if name == "get_session_window_capture" and arguments.get("save_path") not in (None, ""):
+            raise ValueError(
+                "get_session_window_capture does not accept save_path; use save_session_window_capture to write a PNG"
+            )
+        if name == "save_session_window_capture" and (
+            not isinstance(arguments.get("save_path"), str)
+            or not arguments["save_path"]
+            or len(arguments["save_path"]) > 4096
+        ):
+            raise ValueError("save_path must be a non-empty string of at most 4096 characters")
         selected, shell_instance = resolve_window_for_shell(arguments.get("window"))
         with CLAIMS.authorize(
             str(selected["id"]),

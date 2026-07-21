@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import Any
 from unittest import TestCase
+from unittest.mock import call
 from unittest.mock import patch
 
 from gnome_same_session import server
@@ -804,6 +805,13 @@ class StatusTests(TestCase):
 
 
 class McpTests(TestCase):
+    def test_read_only_capture_rejects_save_path(self) -> None:
+        with self.assertRaisesRegex(ValueError, "save_session_window_capture"):
+            server.call_tool(
+                "get_session_window_capture",
+                {"window": "11", "save_path": "/tmp/capture.png"},
+            )
+
     def test_initialize_does_not_claim_unknown_protocol_version(self) -> None:
         response = server.dispatch({
             "jsonrpc": "2.0",
@@ -981,7 +989,7 @@ class McpTests(TestCase):
             ),
         ):
             result = server.call_tool(
-                "capture_session_window",
+                "get_session_window_capture",
                 {"window": "11", "claim_token": claim["claim_token"]},
                 "thread-a",
             )
@@ -1019,16 +1027,38 @@ class McpTests(TestCase):
             patch.object(server, "file_guard", side_effect=unlocked),
             patch.object(server, "capture_window", return_value={"content": [], "isError": False}) as capture,
         ):
-            result = server.call_tool("capture_session_window", {"window": "12"}, None)
+            legacy_result = server.call_tool(
+                "capture_session_window",
+                {"window": "12", "save_path": "/tmp/legacy-capture.png"},
+                None,
+            )
+            save_result = server.call_tool(
+                "save_session_window_capture",
+                {"window": "12", "save_path": "/tmp/new-capture.png"},
+                None,
+            )
 
-        self.assertFalse(result["isError"])
+        self.assertFalse(legacy_result["isError"])
+        self.assertFalse(save_result["isError"])
         shell_status.assert_not_called()
-        capture.assert_called_once_with(
-            {"window": "12"},
-            None,
-            WINDOWS[1],
-            None,
-            expected_shell_instance="legacy-shell",
+        self.assertEqual(
+            capture.call_args_list,
+            [
+                call(
+                    {"window": "12", "save_path": "/tmp/legacy-capture.png"},
+                    None,
+                    WINDOWS[1],
+                    None,
+                    expected_shell_instance="legacy-shell",
+                ),
+                call(
+                    {"window": "12", "save_path": "/tmp/new-capture.png"},
+                    None,
+                    WINDOWS[1],
+                    None,
+                    expected_shell_instance="legacy-shell",
+                ),
+            ],
         )
 
     def test_call_tool_forwards_claim_to_begin_pointer_and_shortcut(self) -> None:
@@ -1226,10 +1256,43 @@ class McpTests(TestCase):
 
         self.assertEqual(manifest["name"], "gnome-same-session-computer-use")
         self.assertEqual(len(tools), len({item["name"] for item in tools}))
-        self.assertEqual(len(tools), 13)
+        self.assertEqual(len(tools), 15)
         annotations = {item["name"]: item["annotations"] for item in tools}
         self.assertFalse(annotations["end_focus_lease"]["idempotentHint"])
+        self.assertEqual(
+            annotations["get_session_window_capture"],
+            {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        )
+        self.assertEqual(
+            annotations["capture_session_window"],
+            {
+                "readOnlyHint": False,
+                "destructiveHint": True,
+                "idempotentHint": True,
+                "openWorldHint": True,
+            },
+        )
+        self.assertEqual(
+            annotations["save_session_window_capture"],
+            {
+                "readOnlyHint": False,
+                "destructiveHint": True,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        )
         schemas = {item["name"]: item["inputSchema"] for item in tools}
+        self.assertIn("save_path", schemas["capture_session_window"]["properties"])
+        self.assertNotIn("save_path", schemas["get_session_window_capture"]["properties"])
+        self.assertEqual(
+            schemas["save_session_window_capture"]["required"],
+            ["window", "save_path"],
+        )
         self.assertEqual(schemas["release_session_window"]["required"], ["claim_token"])
         self.assertEqual(schemas["release_session_window"]["properties"]["claim_token"]["maxLength"], 256)
         self.assertEqual(schemas["list_window_claims"]["properties"]["cursor"]["maxLength"], 20)

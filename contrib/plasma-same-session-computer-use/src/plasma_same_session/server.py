@@ -89,7 +89,7 @@ TOOLS = [
     },
     {
         "name": "capture_plasma_window",
-        "description": "Capture one exact KWin window without changing physical state. Different windows capture in parallel; an active foreign window claim is enforced.",
+        "description": "Deprecated compatibility tool. Capture one exact KWin window and optionally write save_path. Prefer get_plasma_window_capture for inline capture or save_plasma_window_capture for writes.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -98,6 +98,33 @@ TOOLS = [
                 "claim_token": {**CLAIM_TOKEN_SCHEMA, "description": "Required when the selected window has an active claim."},
             },
             "required": ["window"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "get_plasma_window_capture",
+        "description": "Return an inline PNG of one exact KWin window without changing physical state or creating a caller-selected file. Different windows capture in parallel; an active foreign window claim is enforced.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "window": WINDOW_SCHEMA,
+                "claim_token": {**CLAIM_TOKEN_SCHEMA, "description": "Required when the selected window has an active claim."},
+            },
+            "required": ["window"],
+        },
+        "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "save_plasma_window_capture",
+        "description": "Capture one exact KWin window and atomically create or replace an absolute PNG path. Also returns the PNG inline.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "window": WINDOW_SCHEMA,
+                "save_path": {"type": "string", "minLength": 1, "maxLength": MAX_SAVE_PATH_CHARS, "description": "Absolute PNG path to atomically create or replace after capture succeeds."},
+                "claim_token": {**CLAIM_TOKEN_SCHEMA, "description": "Required when the selected window has an active claim."},
+            },
+            "required": ["window", "save_path"],
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
     },
@@ -345,7 +372,16 @@ def call_tool(name: str, arguments: dict[str, Any], *, thread_id: str | None = N
             "total": len(windows),
             "next_offset": end if end < len(windows) else None,
         })
-    if name == "capture_plasma_window":
+    if name in {"capture_plasma_window", "get_plasma_window_capture", "save_plasma_window_capture"}:
+        if name == "get_plasma_window_capture" and arguments.get("save_path") not in (None, ""):
+            raise ValueError(
+                "get_plasma_window_capture does not accept save_path; use save_plasma_window_capture to write a PNG"
+            )
+        if name == "save_plasma_window_capture" and (
+            not isinstance(arguments.get("save_path"), str)
+            or not arguments["save_path"]
+        ):
+            raise ValueError("save_path must be a non-empty string")
         return capture_result(arguments, owner_id)
     if name == "claim_session_window":
         owner_id = coordination.require_thread_id(thread_id)

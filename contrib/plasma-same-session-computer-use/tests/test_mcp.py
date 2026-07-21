@@ -35,7 +35,7 @@ class McpSmokeTests(TestCase):
         self.assertEqual(responses[1]["result"]["protocolVersion"], "2025-11-25")
         self.assertEqual(responses[3]["result"], {})
         tools = responses[2]["result"]["tools"]
-        self.assertEqual(len(tools), 10)
+        self.assertEqual(len(tools), 12)
         self.assertEqual(len(tools), len({tool["name"] for tool in tools}))
         self.assertEqual(
             {tool["name"] for tool in tools},
@@ -43,6 +43,8 @@ class McpSmokeTests(TestCase):
                 "plasma_session_status",
                 "list_plasma_windows",
                 "capture_plasma_window",
+                "get_plasma_window_capture",
+                "save_plasma_window_capture",
                 "claim_session_window",
                 "release_session_window",
                 "list_window_claims",
@@ -53,6 +55,24 @@ class McpSmokeTests(TestCase):
             },
         )
         self.assertIn("serialize", responses[1]["result"]["instructions"])
+        by_name = {tool["name"]: tool for tool in tools}
+        self.assertIn(
+            "save_path",
+            by_name["capture_plasma_window"]["inputSchema"]["properties"],
+        )
+        self.assertTrue(
+            by_name["capture_plasma_window"]["annotations"]["destructiveHint"]
+        )
+        self.assertNotIn(
+            "save_path",
+            by_name["get_plasma_window_capture"]["inputSchema"]["properties"],
+        )
+        self.assertTrue(
+            by_name["get_plasma_window_capture"]["annotations"]["readOnlyHint"]
+        )
+        self.assertTrue(
+            by_name["save_plasma_window_capture"]["annotations"]["destructiveHint"]
+        )
         for tool in tools:
             self.assertEqual(tool["inputSchema"]["type"], "object")
             self.assertLessEqual(set(tool["inputSchema"].get("required", [])), set(tool["inputSchema"].get("properties", {})))

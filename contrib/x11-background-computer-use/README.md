@@ -41,6 +41,8 @@ sudo pacman -S python wmctrl xdotool xorg-xinput gcc pkgconf libx11 libxcomposit
 
 Enable your desktop's compositor if `session_status` reports `compositing_manager_active: false`. Minimized windows must be restored before exact capture. Capture is limited to 33,177,600 pixels (equivalent to 7680 × 4320), and PNGs larger than 5 MiB are rejected before transport.
 
+`get_session_window_capture` is read-only and returns its PNG inline. Use the separately destructive `save_session_window_capture` tool only when an absolute-path PNG artifact is needed; it atomically replaces the destination after validation. The original `capture_session_window` tool remains as a deprecated compatibility route with its optional `save_path` behavior and destructive annotation.
+
 ## Install
 
 ```shell
