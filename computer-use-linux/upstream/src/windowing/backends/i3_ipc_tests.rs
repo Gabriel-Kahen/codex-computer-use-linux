@@ -107,11 +107,7 @@ fn event_interleaved_with_tree_reply_keeps_cache_dirty() {
         write_message(&mut stream, IPC_SUBSCRIBE, br#"{"success":true}"#);
 
         assert_eq!(read_message(&mut stream).message_type, IPC_GET_TREE);
-        write_message(
-            &mut stream,
-            IPC_EVENT_MASK | 3,
-            br#"{"change":"focus"}"#,
-        );
+        write_message(&mut stream, IPC_EVENT_MASK | 3, br#"{"change":"focus"}"#);
         write_message(&mut stream, IPC_GET_TREE, br#"{"name":"first"}"#);
 
         assert_eq!(read_message(&mut stream).message_type, IPC_GET_TREE);
