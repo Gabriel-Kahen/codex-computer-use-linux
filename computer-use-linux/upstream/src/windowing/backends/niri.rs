@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::process::Command;
 
-use super::niri_ipc;
+use super::{niri_capture, niri_ipc};
 
 pub const NIRI_BACKEND: &str = "niri";
 
@@ -17,10 +17,10 @@ pub fn probe() -> BackendProbe {
             can_list_windows: true,
             can_focus_apps: true,
             can_focus_windows: true,
-            detail: format!(
+            detail: with_capture_detail(format!(
                 "Niri IPC event stream returned an initial snapshot with {} window(s)",
                 windows.len()
-            ),
+            )),
         };
     }
 
@@ -38,7 +38,7 @@ pub fn probe() -> BackendProbe {
                 can_focus_apps: ok,
                 can_focus_windows: ok,
                 detail: if ok {
-                    "niri msg --json windows returned a JSON array".to_string()
+                    with_capture_detail("niri msg --json windows returned a JSON array".to_string())
                 } else {
                     "niri msg --json windows did not return a JSON array".to_string()
                 },
@@ -61,6 +61,11 @@ pub fn probe() -> BackendProbe {
             detail: error.to_string(),
         },
     }
+}
+
+fn with_capture_detail(window_detail: String) -> String {
+    let capture = niri_capture::exact_capture_support();
+    format!("{window_detail}. {}", capture.detail)
 }
 
 pub fn list_windows() -> Result<Vec<WindowInfo>> {

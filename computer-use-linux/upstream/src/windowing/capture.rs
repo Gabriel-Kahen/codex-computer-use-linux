@@ -1,6 +1,6 @@
 use crate::screenshot::RawScreenshotCapture;
 use crate::screenshot_impl::{read_png_as_capture_inner, temp_png_path};
-use crate::windowing::backends::hyprland;
+use crate::windowing::backends::{hyprland, niri::NIRI_BACKEND, niri_capture};
 use crate::windowing::{WindowInfo, HYPRLAND_BACKEND};
 use anyhow::{bail, Context, Result};
 use std::fs;
@@ -13,12 +13,17 @@ const EXACT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 const EXACT_CAPTURE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 static GRIM_EXACT_CAPTURE: OnceCell<bool> = OnceCell::const_new();
 
-/// Capture exact window-local pixels, returning `None` when the runtime lacks
-/// compositor-native support. Once support is confirmed, capture failures are
-/// returned rather than falling back to desktop pixels.
+/// Capture exact window-local pixels. Backends with trustworthy desktop bounds
+/// may return `None` when native capture is unavailable and use the existing
+/// crop path. Niri has no global window origin, so missing exact-capture
+/// prerequisites and capture failures are explicit errors rather than desktop
+/// substitutions.
 pub(crate) async fn capture_window_exact(
     window: &WindowInfo,
 ) -> Result<Option<RawScreenshotCapture>> {
+    if window.backend == NIRI_BACKEND {
+        return niri_capture::capture_window_exact(window).await.map(Some);
+    }
     if window.backend != HYPRLAND_BACKEND || !grim_supports_exact_capture().await {
         return Ok(None);
     }

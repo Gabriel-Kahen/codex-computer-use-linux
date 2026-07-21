@@ -4,5 +4,6 @@ pub mod hyprland;
 pub mod i3;
 pub mod kwin;
 pub mod niri;
+pub(crate) mod niri_capture;
 mod niri_ipc;
 pub mod x11;

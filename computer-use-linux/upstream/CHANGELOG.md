@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   query. The client reconnects after compositor or socket replacement, sends
   focus actions over direct IPC, and retains `niri msg` as a compatibility
   fallback.
+- Niri targeted screenshots can now capture exact inactive window pixels
+  through the compositor's stable window-ID ScreenCast interface and a
+  one-frame GStreamer PipeWire pipeline. Capture revalidates identity before
+  and after the frame and refuses desktop substitution for missing, closed,
+  hidden, or reidentified windows.
 
 ### Changed
 - **Breaking:** Element-targeted `scroll` calls now require the originating

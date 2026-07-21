@@ -210,14 +210,14 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
     BackendDescriptor {
         id: NIRI_BACKEND,
         failure_label: "Niri",
-        list_note: "Window list came from Niri IPC. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
-        missing_hint: "On Niri, ensure NIRI_SOCKET points to the active compositor IPC socket. The niri command provides a compatibility fallback for older IPC implementations.",
+        list_note: "Window list came from Niri IPC. Exact inactive capture uses Niri's stable window-ID ScreenCast interface when the required GStreamer plugins are installed. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
+        missing_hint: "On Niri, ensure NIRI_SOCKET points to the active compositor IPC socket. The niri command provides a compatibility fallback for older IPC implementations. Exact inactive capture additionally needs Niri's org.gnome.Mutter.ScreenCast service plus the GStreamer pipewiresrc, videoconvert, and pngenc plugins.",
         can_exact_focus: true,
         #[cfg(test)]
         support: BackendSupport {
             desktop_session: "Niri",
             window_backend: "direct `NIRI_SOCKET` event stream and actions; `niri msg` fallback",
-            notes: "Uses Niri's complete event-stream snapshot and incremental updates without polling. The `niri` command is only required for compatibility fallback.",
+            notes: "Uses Niri's complete event-stream snapshot and incremental updates without polling. Exact inactive capture binds the compositor ScreenCast stream to the same stable window ID and requires GStreamer PipeWire, base, and good plugins; it never substitutes monitor or desktop pixels. The `niri` command is only required for compatibility fallback.",
         },
     },
     BackendDescriptor {
