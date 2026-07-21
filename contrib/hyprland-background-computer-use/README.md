@@ -35,7 +35,7 @@ The broker identifies each caller from the host-only `tools/call.params._meta.th
 
 Claim state is atomically replaced, mode `0600`, and scoped to the real user's Wayland display and Hyprland instance. Cross-process file locks make same-window claim and mutation races deterministic. Different native Wayland windows use separate locks and can progress concurrently. Same-window operations remain serialized. XWayland, global-seat, and coordinate-fallback operations use one global lane because those paths share compositor or XTEST state. The generic Computer Use server takes that same global lane before its window lock for focus changes, physical-seat input, and screenshots that raise their target, and consumes the same claim state and window locks for capture, focus, AT-SPI, portal, pointer, keyboard, text, and combined action-and-observe operations: pass the claim result's `owner_thread_id` and `claim_token` to those tools. Pass `raise_window=false` to keep exact capture non-focusing.
 
-The native extension sends a complete event transaction directly to the selected Wayland surface, then restores pointer focus before the next compositor event. It never moves Hyprland's physical pointer. XWayland actions snapshot and restore XWayland's separate internal pointer.
+The native extension handles each Wayland pointer action as one compositor-thread `cutarget` transaction. That single command validates the broker/plugin identity and live input-safety state, snapshots physical cursor/focus/workspace state, sends the complete event sequence directly to the selected surface, restores pointer focus, and snapshots physical state again before returning. It never moves Hyprland's physical pointer. XWayland actions snapshot and restore XWayland's separate internal pointer.
 
 The fallback reuses the same application process. It does not create another profile or login. The target may be fullscreened on the temporary output, and all recorded compositor state is restored afterward.
 
@@ -72,9 +72,11 @@ The implementation is Hyprland-specific and experimental. It was developed and a
 Normal targeted pointer and shortcut actions snapshot the physical focus,
 workspace, and cursor before and after dispatch. They return success only when
 those observations match; a mismatch is reported as an error with the observed
-changes instead of being attributed to the backend. The snapshots cannot
-distinguish backend interference from concurrent physical user input, so normal
-targeted actions never restore a potentially stale pre-action snapshot.
+changes instead of being attributed to the backend. Native Wayland pointer
+snapshots run inside one compositor-thread transaction, so no physical input
+event can interleave them. XWayland and shortcut snapshots remain external and
+cannot distinguish backend interference from concurrent physical user input;
+normal targeted actions therefore never restore a potentially stale snapshot.
 
 Runtime and build dependencies include:
 
@@ -88,7 +90,7 @@ Runtime and build dependencies include:
 - a Codex CLI release with `codex plugin` support
 - `computer-use-linux@codex-computer-use-linux`, which provides the AT-SPI and global-input Computer Use tools that this plugin's skill coordinates with
 
-The broker builds and loads the native extension on demand. Builds are cached outside the installed plugin under `${XDG_CACHE_HOME:-$HOME/.cache}/same-session-computer-use/` and keyed by the plugin source and running Hyprland version. Before using an already-loaded extension, the broker verifies its plugin version, source digest, and build/runtime Hyprland ABI. A stale or mismatched extension is rejected with instructions to unload it instead of being used silently.
+The broker builds and loads the native extension on demand. Builds are cached outside the installed plugin under `${XDG_CACHE_HOME:-$HOME/.cache}/same-session-computer-use/` and keyed by the plugin source and running Hyprland version. The broker caches only the extension's immutable expected identity, scoped to the Hyprland instance and Wayland socket. Every `cutarget` request carries that identity; the compositor validates it and the build/runtime ABI before touching the target. Live lock, drag, pointer-constraint, and physical-button safety state is never cached. An explicitly missing command triggers one safe reload attempt, while ambiguous transport failures are never replayed.
 
 `session_status` reports that identity under `versions`. It also reports semantic actions separately under `semantic_actions`: the companion knows that `computer-use-linux` is the provider and that its calls are not claim-enforced, but leaves availability unknown because the provider is a separate MCP process.
 
