@@ -6,6 +6,8 @@ import {
     actAndCaptureTransaction,
     activateLeaseTransaction,
     assertInputSafe,
+    assertFreshWindowFrame,
+    captureMinimizedWindowTransaction,
     injectKeyTransaction,
     injectPointerTransaction,
     restoreLeaseTransaction,
@@ -251,6 +253,75 @@ test('restore clears a non-actionable lease when the leased target closed', () =
         'state',
     ]);
     assert.equal(protocol.lease, null);
+});
+
+test('fresh minimized capture accepts only client damage followed by paint', () => {
+    assert.doesNotThrow(() => assertFreshWindowFrame({reason: 'damaged-and-painted'}, '11'));
+    for (const reason of ['timeout', 'actor-destroyed', 'actor-unavailable']) {
+        assert.throws(
+            () => assertFreshWindowFrame({reason}, '11'),
+            /did not submit and paint a fresh buffer/,
+        );
+    }
+});
+
+test('fresh minimized capture observes before activation and restores before return', async () => {
+    const calls = [];
+    const times = [1000, 3500];
+    const result = await captureMinimizedWindowTransaction('11', {
+        armWindowFrame: () => (calls.push('arm'), {
+            promise: Promise.resolve({reason: 'damaged-and-painted'}),
+            cancel: () => calls.push('cancel'),
+        }),
+        activate: () => calls.push('activate'),
+        capture: () => (calls.push('capture'), {metadata: {window: {id: '11'}}}),
+        restore: () => (calls.push('restore'), {recovery_complete: true, errors: []}),
+        monotonicTimeUsec: () => times.shift(),
+    });
+
+    assert.deepEqual(calls, ['arm', 'activate', 'capture', 'cancel', 'restore']);
+    assert.deepEqual(result.transaction.settle, {reason: 'damaged-and-painted'});
+    assert.equal(result.transaction.interference_milliseconds, 2.5);
+});
+
+test('fresh minimized capture cancels observation and restores after activation failure', async () => {
+    const calls = [];
+    const pending = new Promise(() => {});
+    await assert.rejects(
+        captureMinimizedWindowTransaction('11', {
+            armWindowFrame: () => (calls.push('arm'), {
+                promise: pending,
+                cancel: () => calls.push('cancel'),
+            }),
+            activate: () => {
+                calls.push('activate');
+                throw new Error('activation failed');
+            },
+            capture: () => assert.fail('unexpected capture'),
+            restore: () => (calls.push('restore'), {recovery_complete: true}),
+            monotonicTimeUsec: () => 1000,
+        }),
+        /activation failed/,
+    );
+    assert.deepEqual(calls, ['arm', 'activate', 'cancel', 'restore']);
+});
+
+test('fresh minimized capture returns no pixels after its frame deadline', async () => {
+    const calls = [];
+    await assert.rejects(
+        captureMinimizedWindowTransaction('11', {
+            armWindowFrame: () => ({
+                promise: Promise.resolve({reason: 'timeout'}),
+                cancel: () => calls.push('cancel'),
+            }),
+            activate: () => calls.push('activate'),
+            capture: () => assert.fail('unexpected capture'),
+            restore: () => (calls.push('restore'), {recovery_complete: true}),
+            monotonicTimeUsec: () => 1000,
+        }),
+        /did not submit and paint a fresh buffer/,
+    );
+    assert.deepEqual(calls, ['activate', 'cancel', 'restore']);
 });
 
 for (const action of ['click', 'drag']) {
