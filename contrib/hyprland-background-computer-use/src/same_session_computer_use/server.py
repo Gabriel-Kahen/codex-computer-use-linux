@@ -16,10 +16,12 @@ from typing import Any
 
 from . import coordination
 from .native_plugin import STATE_DIR
+from .native_plugin import NATIVE_PLUGIN_VERSION
 from .native_plugin import ensure_native_input_safe
 from .native_plugin import ensure_target_pointer_plugin
 from .native_plugin import file_guard
 from .native_plugin import plugin_build_requirements
+from .native_plugin import plugin_identity
 
 
 SERVER_INFO = {"name": "same-session-computer-use", "version": "0.2.0"}
@@ -1158,9 +1160,27 @@ def status() -> dict[str, Any]:
             probed = run(["hyprctl", "-j", "cutargetstatus"])
             if probed.returncode == 0:
                 try:
-                    safety_status = json.loads(probed.stdout)
+                    parsed_status = json.loads(probed.stdout)
+                    if isinstance(parsed_status, dict):
+                        safety_status = parsed_status
                 except json.JSONDecodeError:
                     pass
+    expected_identity = None
+    identity_matches = None
+    if safety_status:
+        version = run(["hyprctl", "version"])
+        source = Path(__file__).resolve().parents[2] / "hyprland/target-pointer.cpp"
+        if version.returncode == 0 and source.is_file():
+            expected_identity = plugin_identity(
+                version.stdout,
+                source.read_bytes(),
+            )
+            identity_matches = all(
+                safety_status.get(name) == value
+                for name, value in expected_identity.items()
+            ) and safety_status.get("hyprland_build_abi") == safety_status.get(
+                "hyprland_runtime_abi"
+            )
     native_available = checks["hyprctl"] and (plugin_loaded or native_buildable)
     return {
         "session": "real-current-login",
@@ -1177,6 +1197,24 @@ def status() -> dict[str, Any]:
             "broker_global_input_lane_serialized": True,
             "native_input_currently_safe": bool(safety_status and safety_status.get("safe_to_inject") is True),
             "physical_pointer_seat_is_independent": False,
+        },
+        "semantic_actions": {
+            "available": None,
+            "claim_enforced": False,
+            "provider": "computer-use-linux",
+            "note": "Availability is unknown because semantic actions are provided by a separate MCP server.",
+        },
+        "versions": {
+            "companion": SERVER_INFO["version"],
+            "native_extension_expected": NATIVE_PLUGIN_VERSION,
+            "native_extension_loaded": safety_status.get("plugin_version") if safety_status else None,
+            "native_source_sha256_expected": expected_identity.get("source_sha256") if expected_identity else None,
+            "native_source_sha256_loaded": safety_status.get("source_sha256") if safety_status else None,
+            "hyprland_build_sha256_expected": expected_identity.get("hyprland_build_sha256") if expected_identity else None,
+            "hyprland_build_sha256_loaded": safety_status.get("hyprland_build_sha256") if safety_status else None,
+            "hyprland_build_abi": safety_status.get("hyprland_build_abi") if safety_status else None,
+            "hyprland_runtime_abi": safety_status.get("hyprland_runtime_abi") if safety_status else None,
+            "native_identity_matches": identity_matches,
         },
         "checks": checks,
         "requirements": {
