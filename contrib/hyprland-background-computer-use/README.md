@@ -41,12 +41,14 @@ The fallback reuses the same application process. It does not create another pro
 
 Window discovery is paginated and bounds compositor-provided text only when returning it over MCP, preserving full internal titles for reliable matching. PNG captures must pass bounded structural and pixel-stream validation before base64 encoding, and captures larger than 5 MiB are rejected so responses remain below Codex's stdio transport limit. Image results omit `structuredContent` so Codex receives the actual screenshot content blocks.
 
+`get_session_window_capture` is read-only and returns its PNG inline. To persist a capture, use the separately destructive `save_session_window_capture` tool with an absolute `save_path`; it atomically replaces the destination only after a valid capture succeeds. The original `capture_session_window` tool remains as a deprecated compatibility route with its optional `save_path` behavior and destructive annotation.
+
 ## Parallel-agent workflow
 
 For a prompt that can be split across windows, the coordinating agent should enumerate the current windows and give each worker a distinct target. Every worker then:
 
 1. Calls `claim_session_window` before its first capture or action.
-2. Passes the returned `claim_token` to this broker's capture, targeted pointer/shortcut, and coordinate-lease tools. Passes both `owner_thread_id` and `claim_token` to the generic Computer Use capture and mutation tools.
+2. Passes the returned `claim_token` to `get_session_window_capture` or `save_session_window_capture`, targeted pointer/shortcut tools, and `begin_coordinate_lease`. Passes both `owner_thread_id` and `claim_token` to the generic Computer Use capture and mutation tools.
 3. Lets claimed broker operations renew automatically, and calls `claim_session_window` before `expires_at` during longer external semantic work. A renewal from the same task keeps the token stable.
 4. Recaptures immediately before coordinate selection and after each mutation.
 5. Ends any coordinate lease and calls `release_session_window` in cleanup, including after failures.
@@ -67,6 +69,13 @@ Claims preserve legacy unclaimed flows when no active claim conflicts. They beco
 
 The implementation is Hyprland-specific and experimental. It was developed and accepted against Hyprland 0.55.4. Other releases are not currently supported. Native extensions must be rebuilt for the exact running Hyprland ABI.
 
+Normal targeted pointer and shortcut actions snapshot the physical focus,
+workspace, and cursor before and after dispatch. They return success only when
+those observations match; a mismatch is reported as an error with the observed
+changes instead of being attributed to the backend. The snapshots cannot
+distinguish backend interference from concurrent physical user input, so normal
+targeted actions never restore a potentially stale pre-action snapshot.
+
 Runtime and build dependencies include:
 
 - Hyprland and its development headers
@@ -79,7 +88,9 @@ Runtime and build dependencies include:
 - a Codex CLI release with `codex plugin` support
 - `computer-use-linux@codex-computer-use-linux`, which provides the AT-SPI and global-input Computer Use tools that this plugin's skill coordinates with
 
-The broker builds and loads the native extension on demand. Builds are cached outside the installed plugin under `${XDG_CACHE_HOME:-$HOME/.cache}/same-session-computer-use/` and keyed by the plugin source and running Hyprland version.
+The broker builds and loads the native extension on demand. Builds are cached outside the installed plugin under `${XDG_CACHE_HOME:-$HOME/.cache}/same-session-computer-use/` and keyed by the plugin source and running Hyprland version. Before using an already-loaded extension, the broker verifies its plugin version, source digest, and build/runtime Hyprland ABI. A stale or mismatched extension is rejected with instructions to unload it instead of being used silently.
+
+`session_status` reports that identity under `versions`. It also reports semantic actions separately under `semantic_actions`: the companion knows that `computer-use-linux` is the provider and that its calls are not claim-enforced, but leaves availability unknown because the provider is a separate MCP process.
 
 ## Install
 
@@ -136,6 +147,16 @@ hyprctl plugin list
 ```
 
 The generated shared object is intentionally excluded from Git. Build it on the target machine so it matches that machine's Hyprland ABI.
+
+## Test the native path
+
+The `hyprland-native-e2e` workflow boots the supported Hyprland release in a NixOS VM with a virtual GPU and real input devices. It builds and loads the extension, captures a background GTK window, injects a click and shortcut into that window, and verifies that a foreground sentinel keeps its focus, workspace, and pointer state.
+
+On a Hyprland development machine, run the same smoke test nested inside the current session:
+
+```bash
+PYTHONPATH=src python tests/native_e2e.py
+```
 
 ## Run the MCP broker
 

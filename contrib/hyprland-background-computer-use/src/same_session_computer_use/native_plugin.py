@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")).expanduser() / "same-session-computer-use"
 PLUGIN_LOCK_FILE = STATE_DIR / "plugin-build-load.lock"
 PLUGIN_PACKAGES = ("pixman-1", "libdrm", "hyprland", "libinput", "libudev", "wayland-server", "xkbcommon")
+NATIVE_PLUGIN_VERSION = "0.1.2"
 
 
 def run(args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
@@ -56,6 +57,14 @@ def plugin_cache_directory(version: str, source: bytes) -> Path:
     return cache_home / "same-session-computer-use/hyprland" / key
 
 
+def plugin_identity(version: str, source: bytes) -> dict[str, str]:
+    return {
+        "plugin_version": NATIVE_PLUGIN_VERSION,
+        "source_sha256": hashlib.sha256(source).hexdigest(),
+        "hyprland_build_sha256": hashlib.sha256(version.encode()).hexdigest(),
+    }
+
+
 def build_target_pointer_plugin(version: str) -> Path:
     source = ROOT / "hyprland/target-pointer.cpp"
     source_bytes = source.read_bytes()
@@ -76,6 +85,10 @@ def build_target_pointer_plugin(version: str) -> Path:
     temporary = directory / f".{library.name}.{os.getpid()}.tmp"
     compiler = shlex.split(os.environ.get("CXX", "g++"))
     flags = ["-O2", "-shared", "-fPIC", "-std=c++23", "-Wall", "-Wextra", "-Wpedantic"]
+    identity = plugin_identity(version, source_bytes)
+    flags.extend(
+        f'-DCU_{name.upper()}="{value}"' for name, value in identity.items()
+    )
     if Path(compiler[-1]).name == "g++":
         flags.append("--no-gnu-unique")
     try:
@@ -94,22 +107,7 @@ def build_target_pointer_plugin(version: str) -> Path:
     return library
 
 
-def ensure_target_pointer_plugin() -> None:
-    with file_guard(PLUGIN_LOCK_FILE):
-        listed = run(["hyprctl", "plugin", "list"])
-        if listed.returncode == 0 and "same-session-target-pointer" in listed.stdout:
-            return
-        version = run(["hyprctl", "version"])
-        if version.returncode:
-            raise RuntimeError(version.stderr.strip() or "failed to read Hyprland version")
-        library = build_target_pointer_plugin(version.stdout)
-        loaded = run(["hyprctl", "plugin", "load", str(library)], timeout=20)
-        if loaded.returncode or "ok" not in loaded.stdout.lower():
-            raise RuntimeError(loaded.stderr.strip() or loaded.stdout.strip() or "failed to load targeted-pointer plugin")
-
-
-def native_input_status() -> dict[str, Any]:
-    ensure_target_pointer_plugin()
+def _native_input_status() -> dict[str, Any]:
     proc = run(["hyprctl", "-j", "cutargetstatus"])
     if proc.returncode:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "native input safety probe failed")
@@ -120,6 +118,45 @@ def native_input_status() -> dict[str, Any]:
     if not isinstance(status, dict) or status.get("ok") is not True:
         raise RuntimeError(str(status.get("error") if isinstance(status, dict) else "native input safety probe failed"))
     return status
+
+
+def _validate_plugin_identity(
+    status: dict[str, Any], expected: dict[str, str]
+) -> None:
+    actual = {name: status.get(name) for name in expected}
+    if actual != expected:
+        raise RuntimeError(
+            "loaded same-session-target-pointer identity does not match this broker: "
+            f"expected={json.dumps(expected, sort_keys=True)}, "
+            f"actual={json.dumps(actual, sort_keys=True)}; unload the stale plugin and retry"
+        )
+    if status.get("hyprland_build_abi") != status.get("hyprland_runtime_abi"):
+        raise RuntimeError("loaded same-session-target-pointer Hyprland ABI does not match the runtime")
+
+
+def ensure_target_pointer_plugin() -> dict[str, Any]:
+    with file_guard(PLUGIN_LOCK_FILE):
+        version = run(["hyprctl", "version"])
+        if version.returncode:
+            raise RuntimeError(version.stderr.strip() or "failed to read Hyprland version")
+        source = (ROOT / "hyprland/target-pointer.cpp").read_bytes()
+        expected = plugin_identity(version.stdout, source)
+        listed = run(["hyprctl", "plugin", "list"])
+        if listed.returncode == 0 and "same-session-target-pointer" in listed.stdout:
+            status = _native_input_status()
+            _validate_plugin_identity(status, expected)
+            return status
+        library = build_target_pointer_plugin(version.stdout)
+        loaded = run(["hyprctl", "plugin", "load", str(library)], timeout=20)
+        if loaded.returncode or "ok" not in loaded.stdout.lower():
+            raise RuntimeError(loaded.stderr.strip() or loaded.stdout.strip() or "failed to load targeted-pointer plugin")
+        status = _native_input_status()
+        _validate_plugin_identity(status, expected)
+        return status
+
+
+def native_input_status() -> dict[str, Any]:
+    return ensure_target_pointer_plugin()
 
 
 def ensure_native_input_safe() -> dict[str, Any]:
