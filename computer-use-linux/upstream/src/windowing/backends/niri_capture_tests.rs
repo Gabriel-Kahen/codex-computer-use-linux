@@ -44,6 +44,17 @@ fn pipeline_targets_only_the_published_pipewire_node() {
 }
 
 #[test]
+fn requires_the_niri_window_capture_protocol_version() {
+    validate_screencast_version(MIN_SCREENCAST_VERSION).unwrap();
+    validate_screencast_version(MIN_SCREENCAST_VERSION + 1).unwrap();
+
+    assert!(validate_screencast_version(MIN_SCREENCAST_VERSION - 1)
+        .unwrap_err()
+        .to_string()
+        .contains("too old"));
+}
+
+#[test]
 fn stable_target_validation_accepts_metadata_preserving_changes() {
     let expected = window(8);
     let mut current = expected.clone();
@@ -67,9 +78,15 @@ fn stable_target_validation_rejects_stale_and_reidentified_windows() {
     let reidentified = validate_current_window(&expected, Some(&changed))
         .unwrap_err()
         .to_string();
+    let mut changed_app = expected.clone();
+    changed_app.app_id = Some("org.example.Other".to_string());
+    let changed_application = validate_current_window(&expected, Some(&changed_app))
+        .unwrap_err()
+        .to_string();
 
     assert!(missing.contains("stale or closed"));
     assert!(reidentified.contains("changed process identity"));
+    assert!(changed_application.contains("changed application identity"));
 }
 
 #[test]

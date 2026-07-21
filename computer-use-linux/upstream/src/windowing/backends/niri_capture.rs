@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use zbus::zvariant::{OwnedObjectPath, Value};
 use zbus::{Connection, Proxy};
@@ -21,6 +21,10 @@ const MUTTER_SCREENCAST_PATH: &str = "/org/gnome/Mutter/ScreenCast";
 const MUTTER_SCREENCAST_INTERFACE: &str = "org.gnome.Mutter.ScreenCast";
 const MUTTER_SCREENCAST_SESSION_INTERFACE: &str = "org.gnome.Mutter.ScreenCast.Session";
 const MUTTER_SCREENCAST_STREAM_INTERFACE: &str = "org.gnome.Mutter.ScreenCast.Stream";
+const MIN_SCREENCAST_VERSION: i32 = 4;
+const GSTREAMER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const SCREENCAST_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+const TARGET_VALIDATION_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAM_START_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -48,14 +52,11 @@ pub(crate) fn exact_capture_support() -> ExactCaptureSupport {
                 };
             };
             for plugin in ["pipewiresrc", "videoconvert", "pngenc"] {
-                let present = std::process::Command::new(&gst_inspect)
-                    .arg(plugin)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .is_ok_and(|status| status.success());
-                if !present {
+                if !command_succeeds_with_timeout(
+                    &gst_inspect,
+                    plugin,
+                    GSTREAMER_PROBE_TIMEOUT,
+                ) {
                     return ExactCaptureSupport {
                         available: false,
                         detail: format!(
@@ -85,12 +86,15 @@ pub(crate) async fn capture_window_exact(window: &WindowInfo) -> Result<RawScree
     }
 
     let expected = window.clone();
-    let window_id = tokio::task::spawn_blocking(move || validate_capture_target(&expected))
+    let validation = tokio::task::spawn_blocking(move || validate_capture_target(&expected));
+    let window_id = tokio::time::timeout(TARGET_VALIDATION_TIMEOUT, validation)
         .await
+        .context("timed out validating the Niri capture target")?
         .context("Niri capture target validation task failed")??;
     hydrate_session_bus_env();
-    let connection = Connection::session()
+    let connection = tokio::time::timeout(SCREENCAST_CALL_TIMEOUT, Connection::session())
         .await
+        .context("timed out connecting to the session bus for Niri exact capture")?
         .context("failed to connect to the session bus for Niri exact capture")?;
     let session_path = create_session(&connection).await?;
     let result = capture_session_window(&connection, &session_path, window_id).await;
@@ -104,8 +108,10 @@ pub(crate) async fn capture_window_exact(window: &WindowInfo) -> Result<RawScree
     };
 
     let expected = window.clone();
-    tokio::task::spawn_blocking(move || validate_capture_target(&expected))
+    let validation = tokio::task::spawn_blocking(move || validate_capture_target(&expected));
+    tokio::time::timeout(TARGET_VALIDATION_TIMEOUT, validation)
         .await
+        .context("timed out revalidating the Niri capture target")?
         .context("Niri post-capture identity validation task failed")??;
     Ok(capture)
 }
@@ -119,11 +125,31 @@ async fn create_session(connection: &Connection) -> Result<OwnedObjectPath> {
     )
     .await
     .context("Niri's org.gnome.Mutter.ScreenCast interface is unavailable")?;
+    let version = tokio::time::timeout(
+        SCREENCAST_CALL_TIMEOUT,
+        proxy.get_property::<i32>("Version"),
+    )
+    .await
+    .context("timed out reading Niri's ScreenCast protocol version")?
+    .context("Niri's ScreenCast service did not expose a protocol version")?;
+    validate_screencast_version(version)?;
     let properties: HashMap<&str, Value<'_>> = HashMap::new();
-    proxy
-        .call("CreateSession", &properties)
-        .await
-        .context("Niri ScreenCast CreateSession failed")
+    tokio::time::timeout(
+        SCREENCAST_CALL_TIMEOUT,
+        proxy.call("CreateSession", &properties),
+    )
+    .await
+    .context("Niri ScreenCast CreateSession timed out")?
+    .context("Niri ScreenCast CreateSession failed")
+}
+
+fn validate_screencast_version(version: i32) -> Result<()> {
+    if version < MIN_SCREENCAST_VERSION {
+        bail!(
+            "Niri ScreenCast protocol version {version} is too old for exact window capture; version {MIN_SCREENCAST_VERSION} or newer is required"
+        )
+    }
+    Ok(())
 }
 
 async fn capture_session_window(
@@ -141,10 +167,13 @@ async fn capture_session_window(
     .context("failed to create Niri ScreenCast session proxy")?;
     let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
     properties.insert("window-id", Value::from(window_id));
-    let stream_path: OwnedObjectPath = session
-        .call("RecordWindow", &properties)
-        .await
-        .with_context(|| format!("Niri refused ScreenCast window id {window_id}"))?;
+    let stream_path: OwnedObjectPath = tokio::time::timeout(
+        SCREENCAST_CALL_TIMEOUT,
+        session.call("RecordWindow", &properties),
+    )
+    .await
+    .with_context(|| format!("Niri ScreenCast RecordWindow timed out for window id {window_id}"))?
+    .with_context(|| format!("Niri refused ScreenCast window id {window_id}"))?;
     let stream = Proxy::new(
         connection,
         MUTTER_SCREENCAST_SERVICE,
@@ -153,14 +182,20 @@ async fn capture_session_window(
     )
     .await
     .context("failed to create Niri ScreenCast stream proxy")?;
-    let mut node_signals = stream
-        .receive_signal("PipeWireStreamAdded")
-        .await
-        .context("failed to subscribe to Niri's PipeWire stream signal")?;
-    session
-        .call::<_, _, ()>("Start", &())
-        .await
-        .context("Niri ScreenCast session failed to start")?;
+    let mut node_signals = tokio::time::timeout(
+        SCREENCAST_CALL_TIMEOUT,
+        stream.receive_signal("PipeWireStreamAdded"),
+    )
+    .await
+    .context("timed out subscribing to Niri's PipeWire stream signal")?
+    .context("failed to subscribe to Niri's PipeWire stream signal")?;
+    tokio::time::timeout(
+        SCREENCAST_CALL_TIMEOUT,
+        session.call::<_, _, ()>("Start", &()),
+    )
+    .await
+    .context("Niri ScreenCast Start timed out")?
+    .context("Niri ScreenCast session failed to start")?;
     let signal = tokio::time::timeout(STREAM_START_TIMEOUT, node_signals.next())
         .await
         .context("timed out waiting for Niri's exact window PipeWire node")?
@@ -181,10 +216,13 @@ async fn stop_session(connection: &Connection, session_path: &OwnedObjectPath) -
     )
     .await
     .context("failed to create Niri ScreenCast cleanup proxy")?;
-    session
-        .call::<_, _, ()>("Stop", &())
-        .await
-        .context("Niri ScreenCast Stop failed")
+    tokio::time::timeout(
+        SCREENCAST_CALL_TIMEOUT,
+        session.call::<_, _, ()>("Stop", &()),
+    )
+    .await
+    .context("Niri ScreenCast Stop timed out")?
+    .context("Niri ScreenCast Stop failed")
 }
 
 async fn capture_pipewire_frame(node_id: u32) -> Result<RawScreenshotCapture> {
@@ -282,6 +320,32 @@ fn command_path(binary: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|entry| entry.join(binary))
         .find(|candidate| is_executable(candidate))
+}
+
+fn command_succeeds_with_timeout(path: &Path, argument: &str, timeout: Duration) -> bool {
+    let Ok(mut child) = std::process::Command::new(path)
+        .arg(argument)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
