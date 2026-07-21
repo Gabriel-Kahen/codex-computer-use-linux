@@ -1284,7 +1284,7 @@ class McpTests(TestCase):
 
         self.assertEqual(manifest["name"], "gnome-same-session-computer-use")
         self.assertEqual(len(tools), len({item["name"] for item in tools}))
-        self.assertEqual(len(tools), 15)
+        self.assertEqual(len(tools), 16)
         annotations = {item["name"]: item["annotations"] for item in tools}
         self.assertFalse(annotations["end_focus_lease"]["idempotentHint"])
         self.assertEqual(

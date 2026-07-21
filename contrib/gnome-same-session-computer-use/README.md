@@ -11,6 +11,7 @@ This experimental Codex plugin operates applications already running in the user
 | Agent coordination | Expiring, per-window claims keyed by Codex thread ID | Broker tools fence claimed windows; different windows proceed concurrently |
 | Semantic actions | Separate repository-owned `computer-use-linux@codex-computer-use-linux` AT-SPI plugin | Normally none; agents honor claims by policy because AT-SPI runs outside this broker |
 | Exact capture | `Meta.WindowActor.paint_to_content()` in the Shell extension | Does not change focus; minimized clients may expose only their last submitted buffer |
+| Short act-and-observe | Journal, focus, one action, damage/paint wait, exact capture, restore | Uses the global seat briefly; restoration completes before the tool returns |
 | Pointer/keyboard | Mutter `Clutter.VirtualInputDevice` | Uses the global seat; pointer is restored after each pointer transaction |
 | Recovery | Shell-owned capability plus atomic, session-scoped state journals | Verifies workspace, focus, pointer, and minimized state before clearing the journal |
 
@@ -59,8 +60,9 @@ the separately installed extension reports the claimed-lease protocol capability
 2. Each parallel agent calls `claim_session_window`. Claims on distinct stable window IDs proceed concurrently; a same-window race has exactly one winner. The default claim is 60 seconds and `lease_seconds` accepts 5 through 300. Reclaiming a live claim as the same thread refreshes it; reacquiring after expiry rotates the token.
 3. Pass `claim_token` to every claimed broker action. Prefer the companion plugin's AT-SPI actions, but treat the claim as a cooperative policy for those external actions: the separate AT-SPI process cannot be mechanically fenced by this broker.
 4. Capture any claimed window directly with `get_session_window_capture`; this does not change focus. If `window_actor_capture_protocol` is false, the compatibility path still requires the target to be focused or leased.
-5. For coordinate work, ask the user to acknowledge interference and call `begin_focus_lease`. Operate the leased window, then always call `end_focus_lease`, including after failures, before `release_session_window`.
-6. Use `recover_focus_lease` after an interruption. A journaled focus-lease target remains reserved even if its claim expires, so end or recover the focus lease before reacquiring that window.
+5. For one coordinate or shortcut action, prefer `act_and_observe_window`: after explicit interference acknowledgement it journals recovery state, focuses the target, acts, waits up to 180 ms for window damage and a stage paint, captures, and restores the original desktop before returning. This removes model-thinking time from the visible focus interval.
+6. Use `begin_focus_lease` only for a sequence that cannot fit one short transaction. Always call `end_focus_lease`, including after failures, before `release_session_window`.
+7. Use `recover_focus_lease` after an interruption. A journaled focus-lease target remains reserved even if its claim expires, so end or recover the focus lease before reacquiring that window.
 
 Capture metadata reports screenshot pixel dimensions, logical window-local dimensions, `pixel_to_window_scale`, the capture source, and whether a minimized client's last submitted compositor buffer may be stale. Convert a screenshot point before pointer input: `window_x = screenshot_x * pixel_to_window_scale.x`, and likewise for y.
 
