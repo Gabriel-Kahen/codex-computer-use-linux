@@ -5,7 +5,11 @@ pub(crate) async fn run_from_env() -> Result<()> {
     diagnostics::hydrate_session_bus_env();
 
     match std::env::args().nth(1).as_deref() {
-        Some("mcp") => server::serve_mcp().await,
+        Some("mcp") => {
+            let result = server::serve_mcp().await;
+            crate::windowing::shutdown_backends().await;
+            result
+        }
         Some("doctor") => {
             let report = diagnostics::doctor_report();
             println!(
@@ -113,6 +117,7 @@ pub(crate) async fn run_from_env() -> Result<()> {
                 }
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
+            crate::windowing::shutdown_backends().await;
             Ok(())
         }
         Some("setup-window-targeting") => {
