@@ -32,6 +32,65 @@ class CaptureBoundaryTests(TestCase):
             with self.assertRaisesRegex(RuntimeError, "begin_focus_lease"):
                 server.capture_window({"window": "11"})
 
+    def test_window_actor_capture_observes_inactive_window_without_focus(self) -> None:
+        window = {
+            "id": "11",
+            "title": "Editor",
+            "focused": False,
+            "minimized": True,
+            "frame": {"width": 400, "height": 300},
+        }
+        integration = {
+            "shell_instance": "shell-a",
+            "protocol_version": server.WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION,
+            "capabilities": [server.WINDOW_ACTOR_CAPTURE_CAPABILITY],
+        }
+        captured = {
+            "window": window,
+            "shell_instance": "shell-a",
+            "source": "meta-window-actor",
+            "potentially_stale": True,
+        }
+        with (
+            patch.object(server, "load_lease", return_value=None),
+            patch.object(server, "shell_status", return_value=integration),
+            patch.object(server, "dbus_capture_window", return_value=(png(800, 600), captured)) as capture,
+            patch.object(server, "run") as run,
+        ):
+            result = server.capture_window(
+                {"window": "11"},
+                selected=window,
+                expected_shell_instance="shell-a",
+            )
+
+        capture.assert_called_once_with("11")
+        run.assert_not_called()
+        metadata = json.loads(result["content"][0]["text"])
+        self.assertFalse(metadata["capture_requires_focus"])
+        self.assertEqual(metadata["capture_source"], "meta-window-actor")
+        self.assertTrue(metadata["potentially_stale"])
+        self.assertEqual(metadata["coordinate_space"]["pixel_to_window_scale"], {"x": 0.5, "y": 0.5})
+
+    def test_window_actor_capture_rejects_shell_restart(self) -> None:
+        window = {"id": "11", "focused": False, "frame": {"width": 1, "height": 1}}
+        integration = {
+            "shell_instance": "shell-a",
+            "protocol_version": server.WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION,
+            "capabilities": [server.WINDOW_ACTOR_CAPTURE_CAPABILITY],
+        }
+        captured = {"window": window, "shell_instance": "shell-b"}
+        with (
+            patch.object(server, "load_lease", return_value=None),
+            patch.object(server, "shell_status", return_value=integration),
+            patch.object(server, "dbus_capture_window", return_value=(png(1, 1), captured)),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "restarted"):
+                server.capture_window(
+                    {"window": "11"},
+                    selected=window,
+                    expected_shell_instance="shell-a",
+                )
+
     def test_failed_capture_preserves_destination(self) -> None:
         window = {"id": "11", "focused": True, "frame": {"width": 1, "height": 1}}
         with TemporaryDirectory() as directory:
