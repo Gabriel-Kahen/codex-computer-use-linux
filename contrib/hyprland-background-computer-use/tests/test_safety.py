@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -68,6 +69,20 @@ class PluginBuildTests(TestCase):
             self.assertNotEqual(first.parent, other_version)
             self.assertFalse((source.parent / first.name).exists())
             self.assertEqual(build.call_count, 1)
+            command = build.call_args.args[0]
+            self.assertIn(
+                f'-DCU_PLUGIN_VERSION="{native_plugin.NATIVE_PLUGIN_VERSION}"',
+                command,
+            )
+            self.assertTrue(
+                any(flag.startswith('-DCU_SOURCE_SHA256="') for flag in command)
+            )
+            self.assertTrue(
+                any(
+                    flag.startswith('-DCU_HYPRLAND_BUILD_SHA256="')
+                    for flag in command
+                )
+            )
 
     def test_plugin_build_and_load_use_the_plugin_file_guard(self) -> None:
         events: list[tuple[str, Path]] = []
@@ -80,20 +95,75 @@ class PluginBuildTests(TestCase):
 
         responses = iter(
             (
-                completed([], "no plugins loaded"),
                 completed([], "Hyprland version"),
+                completed([], "no plugins loaded"),
                 completed([], "ok"),
+                completed(
+                    [],
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "plugin_version": native_plugin.NATIVE_PLUGIN_VERSION,
+                            "source_sha256": native_plugin.plugin_identity(
+                                "Hyprland version", b"int plugin_source;"
+                            )["source_sha256"],
+                            "hyprland_build_sha256": native_plugin.plugin_identity(
+                                "Hyprland version", b"int plugin_source;"
+                            )["hyprland_build_sha256"],
+                            "hyprland_build_abi": "abi",
+                            "hyprland_runtime_abi": "abi",
+                        }
+                    ),
+                ),
             )
         )
         library = Path("/cache/same-session-target-pointer.so")
-        with (
-            patch.object(native_plugin, "file_guard", side_effect=guard),
-            patch.object(native_plugin, "run", side_effect=lambda *_args, **_kwargs: next(responses)),
-            patch.object(native_plugin, "build_target_pointer_plugin", return_value=library),
-        ):
-            native_plugin.ensure_target_pointer_plugin()
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "hyprland/target-pointer.cpp"
+            source.parent.mkdir(parents=True)
+            source.write_text("int plugin_source;")
+            with (
+                patch.object(native_plugin, "ROOT", root),
+                patch.object(native_plugin, "file_guard", side_effect=guard),
+                patch.object(native_plugin, "run", side_effect=lambda *_args, **_kwargs: next(responses)),
+                patch.object(native_plugin, "build_target_pointer_plugin", return_value=library),
+            ):
+                native_plugin.ensure_target_pointer_plugin()
 
         self.assertEqual(events, [("enter", native_plugin.PLUGIN_LOCK_FILE), ("exit", native_plugin.PLUGIN_LOCK_FILE)])
+
+    def test_rejects_an_already_loaded_plugin_with_the_wrong_identity(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "hyprland/target-pointer.cpp"
+            source.parent.mkdir(parents=True)
+            source.write_text("current source")
+            responses = iter(
+                (
+                    completed([], "Hyprland version"),
+                    completed([], "same-session-target-pointer"),
+                    completed([], '{"ok":true,"plugin_version":"stale"}'),
+                )
+            )
+            with (
+                patch.object(native_plugin, "ROOT", root),
+                patch.object(native_plugin, "file_guard", return_value=nullcontext()),
+                patch.object(native_plugin, "run", side_effect=lambda *_args, **_kwargs: next(responses)),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity does not match"):
+                    native_plugin.ensure_target_pointer_plugin()
+
+    def test_rejects_matching_plugin_identity_with_a_runtime_abi_mismatch(self) -> None:
+        expected = native_plugin.plugin_identity("Hyprland version", b"source")
+        status = {
+            **expected,
+            "hyprland_build_abi": "build-abi",
+            "hyprland_runtime_abi": "runtime-abi",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "ABI does not match"):
+            native_plugin._validate_plugin_identity(status, expected)
 
 
 class SafetyProbeTests(TestCase):
@@ -349,6 +419,115 @@ class RestoreTests(TestCase):
 
 
 class StatusTests(TestCase):
+    def test_reports_loaded_native_identity_match(self) -> None:
+        source = (
+            Path(server.__file__).resolve().parents[2]
+            / "hyprland/target-pointer.cpp"
+        ).read_bytes()
+        expected = native_plugin.plugin_identity("Hyprland version", source)
+        native_status = {
+            "ok": True,
+            **expected,
+            "hyprland_build_abi": "abi",
+            "hyprland_runtime_abi": "abi",
+            "safe_to_inject": True,
+        }
+        responses = iter(
+            (
+                completed([], "same-session-target-pointer"),
+                completed([], json.dumps(native_status)),
+                completed([], "Hyprland version"),
+            )
+        )
+        with (
+            patch.object(server.shutil, "which", return_value="/bin/tool"),
+            patch.object(server, "plugin_build_requirements", return_value={}),
+            patch.object(server, "combine_windows", return_value=[]),
+            patch.object(
+                server,
+                "run",
+                side_effect=lambda *_args, **_kwargs: next(responses),
+            ),
+        ):
+            result = server.status()
+
+        self.assertEqual(
+            result["versions"],
+            {
+                "companion": "0.2.0",
+                "native_extension_expected": native_plugin.NATIVE_PLUGIN_VERSION,
+                "native_extension_loaded": native_plugin.NATIVE_PLUGIN_VERSION,
+                "native_source_sha256_expected": expected["source_sha256"],
+                "native_source_sha256_loaded": expected["source_sha256"],
+                "hyprland_build_sha256_expected": expected[
+                    "hyprland_build_sha256"
+                ],
+                "hyprland_build_sha256_loaded": expected[
+                    "hyprland_build_sha256"
+                ],
+                "hyprland_build_abi": "abi",
+                "hyprland_runtime_abi": "abi",
+                "native_identity_matches": True,
+            },
+        )
+        self.assertEqual(
+            result["capabilities"],
+            {
+                "exact_background_window_capture": False,
+                "targeted_background_shortcuts": True,
+                "background_semantic_actions": False,
+                "targeted_wayland_pointer": True,
+                "targeted_xwayland_pointer": True,
+                "cross_process_window_claims": True,
+                "parallel_native_wayland_windows": True,
+                "broker_global_input_lane_serialized": True,
+                "native_input_currently_safe": True,
+                "physical_pointer_seat_is_independent": False,
+            },
+        )
+
+    def test_stale_loaded_plugin_is_not_reported_as_available_or_safe(self) -> None:
+        native_status = {
+            "ok": True,
+            "plugin_version": "stale",
+            "safe_to_inject": True,
+        }
+        responses = iter(
+            (
+                completed([], "same-session-target-pointer"),
+                completed([], json.dumps(native_status)),
+                completed([], "Hyprland version"),
+            )
+        )
+        with (
+            patch.object(server.shutil, "which", return_value="/bin/tool"),
+            patch.object(server, "plugin_build_requirements", return_value={}),
+            patch.object(server, "combine_windows", return_value=[]),
+            patch.object(
+                server,
+                "run",
+                side_effect=lambda *_args, **_kwargs: next(responses),
+            ),
+        ):
+            result = server.status()
+
+        self.assertEqual(
+            result["capabilities"],
+            {
+                "exact_background_window_capture": False,
+                "targeted_background_shortcuts": False,
+                "background_semantic_actions": False,
+                "targeted_wayland_pointer": False,
+                "targeted_xwayland_pointer": False,
+                "cross_process_window_claims": True,
+                "parallel_native_wayland_windows": True,
+                "broker_global_input_lane_serialized": True,
+                "native_input_currently_safe": False,
+                "physical_pointer_seat_is_independent": False,
+            },
+        )
+        self.assertFalse(result["versions"]["native_identity_matches"])
+
     def test_reports_buildable_native_capabilities_without_claiming_at_spi(self) -> None:
         requirements = {"compiler": True, "headers": True}
         with (
@@ -376,3 +555,17 @@ class StatusTests(TestCase):
         )
         self.assertEqual(result["requirements"]["native_plugin_build"], requirements)
         self.assertIn("separate Computer Use plugin", result["requirements"]["background_semantic_actions"])
+        self.assertEqual(
+            result["semantic_actions"],
+            {
+                "available": None,
+                "claim_enforced": False,
+                "provider": "computer-use-linux",
+                "note": "Availability is unknown because semantic actions are provided by a separate MCP server.",
+            },
+        )
+        self.assertEqual(result["versions"]["companion"], "0.2.0")
+        self.assertEqual(
+            result["versions"]["native_extension_expected"],
+            native_plugin.NATIVE_PLUGIN_VERSION,
+        )

@@ -86,7 +86,9 @@ Runtime and build dependencies include:
 - a Codex CLI release with `codex plugin` support
 - `computer-use-linux@codex-computer-use-linux`, which provides the AT-SPI and global-input Computer Use tools that this plugin's skill coordinates with
 
-The broker builds and loads the native extension on demand. Builds are cached outside the installed plugin under `${XDG_CACHE_HOME:-$HOME/.cache}/same-session-computer-use/` and keyed by the plugin source and running Hyprland version.
+The broker builds and loads the native extension on demand. Builds are cached outside the installed plugin under `${XDG_CACHE_HOME:-$HOME/.cache}/same-session-computer-use/` and keyed by the plugin source and running Hyprland version. Before using an already-loaded extension, the broker verifies its plugin version, source digest, and build/runtime Hyprland ABI. A stale or mismatched extension is rejected with instructions to unload it instead of being used silently.
+
+`session_status` reports that identity under `versions`. It also reports semantic actions separately under `semantic_actions`: the companion knows that `computer-use-linux` is the provider and that its calls are not claim-enforced, but leaves availability unknown because the provider is a separate MCP process.
 
 ## Install
 
