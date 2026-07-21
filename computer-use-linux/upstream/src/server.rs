@@ -777,8 +777,9 @@ impl ComputerUseLinux {
         &self,
         params: ScreenshotParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let target = params.window_target();
+        let mut target = params.window_target();
         let full_screen = params.full_screen.unwrap_or(false);
+        let raise_window = params.raise_window.unwrap_or(true);
         let coordination_window_id = if full_screen {
             None
         } else {
@@ -786,11 +787,22 @@ impl ComputerUseLinux {
                 .await
                 .map_err(|error| screenshot_failure("claim_coordination", target.as_ref(), error))?
         };
+        if let (Some(target), Some(window_id)) = (target.as_mut(), coordination_window_id) {
+            target.pin_exact_window_id(window_id);
+        }
         let _claim_guard = self
-            .acquire_claim_guard(coordination_window_id, &params.claim)
+            .mutation_claim_guard(
+                ClaimGuardMode::Acquire,
+                coordination_window_id,
+                &params.claim,
+                if target.is_some() && raise_window {
+                    MutationLane::PhysicalSeat
+                } else {
+                    MutationLane::Window
+                },
+            )
             .await
             .map_err(|error| screenshot_failure("claim_coordination", target.as_ref(), error))?;
-        let raise_window = params.raise_window.unwrap_or(true);
         if let Some(target) = target.as_ref().filter(|_| raise_window) {
             let focus = focus_window_target(target)
                 .await
@@ -5436,7 +5448,6 @@ mod tests {
     use crate::atspi_tree::{AccessibilityAction, Bounds};
     use crate::windows::{WindowBounds, GNOME_SHELL_EXTENSION_BACKEND};
     use std::io::{BufRead, Write};
-
     fn claim_context(owner: &str, token: &str) -> ClaimContext {
         ClaimContext {
             owner_thread_id: Some(owner.to_string()),
@@ -5807,6 +5818,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exact_window_pin_preserves_selectors_and_authorizes_one_identity() {
+        let mut target = WindowTarget {
+            app_id: Some("org.example.App".to_string()),
+            title: Some("Document".to_string()),
+            ..Default::default()
+        };
+
+        target.pin_exact_window_id(42);
+
+        assert_eq!(
+            target,
+            WindowTarget {
+                window_id: Some(42),
+                app_id: Some("org.example.App".to_string()),
+                title: Some("Document".to_string()),
+                ..Default::default()
+            }
+        );
+    }
+
     #[tokio::test]
     async fn screenshot_route_rejects_foreign_claim_credentials() {
         let window_id = u64::MAX;
@@ -5840,6 +5872,57 @@ mod tests {
                 ..Default::default()
             }))
             .await
+            .unwrap_err();
+        assert!(!error.message.contains("claim_coordination"));
+        assert!(!error.message.contains("actively claimed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn screenshot_focus_waits_for_the_companion_global_lane() {
+        let window_id = u64::MAX;
+        let (backend, root) = backend_with_live_claim(window_id);
+        let lock_path = root.join("pointer-transaction.lock");
+        let mut companion = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl,sys; f=open(sys.argv[1], 'a+'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); input()",
+            ])
+            .arg(lock_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(companion.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "locked\n");
+
+        let mut capture = tokio::spawn(async move {
+            backend
+                .screenshot(Parameters(ScreenshotParams {
+                    window_id: Some(window_id),
+                    claim: ClaimContext {
+                        owner_thread_id: Some("owner-a".to_string()),
+                        claim_token: Some("token-a".to_string()),
+                    },
+                    ..Default::default()
+                }))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut capture)
+                .await
+                .is_err()
+        );
+        companion.stdin.take().unwrap().write_all(b"\n").unwrap();
+        assert!(companion.wait().unwrap().success());
+
+        let error = tokio::time::timeout(Duration::from_secs(5), capture)
+            .await
+            .unwrap()
+            .unwrap()
             .unwrap_err();
         assert!(!error.message.contains("claim_coordination"));
         assert!(!error.message.contains("actively claimed"));
