@@ -5,6 +5,9 @@
 - Attach to the current user's real Wayland, Hyprland, D-Bus, and AT-SPI sessions.
 - Reuse existing application processes and profiles.
 - Keep the physical workspace, focused window, and pointer unchanged for normal operations.
+- Treat a before/after physical-state mismatch as a failed targeted operation.
+  The broker reports which fields changed but does not restore a stale snapshot
+  that may reflect concurrent user input.
 - Prefer exact window capture and semantic accessibility actions.
 - Restore all compositor state after any fallback transaction.
 - Fence every claimed window by the host-provided Codex task identity and an expiring token.
