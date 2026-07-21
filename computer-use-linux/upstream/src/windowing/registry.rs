@@ -242,8 +242,8 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         #[cfg(test)]
         support: BackendSupport {
             desktop_session: "Generic X11 / Xfce / other EWMH WMs",
-            window_backend: "`wmctrl`; optional `xprop` for focus verification",
-            notes: "Lists, focuses, moves, and resizes EWMH windows. Without `xprop`, listing still works but focused-window verification is unavailable.",
+            window_backend: "native X11/EWMH connection; `wmctrl`/`xprop` fallback",
+            notes: "Lists and focuses through one persistent X11 connection, with event-invalidated snapshots. `wmctrl` remains the move/resize and compatibility fallback.",
         },
     },
 ];
@@ -401,7 +401,10 @@ pub async fn resize_window(window: &WindowInfo, width: i32, height: i32) -> Resu
 }
 
 pub fn focused_window_override() -> Option<WindowInfo> {
-    cosmic::focused_window().ok().flatten()
+    cosmic::focused_window()
+        .ok()
+        .flatten()
+        .or_else(x11::focused_window)
 }
 
 pub fn probe_backends() -> Vec<BackendProbe> {
