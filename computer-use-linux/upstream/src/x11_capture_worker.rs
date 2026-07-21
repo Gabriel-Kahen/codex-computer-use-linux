@@ -130,12 +130,9 @@ fn handle_request(request: WorkerRequest) -> Result<WorkerResult> {
                 (None, None) => None,
                 _ => anyhow::bail!("expected_width and expected_height must both be positive"),
             };
-            let capture = x11_native::capture_window(
-                request.window_id,
-                request.expected_pid,
-                expected_size,
-            )?
-            .context("native XComposite/XRes capture is unavailable in this X11 session")?;
+            let capture =
+                x11_native::capture_window(request.window_id, request.expected_pid, expected_size)?
+                    .context("native XComposite/XRes capture is unavailable in this X11 session")?;
             ensure_companion_payload_size(capture.png.len())?;
             Ok(WorkerResult::Capture(capture))
         }
@@ -225,7 +222,10 @@ mod tests {
             .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(responses.len(), 2);
-        assert!(responses[0]["error"].as_str().unwrap().contains("too large"));
+        assert!(responses[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("too large"));
         assert!(responses[1]["error"]
             .as_str()
             .unwrap()

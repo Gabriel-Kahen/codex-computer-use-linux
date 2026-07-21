@@ -398,8 +398,8 @@ impl NativeSession {
                 bail!("X11 window pixmap exceeds the {MAX_CAPTURE_PIXELS}-pixel capture budget");
             }
             let layout = self.pixel_layout(attributes.visual)?;
-            let image_offset = i16::try_from(window_border)
-                .context("X11 window border is too wide to capture")?;
+            let image_offset =
+                i16::try_from(window_border).context("X11 window border is too wide to capture")?;
             let (image, _) = X11Image::get(
                 &self.connection,
                 pixmap,
