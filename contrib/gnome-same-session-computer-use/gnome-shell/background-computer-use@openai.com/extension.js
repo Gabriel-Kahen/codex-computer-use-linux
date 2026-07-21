@@ -21,10 +21,17 @@ import {
     injectPointerTransaction,
     restoreLeaseTransaction,
 } from './shell_transactions.js';
+import {
+    bridgeInfo,
+    CONTRACT_FILENAME,
+    operationIdentity,
+    parseBridgeContract,
+    stableWindowId,
+} from './gnome_shell_bridge_contract.js';
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.BackgroundComputerUse';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/BackgroundComputerUse';
-const PROTOCOL_VERSION = 4;
+const PROTOCOL_VERSION = 5;
 const MAX_CAPTURE_BYTES = 5 * 1024 * 1024;
 const MAX_CAPTURE_PIXELS = 7680 * 4320;
 const XML = `<node>
@@ -52,6 +59,8 @@ function json(value) {
 
 export default class BackgroundComputerUseExtension extends Extension {
     enable() {
+        const [, contents] = this.dir.get_child(CONTRACT_FILENAME).load_contents(null);
+        this._bridgeContract = parseBridgeContract(new TextDecoder().decode(contents));
         this._tracker = Shell.WindowTracker.get_default();
         this._seat = Clutter.get_default_backend().get_default_seat();
         this._pointer = this._seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
@@ -85,6 +94,7 @@ export default class BackgroundComputerUseExtension extends Extension {
         this._tracker = null;
         this._protocol?.clear();
         this._protocol = null;
+        this._bridgeContract = null;
         this._shellInstance = null;
         this._leaseExpiryId = null;
         this._captureActive = false;
@@ -97,7 +107,7 @@ export default class BackgroundComputerUseExtension extends Extension {
     }
 
     _id(window) {
-        return String(window.get_stable_sequence());
+        return stableWindowId(window);
     }
 
     _find(id) {
@@ -188,7 +198,17 @@ export default class BackgroundComputerUseExtension extends Extension {
     Status() {
         return json({
             protocol_version: PROTOCOL_VERSION,
-            capabilities: ['claimed_focus_leases', 'window_actor_capture', 'act_and_capture'],
+            capabilities: [
+                'claimed_focus_leases',
+                'window_actor_capture',
+                'act_and_capture',
+                'bridge_contract_v1',
+            ],
+            bridge_contract: bridgeInfo(
+                this._bridgeContract,
+                'background-computer-use',
+                ['claimed-leases', 'window-actor-capture', 'act-and-capture'],
+            ),
             shell_version: Config.PACKAGE_VERSION,
             locked: Main.sessionMode.isLocked,
             overview_visible: Main.overview.visible,
@@ -222,6 +242,8 @@ export default class BackgroundComputerUseExtension extends Extension {
             throw new Error('another window capture is already in progress');
 
         const window = this._find(id);
+        if (window.minimized)
+            throw new Error(`window ${id} is minimized; refusing a potentially stale compositor buffer`);
         const actor = window.get_compositor_private();
         if (!actor || actor.is_destroyed())
             throw new Error(`window ${id} has no live compositor actor`);
@@ -255,6 +277,8 @@ export default class BackgroundComputerUseExtension extends Extension {
             const current = this._find(id);
             if (current.get_compositor_private() !== actor || actor.is_destroyed())
                 throw new Error(`window ${id} changed while it was being captured`);
+            if (current.minimized)
+                throw new Error(`window ${id} became minimized while it was being captured`);
             return {
                 bytes,
                 metadata: {
@@ -262,7 +286,14 @@ export default class BackgroundComputerUseExtension extends Extension {
                     screenshot_pixels: {width, height},
                     shell_instance: this._shellInstance,
                     source: 'meta-window-actor',
-                    potentially_stale: Boolean(current.minimized),
+                    potentially_stale: false,
+                    freshness: 'mapped-live-actor',
+                    operation_identity: operationIdentity(
+                        this._bridgeContract,
+                        this._shellInstance,
+                        current,
+                        'capture',
+                    ),
                 },
             };
         } finally {
@@ -337,7 +368,17 @@ export default class BackgroundComputerUseExtension extends Extension {
             armWindowFrame: () => this._armWindowFrame(this._find(lease.target)),
             injectPointer: action => this._injectPointer(capability, json(action), sender),
             injectKeys: action => this._injectKeys(capability, json(action), sender),
-            capture: () => this._captureWindow(lease.target),
+            capture: async () => {
+                const captured = await this._captureWindow(lease.target);
+                captured.metadata.operation_identity = operationIdentity(
+                    this._bridgeContract,
+                    this._shellInstance,
+                    this._find(lease.target),
+                    'act-and-capture',
+                    lease.generation,
+                );
+                return captured;
+            },
             restore: () => this._restoreLease(lease),
             monotonicTimeUsec: () => GLib.get_monotonic_time(),
         });
@@ -367,12 +408,14 @@ export default class BackgroundComputerUseExtension extends Extension {
         this._assertInputSafe();
         const window = this._find(id);
         const capability = `${GLib.uuid_string_random()}${GLib.uuid_string_random()}`;
+        const generation = `${GLib.uuid_string_random()}${GLib.uuid_string_random()}`;
         const lease = this._protocol.begin({
             capability,
             owner,
             target: id,
             targetMinimized: Boolean(window.minimized),
             original: this._state(),
+            generation,
             recoveryDeadlineUsec,
         });
         this._leaseExpiryId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 30, () => {
@@ -382,6 +425,7 @@ export default class BackgroundComputerUseExtension extends Extension {
         });
         return {
             capability,
+            lease_generation: generation,
             phase: 'pending',
             target: this._window(window),
             original: lease.original,

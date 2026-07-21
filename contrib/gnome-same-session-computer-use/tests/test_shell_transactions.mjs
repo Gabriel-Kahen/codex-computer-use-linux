@@ -88,6 +88,7 @@ test('activation performs the focus transaction and verifies its result', () => 
         target: '11',
         targetMinimized: false,
         original: {workspace: 1},
+        generation: 'g'.repeat(64),
     });
     const adapter = {
         findWindow: id => (calls.push(`find:${id}`), target),
@@ -131,6 +132,7 @@ test('restore runs every step and a postcondition mismatch retains the lease', (
         target: '11',
         targetMinimized: true,
         original,
+        generation: 'g'.repeat(64),
     });
     protocol.activate(CAPABILITY, OWNER);
     const result = restoreLeaseTransaction(lease, {
@@ -176,6 +178,7 @@ test('restore clears a non-actionable lease when the original window closed', ()
         target: '11',
         targetMinimized: true,
         original: {focused_window: '22', workspace: 3, pointer: {x: 10, y: 20}},
+        generation: 'g'.repeat(64),
     });
     protocol.activate(CAPABILITY, OWNER);
 
@@ -214,6 +217,7 @@ test('restore clears a non-actionable lease when the leased target closed', () =
         target: '11',
         targetMinimized: true,
         original: {focused_window: '22', workspace: 3, pointer: {x: 10, y: 20}},
+        generation: 'g'.repeat(64),
     });
     protocol.activate(CAPABILITY, OWNER);
 
