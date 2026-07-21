@@ -112,7 +112,7 @@ Validated manually on Ubuntu 25.10 (GNOME Shell 50.1, Wayland). Other compositor
 | --- | --- | --- |
 | GNOME Wayland | GNOME Shell extension first, `org.gnome.Shell.Introspect` fallback | Full target. The extension provides exact window activation when GNOME blocks native introspection; Introspect can list windows and focus apps by `app_id` when allowed. |
 | GNOME X11 | `org.gnome.Shell.Introspect` when allowed | AT-SPI and `ydotool` work; exact per-window focus may be unavailable without the extension backend. |
-| COSMIC Wayland | `computer-use-linux-cosmic` helper | Installed automatically by `./install.sh`, `cargo install`, and npm. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`. |
+| COSMIC Wayland | persistent `computer-use-linux-cosmic` helper | Installed automatically by `./install.sh`, `cargo install`, and npm. Normal operations reuse one helper and Wayland connection, with automatic restart and a one-shot fallback. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`. |
 | KDE Plasma / KWin | temporary KWin DBus scripting | Lists and focuses windows through `org.kde.KWin` scripting when the session bus exposes it. |
 | Hyprland | `hyprctl clients -j` and `hyprctl dispatch focuswindow` | Requires `hyprctl` in the desktop session. |
 | Niri | `niri msg --json windows` and `niri msg action focus-window` | Requires `NIRI_SOCKET` and the `niri` command from the active compositor session. |
@@ -371,7 +371,7 @@ files.
 - **Input fallback** — coordinate-bearing pointer actions use absolute uinput or write through `ydotoold`; the remote-desktop portal is limited to input that needs no screenshot-pixel mapping. `install.sh` can configure `ydotoold`; the `setup` command only enables the GNOME AT-SPI bridge.
 - **Window registry** — `list_windows`, `focused_window`, `activate_window`, `press_key`, and `type_text` share a backend registry. It tries GNOME extension, GNOME Introspect, COSMIC helper, KWin scripting, Hyprland `hyprctl`, and i3 IPC in that order, skipping empty or failed backends so another compositor backend can answer.
 - **GNOME extension fallback** — recent GNOME builds deny `org.gnome.Shell.Introspect.GetWindows` to non-blessed clients. The bundled Shell extension exposes window data and exact activation under `dev.avifenesh.ComputerUseLinux.WindowControl`.
-- **COSMIC helper** — `computer-use-linux-cosmic` talks to COSMIC toplevel protocols and is resolved from `COMPUTER_USE_LINUX_COSMIC_HELPER`, next to the running binary, or from `PATH`.
+- **COSMIC helper** — `computer-use-linux-cosmic` talks to COSMIC toplevel protocols and is resolved from `COMPUTER_USE_LINUX_COSMIC_HELPER`, next to the running binary, or from `PATH`. Normal window operations reuse one helper process and Wayland connection; EOF, timeout, or invalid service responses trigger one automatic restart. Compatibility failures then use the one-shot command path, while repeated timeouts fail closed rather than starting another potentially wedged process. Activation is reported only when COSMIC confirms that the requested toplevel became focused.
 - **Terminal enrichment** — `list_windows` cross-references each terminal window with its controlling TTY and the foreground process on that TTY, so `type_text` / `press_key` can target "the terminal where `pytest` is running" without the host ever knowing the window id.
 
 ## Security

@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Element-targeted `scroll` calls now require the originating
   `observation_id` alongside `element_index`. Coordinate scrolls must provide
   both `x` and `y` and cannot be combined with `element_index`.
+- COSMIC window discovery, focused-window lookup, and activation now reuse one
+  long-lived helper and Wayland connection. The client restarts the helper on
+  EOF, timeout, or invalid protocol responses and retains the one-shot command
+  fallback for compatibility failures.
+- COSMIC activation now succeeds only after the compositor reports the target
+  focused; the previous short-lived synthetic focus marker has been removed.
 
 ## [0.5.0] - 2026-07-16
 

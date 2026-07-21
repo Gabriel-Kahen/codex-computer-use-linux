@@ -6,6 +6,8 @@ mod atspi_tree_impl;
 mod claim_coordination;
 mod cli;
 mod cosmic_helper;
+#[doc(hidden)]
+pub mod cosmic_helper_protocol;
 mod desktop_transaction;
 #[path = "diagnostics.rs"]
 mod diagnostics_impl;

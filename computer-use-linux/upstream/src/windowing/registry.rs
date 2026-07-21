@@ -171,14 +171,14 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
     BackendDescriptor {
         id: COSMIC_WAYLAND_BACKEND,
         failure_label: "COSMIC helper",
-        list_note: "Window list came from the COSMIC Wayland helper. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
+        list_note: "Window list came from the persistent COSMIC Wayland helper. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On COSMIC, ensure the bundled COSMIC helper is present and can connect to the session.",
         can_exact_focus: true,
         #[cfg(test)]
         support: BackendSupport {
             desktop_session: "COSMIC Wayland",
-            window_backend: "`computer-use-linux-cosmic` helper",
-            notes: "Installed automatically by `./install.sh`, `cargo install`, and npm. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`.",
+            window_backend: "persistent `computer-use-linux-cosmic` helper",
+            notes: "Installed automatically by `./install.sh`, `cargo install`, and npm. Normal operations reuse one helper and Wayland connection, with automatic restart and a one-shot fallback. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`.",
         },
     },
     BackendDescriptor {

@@ -117,7 +117,8 @@ In practical terms:
 - **Generic X11/EWMH:** intended for Xorg desktops such as Xfce, Cinnamon,
   MATE, LXQt/Openbox, and legacy GNOME or KDE sessions.
 - **Niri:** requires `NIRI_SOCKET` and working `niri msg` access.
-- **COSMIC Wayland:** uses the bundled `computer-use-linux-cosmic` helper.
+- **COSMIC Wayland:** uses the bundled persistent `computer-use-linux-cosmic`
+  helper, with automatic restart and a compatible one-shot fallback.
 - **i3:** requires `i3-msg`; `xprop` adds process details when available.
 
 Real behavior depends on the portal, accessibility, compositor, and input
