@@ -1040,9 +1040,6 @@ def _targeted_pointer(
     arguments: dict[str, Any], action: str, *, window: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     window = window or resolve_window(str(arguments["window"]))
-    if window.get("xwayland"):
-        ensure_native_input_safe()
-    before = physical_snapshot()
     button = str(arguments.get("button") or "left")
     button_number = {"left": "1", "middle": "2", "right": "3"}.get(button)
     if not button_number: raise ValueError("button must be left, right, or middle")
@@ -1051,36 +1048,43 @@ def _targeted_pointer(
         x, y = float(arguments["x"]), float(arguments["y"]); validate_point(window, x, y)
         count = int(arguments.get("count", 1))
         if not 1 <= count <= 3: raise ValueError("count must be between 1 and 3")
-        if window.get("xwayland"):
-            xid = resolve_xwindow_id(window)
-            result = xdotool_target(window, ["mousemove", "--window", xid, str(round(x)), str(round(y)), "click", "--repeat", str(count), "--delay", "40", button_number])
-        else:
-            ensure_target_pointer_plugin()
-            proc = run(["hyprctl", "-j", "cutarget", "click", str(window["address"]), str(x), str(y), button, str(count)])
-            if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted click failed")
-            result = json.loads(proc.stdout)
     elif action == "scroll":
         x, y = float(arguments["x"]), float(arguments["y"]); validate_point(window, x, y)
         steps = int(arguments["steps"])
         if steps == 0 or abs(steps) > 20: raise ValueError("steps must be between -20 and 20, excluding zero")
-        if window.get("xwayland"):
-            xid = resolve_xwindow_id(window); wheel = "5" if steps > 0 else "4"
-            result = xdotool_target(window, ["mousemove", "--window", xid, str(round(x)), str(round(y)), "click", "--repeat", str(abs(steps)), "--delay", "20", wheel])
-        else:
-            ensure_target_pointer_plugin()
-            proc = run(["hyprctl", "-j", "cutarget", "scroll", str(window["address"]), str(x), str(y), str(steps)])
-            if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted scroll failed")
-            result = json.loads(proc.stdout)
     else:
         sx, sy, ex, ey = map(float, (arguments["start_x"], arguments["start_y"], arguments["end_x"], arguments["end_y"]))
         validate_point(window, sx, sy); validate_point(window, ex, ey)
         motion_steps = int(arguments.get("motion_steps", 8))
         if not 2 <= motion_steps <= 32: raise ValueError("motion_steps must be between 2 and 32")
+
+    if window.get("xwayland"):
+        ensure_native_input_safe()
+    else:
+        ensure_target_pointer_plugin()
+    before = physical_snapshot()
+
+    if action == "click":
+        if window.get("xwayland"):
+            xid = resolve_xwindow_id(window)
+            result = xdotool_target(window, ["mousemove", "--window", xid, str(round(x)), str(round(y)), "click", "--repeat", str(count), "--delay", "40", button_number])
+        else:
+            proc = run(["hyprctl", "-j", "cutarget", "click", str(window["address"]), str(x), str(y), button, str(count)])
+            if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted click failed")
+            result = json.loads(proc.stdout)
+    elif action == "scroll":
+        if window.get("xwayland"):
+            xid = resolve_xwindow_id(window); wheel = "5" if steps > 0 else "4"
+            result = xdotool_target(window, ["mousemove", "--window", xid, str(round(x)), str(round(y)), "click", "--repeat", str(abs(steps)), "--delay", "20", wheel])
+        else:
+            proc = run(["hyprctl", "-j", "cutarget", "scroll", str(window["address"]), str(x), str(y), str(steps)])
+            if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted scroll failed")
+            result = json.loads(proc.stdout)
+    else:
         if window.get("xwayland"):
             xid = resolve_xwindow_id(window)
             result = xdotool_target(window, ["mousemove", "--window", xid, str(round(sx)), str(round(sy)), "mousedown", button_number, "mousemove", "--window", xid, str(round(ex)), str(round(ey)), "mouseup", button_number])
         else:
-            ensure_target_pointer_plugin()
             proc = run(["hyprctl", "-j", "cutarget", "drag", str(window["address"]), str(sx), str(sy), str(ex), str(ey), button, str(motion_steps)])
             if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted drag failed")
             result = json.loads(proc.stdout)

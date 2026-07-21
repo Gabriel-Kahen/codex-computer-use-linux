@@ -126,6 +126,41 @@ class SafetyProbeTests(TestCase):
 
         self.assertEqual(events, ["safe", "snapshot", "snapshot"])
 
+    def test_wayland_pointer_prepares_action_before_snapshot(self) -> None:
+        events: list[str] = []
+        window = {"address": "0x1", "size": [100, 100], "xwayland": False}
+
+        def record(event: str):
+            return lambda *_args, **_kwargs: events.append(event)
+
+        def snapshot() -> dict[str, object]:
+            events.append("snapshot")
+            return {}
+
+        with (
+            patch.object(server, "validate_point", side_effect=record("validate")),
+            patch.object(
+                server,
+                "ensure_target_pointer_plugin",
+                side_effect=record("plugin"),
+            ),
+            patch.object(server, "physical_snapshot", side_effect=snapshot),
+            patch.object(
+                server,
+                "run",
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("dispatch") or completed([], '{"ok":true}')
+                ),
+            ),
+        ):
+            server._targeted_pointer(
+                {"window": "0x1", "x": 10, "y": 10}, "click", window=window
+            )
+
+        self.assertEqual(
+            events, ["validate", "plugin", "snapshot", "dispatch", "snapshot"]
+        )
+
     def test_targeted_pointer_rejects_changed_physical_state(self) -> None:
         window = {"address": "0x1", "size": [100, 100], "xwayland": False}
         before = {
