@@ -67,6 +67,13 @@ Claims preserve legacy unclaimed flows when no active claim conflicts. They beco
 
 The implementation is Hyprland-specific and experimental. It was developed and accepted against Hyprland 0.55.4. Other releases are not currently supported. Native extensions must be rebuilt for the exact running Hyprland ABI.
 
+Normal targeted pointer and shortcut actions snapshot the physical focus,
+workspace, and cursor before and after dispatch. They return success only when
+those observations match; a mismatch is reported as an error with the observed
+changes instead of being attributed to the backend. The snapshots cannot
+distinguish backend interference from concurrent physical user input, so normal
+targeted actions never restore a potentially stale pre-action snapshot.
+
 Runtime and build dependencies include:
 
 - Hyprland and its development headers
