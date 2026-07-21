@@ -171,6 +171,25 @@ impl I3Ipc {
             .context("failed to make i3 IPC socket nonblocking")?;
         let mut read_result = Ok(());
         loop {
+            match decode_frame(&mut self.read_buffer) {
+                Ok(Some(message)) if is_event(message.message_type) => {
+                    self.note_event();
+                    continue;
+                }
+                Ok(Some(message)) => {
+                    read_result = Err(anyhow::anyhow!(
+                        "unexpected queued i3 IPC response of type {}",
+                        message.message_type
+                    ));
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    read_result = Err(error);
+                    break;
+                }
+            }
+
             let mut chunk = [0_u8; 8192];
             match self.stream.read(&mut chunk) {
                 Ok(0) => {
@@ -191,16 +210,6 @@ impl I3Ipc {
             .context("failed to restore blocking i3 IPC socket");
         read_result?;
         restore_result?;
-
-        while let Some(message) = decode_frame(&mut self.read_buffer)? {
-            if !is_event(message.message_type) {
-                bail!(
-                    "unexpected queued i3 IPC response of type {}",
-                    message.message_type
-                );
-            }
-            self.note_event();
-        }
         Ok(())
     }
 

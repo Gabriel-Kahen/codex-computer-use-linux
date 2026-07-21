@@ -97,6 +97,37 @@ fn persistent_connection_subscribes_caches_and_refreshes_after_event() {
     server.join().unwrap();
 }
 
+#[test]
+fn event_interleaved_with_tree_reply_keeps_cache_dirty() {
+    let socket_path = TestSocketPath::new();
+    let listener = UnixListener::bind(&socket_path.0).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        assert_eq!(read_message(&mut stream).message_type, IPC_SUBSCRIBE);
+        write_message(&mut stream, IPC_SUBSCRIBE, br#"{"success":true}"#);
+
+        assert_eq!(read_message(&mut stream).message_type, IPC_GET_TREE);
+        write_message(
+            &mut stream,
+            IPC_EVENT_MASK | 3,
+            br#"{"change":"focus"}"#,
+        );
+        write_message(&mut stream, IPC_GET_TREE, br#"{"name":"first"}"#);
+
+        assert_eq!(read_message(&mut stream).message_type, IPC_GET_TREE);
+        write_message(&mut stream, IPC_GET_TREE, br#"{"name":"second"}"#);
+    });
+
+    let mut ipc = I3Ipc::connect(socket_path.0.clone()).unwrap();
+    let first_generation = ipc.refresh_tree().unwrap();
+    assert_eq!(ipc.tree_payload().unwrap(), br#"{"name":"first"}"#);
+
+    let second_generation = ipc.refresh_tree().unwrap();
+    assert_ne!(second_generation, first_generation);
+    assert_eq!(ipc.tree_payload().unwrap(), br#"{"name":"second"}"#);
+    server.join().unwrap();
+}
+
 fn read_message(stream: &mut UnixStream) -> IpcMessage {
     let mut header = [0_u8; IPC_HEADER_LEN];
     stream.read_exact(&mut header).unwrap();
