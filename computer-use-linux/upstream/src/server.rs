@@ -11,9 +11,7 @@ use crate::atspi_tree::{
     snapshot_compact_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
     ActionFingerprint, Bounds, FocusedElementSummary, ValueSetInvocation,
 };
-use crate::claim_coordination::{
-    acquire_claim_guard, acquire_mutation_guards, ClaimContext, Coordinator, MutationLane,
-};
+use crate::claim_coordination::{acquire_mutation_guards, ClaimContext, Coordinator, MutationLane};
 use crate::desktop_transaction::DesktopTransaction;
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
@@ -328,8 +326,39 @@ impl ComputerUseLinux {
         &self,
         params: ActivateWindowParams,
     ) -> Json<ActivateWindowOutput> {
-        let target = params.into_target();
+        let claim = params.claim.clone();
+        let mut target = params.into_target();
         let received = Some(serde_json::json!(target.clone()));
+        let activation_error = |error: String| {
+            Json(ActivateWindowOutput {
+                ok: false,
+                implemented: true,
+                backend: GNOME_SHELL_INTROSPECT_BACKEND.to_string(),
+                focus: None,
+                permissions_hint: window_permission_hint(&error),
+                error: Some(error),
+                received: received.clone(),
+            })
+        };
+        let coordination_window_id = match self.coordination_window_id(Some(&target)).await {
+            Ok(window_id) => window_id,
+            Err(error) => return activation_error(error),
+        };
+        if let Some(window_id) = coordination_window_id {
+            target.pin_exact_window_id(window_id);
+        }
+        let _claim_guard = match self
+            .mutation_claim_guard(
+                ClaimGuardMode::Acquire,
+                coordination_window_id,
+                &claim,
+                MutationLane::PhysicalSeat,
+            )
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => return activation_error(error),
+        };
         match focus_window_target(&target).await {
             Ok(focus) => {
                 let ok = focus_satisfies_target(&focus, &target);
@@ -340,20 +369,12 @@ impl ComputerUseLinux {
                     focus: Some(focus),
                     error: None,
                     permissions_hint: None,
-                    received,
+                    received: received.clone(),
                 })
             }
             Err(error) => {
                 let error = format!("{error:#}");
-                Json(ActivateWindowOutput {
-                    ok: false,
-                    implemented: true,
-                    backend: GNOME_SHELL_INTROSPECT_BACKEND.to_string(),
-                    focus: None,
-                    permissions_hint: window_permission_hint(&error),
-                    error: Some(error),
-                    received,
-                })
+                activation_error(error)
             }
         }
     }
@@ -2293,8 +2314,10 @@ struct FocusedWindowOutput {
     message: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ActivateWindowParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     #[serde(default)]
     window_id: Option<u64>,
     #[serde(default)]
@@ -3666,18 +3689,6 @@ impl ComputerUseLinux {
             notes.push(note);
         }
         notes
-    }
-
-    async fn acquire_claim_guard(
-        &self,
-        window_id: Option<u64>,
-        context: &ClaimContext,
-    ) -> std::result::Result<Option<crate::claim_coordination::ClaimGuard>, String> {
-        let coordinator = self
-            .claim_coordinator
-            .get_or_init(Coordinator::from_env)
-            .clone();
-        acquire_claim_guard(coordinator, window_id, context).await
     }
 
     async fn mutation_claim_guard(
@@ -5796,6 +5807,7 @@ mod tests {
     fn window_scoped_tools_expose_shared_claim_credentials() {
         let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
         for name in [
+            "activate_window",
             "get_app_state",
             "screenshot",
             "perform_action",
@@ -5950,6 +5962,13 @@ mod tests {
             (claim_context("owner-b", "token-b"), true),
             (claim_context("owner-a", "token-a"), false),
         ] {
+            let Json(activate) = backend
+                .activate_window(Parameters(ActivateWindowParams {
+                    claim: claim.clone(),
+                    window_id: Some(42),
+                    ..Default::default()
+                }))
+                .await;
             let Json(semantic) = backend
                 .perform_action(Parameters(ActionParams {
                     claim: claim.clone(),
@@ -6032,6 +6051,7 @@ mod tests {
                 );
 
             for output in [
+                serde_json::to_string(&activate).unwrap(),
                 serde_json::to_string(&semantic).unwrap(),
                 serde_json::to_string(&value).unwrap(),
                 serde_json::to_string(&text).unwrap(),
@@ -6050,7 +6070,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn physical_input_route_waits_for_the_companion_global_lane() {
+    async fn activate_window_waits_for_the_companion_global_lane() {
         let (backend, root) = backend_with_live_claim(42);
         let lock_path = root.join("pointer-transaction.lock");
         let mut companion = std::process::Command::new("python3")
@@ -6071,12 +6091,8 @@ mod tests {
 
         let mut action = tokio::spawn(async move {
             backend
-                .drag(Parameters(DragParams {
+                .activate_window(Parameters(ActivateWindowParams {
                     claim: claim_context("owner-a", "token-a"),
-                    start_x: 1,
-                    start_y: 1,
-                    end_x: 2,
-                    end_y: 2,
                     window_id: Some(42),
                     ..Default::default()
                 }))
