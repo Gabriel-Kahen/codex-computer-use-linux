@@ -17,6 +17,16 @@
 #include <string>
 #include <vector>
 
+#ifndef CU_PLUGIN_VERSION
+#define CU_PLUGIN_VERSION "unknown"
+#endif
+#ifndef CU_SOURCE_SHA256
+#define CU_SOURCE_SHA256 "unknown"
+#endif
+#ifndef CU_HYPRLAND_BUILD_SHA256
+#define CU_HYPRLAND_BUILD_SHA256 "unknown"
+#endif
+
 inline HANDLE PHANDLE = nullptr;
 
 namespace {
@@ -212,8 +222,9 @@ std::string handleStatus(eHyprCtlOutputFormat, std::string) {
     const bool dndActive = PROTO::data && PROTO::data->dndActive();
     const bool safe = pointerSeat && inputManager && !sessionLocked && !heldButtons && !pointerConstrained && !pointerLocked && !dndActive;
     return std::format(
-        "{{\"ok\":true,\"safe_to_inject\":{},\"pointer_seat\":{},\"session_locked\":{},\"held_buttons\":{},\"pointer_constrained\":{},\"pointer_locked\":{},\"dnd_active\":{}}}",
-        safe, pointerSeat, sessionLocked, heldButtons, pointerConstrained, pointerLocked, dndActive);
+        "{{\"ok\":true,\"plugin_version\":\"{}\",\"source_sha256\":\"{}\",\"hyprland_build_sha256\":\"{}\",\"hyprland_build_abi\":\"{}\",\"hyprland_runtime_abi\":\"{}\",\"safe_to_inject\":{},\"pointer_seat\":{},\"session_locked\":{},\"held_buttons\":{},\"pointer_constrained\":{},\"pointer_locked\":{},\"dnd_active\":{}}}",
+        CU_PLUGIN_VERSION, CU_SOURCE_SHA256, CU_HYPRLAND_BUILD_SHA256, __hyprland_api_get_client_hash(), __hyprland_api_get_hash(), safe,
+        pointerSeat, sessionLocked, heldButtons, pointerConstrained, pointerLocked, dndActive);
 }
 
 std::string handleRequest(eHyprCtlOutputFormat, std::string request) {
@@ -289,7 +300,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         PHANDLE, SHyprCtlCommand{.name = "cutargetstatus", .exact = true, .fn = handleStatus});
     if (!statusCommand) throw std::runtime_error("same-session-target-pointer: failed to register cutargetstatus command");
 
-    return {"same-session-target-pointer", "Atomic window-targeted pointer events without cursor movement", "Gabe", "0.1.1"};
+    return {"same-session-target-pointer", "Atomic window-targeted pointer events without cursor movement", "Gabe", CU_PLUGIN_VERSION};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {}

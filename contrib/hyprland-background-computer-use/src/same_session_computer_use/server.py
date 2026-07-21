@@ -16,10 +16,12 @@ from typing import Any
 
 from . import coordination
 from .native_plugin import STATE_DIR
+from .native_plugin import NATIVE_PLUGIN_VERSION
 from .native_plugin import ensure_native_input_safe
 from .native_plugin import ensure_target_pointer_plugin
 from .native_plugin import file_guard
 from .native_plugin import plugin_build_requirements
+from .native_plugin import plugin_identity
 
 
 SERVER_INFO = {"name": "same-session-computer-use", "version": "0.2.0"}
@@ -873,6 +875,31 @@ def physical_snapshot() -> dict[str, Any]:
     return {"active_address": hypr_json(["activewindow"]).get("address"), "workspace": hypr_json(["activeworkspace"]).get("id"), "cursor": hypr_json(["cursorpos"])}
 
 
+def verified_physical_state(
+    action: str, before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    changes = {
+        "cursor_moved_by_backend": before.get("cursor") != after.get("cursor"),
+        "keyboard_focus_changed_by_backend": before.get("active_address")
+        != after.get("active_address"),
+        "workspace_changed_by_backend": before.get("workspace")
+        != after.get("workspace"),
+    }
+    if any(changes.values()):
+        raise RuntimeError(
+            f"{action} did not preserve physical desktop state: "
+            f"changes={json.dumps(changes, sort_keys=True)}; "
+            f"before={json.dumps(before, sort_keys=True)}; "
+            f"after={json.dumps(after, sort_keys=True)}"
+        )
+    return {
+        "observed_physical_state_unchanged": True,
+        "physical_state_before": before,
+        "physical_state_after": after,
+        **changes,
+    }
+
+
 def validate_point(window: dict[str, Any], x: float, y: float) -> None:
     size = window.get("size") or []
     if len(size) != 2 or not (0 <= x < float(size[0]) and 0 <= y < float(size[1])):
@@ -1042,9 +1069,6 @@ def _targeted_pointer(
     arguments: dict[str, Any], action: str, *, window: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     window = window or resolve_window(str(arguments["window"]))
-    if window.get("xwayland"):
-        ensure_native_input_safe()
-    before = physical_snapshot()
     button = str(arguments.get("button") or "left")
     button_number = {"left": "1", "middle": "2", "right": "3"}.get(button)
     if not button_number: raise ValueError("button must be left, right, or middle")
@@ -1053,44 +1077,55 @@ def _targeted_pointer(
         x, y = float(arguments["x"]), float(arguments["y"]); validate_point(window, x, y)
         count = int(arguments.get("count", 1))
         if not 1 <= count <= 3: raise ValueError("count must be between 1 and 3")
-        if window.get("xwayland"):
-            xid = resolve_xwindow_id(window)
-            result = xdotool_target(window, ["mousemove", "--window", xid, str(round(x)), str(round(y)), "click", "--repeat", str(count), "--delay", "40", button_number])
-        else:
-            ensure_target_pointer_plugin()
-            proc = run(["hyprctl", "-j", "cutarget", "click", str(window["address"]), str(x), str(y), button, str(count)])
-            if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted click failed")
-            result = json.loads(proc.stdout)
     elif action == "scroll":
         x, y = float(arguments["x"]), float(arguments["y"]); validate_point(window, x, y)
         steps = int(arguments["steps"])
         if steps == 0 or abs(steps) > 20: raise ValueError("steps must be between -20 and 20, excluding zero")
-        if window.get("xwayland"):
-            xid = resolve_xwindow_id(window); wheel = "5" if steps > 0 else "4"
-            result = xdotool_target(window, ["mousemove", "--window", xid, str(round(x)), str(round(y)), "click", "--repeat", str(abs(steps)), "--delay", "20", wheel])
-        else:
-            ensure_target_pointer_plugin()
-            proc = run(["hyprctl", "-j", "cutarget", "scroll", str(window["address"]), str(x), str(y), str(steps)])
-            if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted scroll failed")
-            result = json.loads(proc.stdout)
     else:
         sx, sy, ex, ey = map(float, (arguments["start_x"], arguments["start_y"], arguments["end_x"], arguments["end_y"]))
         validate_point(window, sx, sy); validate_point(window, ex, ey)
         motion_steps = int(arguments.get("motion_steps", 8))
         if not 2 <= motion_steps <= 32: raise ValueError("motion_steps must be between 2 and 32")
+
+    if window.get("xwayland"):
+        ensure_native_input_safe()
+    else:
+        ensure_target_pointer_plugin()
+    before = physical_snapshot()
+
+    if action == "click":
+        if window.get("xwayland"):
+            xid = resolve_xwindow_id(window)
+            result = xdotool_target(window, ["mousemove", "--window", xid, str(round(x)), str(round(y)), "click", "--repeat", str(count), "--delay", "40", button_number])
+        else:
+            proc = run(["hyprctl", "-j", "cutarget", "click", str(window["address"]), str(x), str(y), button, str(count)])
+            if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted click failed")
+            result = json.loads(proc.stdout)
+    elif action == "scroll":
+        if window.get("xwayland"):
+            xid = resolve_xwindow_id(window); wheel = "5" if steps > 0 else "4"
+            result = xdotool_target(window, ["mousemove", "--window", xid, str(round(x)), str(round(y)), "click", "--repeat", str(abs(steps)), "--delay", "20", wheel])
+        else:
+            proc = run(["hyprctl", "-j", "cutarget", "scroll", str(window["address"]), str(x), str(y), str(steps)])
+            if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted scroll failed")
+            result = json.loads(proc.stdout)
+    else:
         if window.get("xwayland"):
             xid = resolve_xwindow_id(window)
             result = xdotool_target(window, ["mousemove", "--window", xid, str(round(sx)), str(round(sy)), "mousedown", button_number, "mousemove", "--window", xid, str(round(ex)), str(round(ey)), "mouseup", button_number])
         else:
-            ensure_target_pointer_plugin()
             proc = run(["hyprctl", "-j", "cutarget", "drag", str(window["address"]), str(sx), str(sy), str(ex), str(ey), button, str(motion_steps)])
             if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted drag failed")
             result = json.loads(proc.stdout)
 
     if isinstance(result, dict) and result.get("ok") is False: raise RuntimeError(str(result.get("error") or "targeted pointer action failed"))
     after = physical_snapshot()
-    unchanged = after == before
-    return {"action": action, "window": bounded_window(window), "result": result, "observed_physical_state_unchanged": unchanged, "physical_state_before": before, "physical_state_after": after, "cursor_moved_by_backend": False, "keyboard_focus_changed_by_backend": False, "workspace_changed_by_backend": False}
+    return {
+        "action": action,
+        "window": bounded_window(window),
+        "result": result,
+        **verified_physical_state(f"targeted pointer {action}", before, after),
+    }
 
 
 def targeted_pointer(
@@ -1185,10 +1220,30 @@ def status() -> dict[str, Any]:
             probed = run(["hyprctl", "-j", "cutargetstatus"])
             if probed.returncode == 0:
                 try:
-                    safety_status = json.loads(probed.stdout)
+                    parsed_status = json.loads(probed.stdout)
+                    if isinstance(parsed_status, dict):
+                        safety_status = parsed_status
                 except json.JSONDecodeError:
                     pass
-    native_available = checks["hyprctl"] and (plugin_loaded or native_buildable)
+    expected_identity = None
+    identity_matches = None
+    if safety_status:
+        version = run(["hyprctl", "version"])
+        source = Path(__file__).resolve().parents[2] / "hyprland/target-pointer.cpp"
+        if version.returncode == 0 and source.is_file():
+            expected_identity = plugin_identity(
+                version.stdout,
+                source.read_bytes(),
+            )
+            identity_matches = all(
+                safety_status.get(name) == value
+                for name, value in expected_identity.items()
+            ) and safety_status.get("hyprland_build_abi") == safety_status.get(
+                "hyprland_runtime_abi"
+            )
+    native_available = checks["hyprctl"] and (
+        identity_matches is True if plugin_loaded else native_buildable
+    )
     return {
         "session": "real-current-login",
         "wayland_display": os.environ.get("WAYLAND_DISPLAY"),
@@ -1202,8 +1257,30 @@ def status() -> dict[str, Any]:
             "cross_process_window_claims": True,
             "parallel_native_wayland_windows": True,
             "broker_global_input_lane_serialized": True,
-            "native_input_currently_safe": bool(safety_status and safety_status.get("safe_to_inject") is True),
+            "native_input_currently_safe": bool(
+                identity_matches is True
+                and safety_status
+                and safety_status.get("safe_to_inject") is True
+            ),
             "physical_pointer_seat_is_independent": False,
+        },
+        "semantic_actions": {
+            "available": None,
+            "claim_enforced": False,
+            "provider": "computer-use-linux",
+            "note": "Availability is unknown because semantic actions are provided by a separate MCP server.",
+        },
+        "versions": {
+            "companion": SERVER_INFO["version"],
+            "native_extension_expected": NATIVE_PLUGIN_VERSION,
+            "native_extension_loaded": safety_status.get("plugin_version") if safety_status else None,
+            "native_source_sha256_expected": expected_identity.get("source_sha256") if expected_identity else None,
+            "native_source_sha256_loaded": safety_status.get("source_sha256") if safety_status else None,
+            "hyprland_build_sha256_expected": expected_identity.get("hyprland_build_sha256") if expected_identity else None,
+            "hyprland_build_sha256_loaded": safety_status.get("hyprland_build_sha256") if safety_status else None,
+            "hyprland_build_abi": safety_status.get("hyprland_build_abi") if safety_status else None,
+            "hyprland_runtime_abi": safety_status.get("hyprland_runtime_abi") if safety_status else None,
+            "native_identity_matches": identity_matches,
         },
         "checks": checks,
         "requirements": {
@@ -1242,6 +1319,7 @@ def send_window_shortcut(
             )
             try:
                 ensure_native_input_safe()
+                before = physical_snapshot()
                 proc = run(
                     [
                         "hyprctl",
@@ -1255,6 +1333,7 @@ def send_window_shortcut(
                         or proc.stdout.strip()
                         or "targeted shortcut failed"
                     )
+                after = physical_snapshot()
                 result = {
                     "sent": True,
                     "address": address,
@@ -1262,6 +1341,9 @@ def send_window_shortcut(
                     "modifiers": modifiers,
                     "focus_changed": False,
                     "pointer_moved": False,
+                    **verified_physical_state(
+                        "targeted shortcut", before, after
+                    ),
                 }
             except Exception:
                 finish_claimed_window_access(

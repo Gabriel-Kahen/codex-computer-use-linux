@@ -69,6 +69,13 @@ Claims preserve legacy unclaimed flows when no active claim conflicts. They beco
 
 The implementation is Hyprland-specific and experimental. It was developed and accepted against Hyprland 0.55.4. Other releases are not currently supported. Native extensions must be rebuilt for the exact running Hyprland ABI.
 
+Normal targeted pointer and shortcut actions snapshot the physical focus,
+workspace, and cursor before and after dispatch. They return success only when
+those observations match; a mismatch is reported as an error with the observed
+changes instead of being attributed to the backend. The snapshots cannot
+distinguish backend interference from concurrent physical user input, so normal
+targeted actions never restore a potentially stale pre-action snapshot.
+
 Runtime and build dependencies include:
 
 - Hyprland and its development headers
@@ -81,7 +88,9 @@ Runtime and build dependencies include:
 - a Codex CLI release with `codex plugin` support
 - `computer-use-linux@codex-computer-use-linux`, which provides the AT-SPI and global-input Computer Use tools that this plugin's skill coordinates with
 
-The broker builds and loads the native extension on demand. Builds are cached outside the installed plugin under `${XDG_CACHE_HOME:-$HOME/.cache}/same-session-computer-use/` and keyed by the plugin source and running Hyprland version.
+The broker builds and loads the native extension on demand. Builds are cached outside the installed plugin under `${XDG_CACHE_HOME:-$HOME/.cache}/same-session-computer-use/` and keyed by the plugin source and running Hyprland version. Before using an already-loaded extension, the broker verifies its plugin version, source digest, and build/runtime Hyprland ABI. A stale or mismatched extension is rejected with instructions to unload it instead of being used silently.
+
+`session_status` reports that identity under `versions`. It also reports semantic actions separately under `semantic_actions`: the companion knows that `computer-use-linux` is the provider and that its calls are not claim-enforced, but leaves availability unknown because the provider is a separate MCP process.
 
 ## Install
 
@@ -138,6 +147,16 @@ hyprctl plugin list
 ```
 
 The generated shared object is intentionally excluded from Git. Build it on the target machine so it matches that machine's Hyprland ABI.
+
+## Test the native path
+
+The `hyprland-native-e2e` workflow boots the supported Hyprland release in a NixOS VM with a virtual GPU and real input devices. It builds and loads the extension, captures a background GTK window, injects a click and shortcut into that window, and verifies that a foreground sentinel keeps its focus, workspace, and pointer state.
+
+On a Hyprland development machine, run the same smoke test nested inside the current session:
+
+```bash
+PYTHONPATH=src python tests/native_e2e.py
+```
 
 ## Run the MCP broker
 

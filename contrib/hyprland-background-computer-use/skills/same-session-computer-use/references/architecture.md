@@ -5,6 +5,9 @@
 - Attach to the current user's real Wayland, Hyprland, D-Bus, and AT-SPI sessions.
 - Reuse existing application processes and profiles.
 - Keep the physical workspace, focused window, and pointer unchanged for normal operations.
+- Treat a before/after physical-state mismatch as a failed targeted operation.
+  The broker reports which fields changed but does not restore a stale snapshot
+  that may reflect concurrent user input.
 - Prefer exact window capture and semantic accessibility actions.
 - Restore all compositor state after any fallback transaction.
 - Fence every claimed window by the host-provided Codex task identity and an expiring token.
@@ -57,3 +60,5 @@ Run cleanup even after timeouts or errors. Only the owning task may capture, end
 ## Honest boundary
 
 Stock Hyprland still exposes one physical compositor seat. The targeted-pointer extension avoids that limitation by delivering an atomic event sequence directly to a selected client surface and restoring pointer focus before the next physical event is processed. Hyprland itself handles these requests on its compositor thread, but the broker no longer serializes unrelated native windows, so workers can make independent progress around capture, inspection, and tool I/O. XWayland uses its own internal XTEST pointer and restores it after each action, so this broker globally serializes its XWayland transactions. This is not a set of independent hardware seats, and arbitrary same-user processes are outside the lock; it is broker-enforced window concurrency plus a broker-local global-input boundary.
+
+The broker treats the native extension identity as part of that safety boundary. The extension reports its embedded version, source digest, build-time Hyprland version digest, and build/runtime Hyprland ABI hashes. The broker checks those values before every native input transaction and refuses a stale loaded extension.
