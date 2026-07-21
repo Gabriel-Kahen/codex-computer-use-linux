@@ -54,6 +54,15 @@ impl AccessibilitySnapshot {
         &self.nodes
     }
 
+    pub(crate) fn window_id(&self) -> Option<u64> {
+        match self.target {
+            AccessibilitySnapshotTarget::Window { window_id, .. } => Some(window_id),
+            AccessibilitySnapshotTarget::Process(_)
+            | AccessibilitySnapshotTarget::Application(_)
+            | AccessibilitySnapshotTarget::Desktop => None,
+        }
+    }
+
     pub(crate) fn pointer_target(&self) -> Result<(u64, Option<u32>), String> {
         match &self.target {
             AccessibilitySnapshotTarget::Window { window_id, pid } => Ok((*window_id, *pid)),

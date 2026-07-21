@@ -29,6 +29,10 @@ impl ObservedScrollTarget {
         self.point
     }
 
+    pub(crate) fn window_id(&self) -> u64 {
+        self.expected_window_id
+    }
+
     pub(crate) async fn prepare(
         &self,
     ) -> Result<(WindowTarget, PointerDispatchVerification), String> {

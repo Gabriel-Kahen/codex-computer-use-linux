@@ -5,6 +5,7 @@ use std::future::ready;
 
 fn batch(actions: Vec<BatchAction>) -> ActionBatchParams {
     ActionBatchParams {
+        claim: ClaimContext::default(),
         window_id: 42,
         actions,
     }

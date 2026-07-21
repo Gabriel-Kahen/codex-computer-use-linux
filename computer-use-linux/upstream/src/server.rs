@@ -11,6 +11,7 @@ use crate::atspi_tree::{
     snapshot_compact_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
     ActionFingerprint, Bounds, FocusedElementSummary, ValueSetInvocation,
 };
+use crate::claim_coordination::{acquire_mutation_guards, ClaimContext, Coordinator, MutationLane};
 use crate::desktop_transaction::DesktopTransaction;
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
@@ -56,7 +57,7 @@ use std::{
     os::unix::net::{UnixDatagram, UnixStream},
     path::PathBuf,
     process::{Command, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -76,6 +77,12 @@ const KDE_KLIPPER_SERVICE: &str = "org.kde.klipper";
 const KDE_KLIPPER_PATH: &str = "/klipper";
 const KDE_KLIPPER_INTERFACE: &str = "org.kde.klipper.klipper";
 const READINESS_CACHE_TTL: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy)]
+enum ClaimGuardMode {
+    Acquire,
+    AlreadyHeld,
+}
 
 #[derive(Default)]
 struct DiagnosticsCache {
@@ -99,6 +106,7 @@ pub struct ComputerUseLinux {
     /// full-frame capture; used for off-screen window/coordinate warnings.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
     diagnostics_cache: Arc<Mutex<DiagnosticsCache>>,
+    claim_coordinator: Arc<OnceLock<Option<Coordinator>>>,
 }
 
 fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
@@ -318,8 +326,39 @@ impl ComputerUseLinux {
         &self,
         params: ActivateWindowParams,
     ) -> Json<ActivateWindowOutput> {
-        let target = params.into_target();
+        let claim = params.claim.clone();
+        let mut target = params.into_target();
         let received = Some(serde_json::json!(target.clone()));
+        let activation_error = |error: String| {
+            Json(ActivateWindowOutput {
+                ok: false,
+                implemented: true,
+                backend: GNOME_SHELL_INTROSPECT_BACKEND.to_string(),
+                focus: None,
+                permissions_hint: window_permission_hint(&error),
+                error: Some(error),
+                received: received.clone(),
+            })
+        };
+        let coordination_window_id = match self.coordination_window_id(Some(&target)).await {
+            Ok(window_id) => window_id,
+            Err(error) => return activation_error(error),
+        };
+        if let Some(window_id) = coordination_window_id {
+            target.pin_exact_window_id(window_id);
+        }
+        let _claim_guard = match self
+            .mutation_claim_guard(
+                ClaimGuardMode::Acquire,
+                coordination_window_id,
+                &claim,
+                MutationLane::PhysicalSeat,
+            )
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => return activation_error(error),
+        };
         match focus_window_target(&target).await {
             Ok(focus) => {
                 let ok = focus_satisfies_target(&focus, &target);
@@ -330,20 +369,12 @@ impl ComputerUseLinux {
                     focus: Some(focus),
                     error: None,
                     permissions_hint: None,
-                    received,
+                    received: received.clone(),
                 })
             }
             Err(error) => {
                 let error = format!("{error:#}");
-                Json(ActivateWindowOutput {
-                    ok: false,
-                    implemented: true,
-                    backend: GNOME_SHELL_INTROSPECT_BACKEND.to_string(),
-                    focus: None,
-                    permissions_hint: window_permission_hint(&error),
-                    error: Some(error),
-                    received,
-                })
+                activation_error(error)
             }
         }
     }
@@ -365,13 +396,18 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let owner = self.clone();
         self.desktop_transaction
-            .run(move || async move { owner.get_app_state_unlocked(params).await })
+            .run(move || async move {
+                owner
+                    .get_app_state_unlocked(params, ClaimGuardMode::Acquire)
+                    .await
+            })
             .await
     }
 
     async fn get_app_state_unlocked(
         &self,
         params: GetAppStateParams,
+        claim_guard_mode: ClaimGuardMode,
     ) -> Result<CallToolResult, ErrorData> {
         let observation_mode = params.observation_mode;
         let adaptive = observation_mode == Some(ObservationMode::Adaptive);
@@ -392,6 +428,18 @@ impl ComputerUseLinux {
         let max_nodes = params.max_nodes.unwrap_or(120).clamp(1, 500);
         let max_depth = params.max_depth.unwrap_or(12).min(12);
         let include_screenshot = params.include_screenshot.unwrap_or(true);
+        let _claim_guard = if include_screenshot {
+            self.mutation_claim_guard(
+                claim_guard_mode,
+                window_context.as_ref().map(|window| window.window_id),
+                &params.claim,
+                MutationLane::Window,
+            )
+            .await
+            .map_err(|error| ErrorData::invalid_params(error, None))?
+        } else {
+            None
+        };
         let screenshot_options = params.screenshot_options();
         let screenshot_target_requested = params.window_target().has_target();
         let screenshot_future = async {
@@ -750,9 +798,32 @@ impl ComputerUseLinux {
         &self,
         params: ScreenshotParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let target = params.window_target();
+        let mut target = params.window_target();
         let full_screen = params.full_screen.unwrap_or(false);
         let raise_window = params.raise_window.unwrap_or(true);
+        let coordination_window_id = if full_screen {
+            None
+        } else {
+            self.coordination_window_id(target.as_ref())
+                .await
+                .map_err(|error| screenshot_failure("claim_coordination", target.as_ref(), error))?
+        };
+        if let (Some(target), Some(window_id)) = (target.as_mut(), coordination_window_id) {
+            target.pin_exact_window_id(window_id);
+        }
+        let _claim_guard = self
+            .mutation_claim_guard(
+                ClaimGuardMode::Acquire,
+                coordination_window_id,
+                &params.claim,
+                if target.is_some() && raise_window {
+                    MutationLane::PhysicalSeat
+                } else {
+                    MutationLane::Window
+                },
+            )
+            .await
+            .map_err(|error| screenshot_failure("claim_coordination", target.as_ref(), error))?;
         if let Some(target) = target.as_ref().filter(|_| raise_window) {
             let focus = focus_window_target(target)
                 .await
@@ -952,11 +1023,15 @@ impl ComputerUseLinux {
     async fn click(&self, Parameters(params): Parameters<ClickParams>) -> Json<ActionOutput> {
         let owner = self.clone();
         self.desktop_transaction
-            .run(move || async move { owner.click_unlocked(params).await })
+            .run(move || async move { owner.click_unlocked(params, ClaimGuardMode::Acquire).await })
             .await
     }
 
-    async fn click_unlocked(&self, mut params: ClickParams) -> Json<ActionOutput> {
+    async fn click_unlocked(
+        &self,
+        mut params: ClickParams,
+        claim_guard_mode: ClaimGuardMode,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let click_error = |message| {
             Json(ActionOutput {
@@ -969,6 +1044,36 @@ impl ComputerUseLinux {
         };
         let mut target = match self.resolve_observed_click_target(&params) {
             Ok(target) => target,
+            Err(message) => return click_error(message),
+        };
+        let coordination_window_id = match &target {
+            ClickTarget::Coordinates(_, _) => match self
+                .coordination_window_id(params.window_target().as_ref())
+                .await
+            {
+                Ok(window_id) => window_id,
+                Err(message) => return click_error(message),
+            },
+            ClickTarget::ObservedCoordinates(observed) => Some(observed.window_id),
+            ClickTarget::ObservedAction(observed) => Some(observed.window_id),
+        };
+        if coordination_window_id.is_some() {
+            params.window_id = coordination_window_id;
+        }
+        let _claim_guard = match self
+            .mutation_claim_guard(
+                claim_guard_mode,
+                coordination_window_id,
+                &params.claim,
+                if matches!(&target, ClickTarget::ObservedAction(_)) {
+                    MutationLane::Window
+                } else {
+                    MutationLane::PhysicalSeat
+                },
+            )
+            .await
+        {
+            Ok(guard) => guard,
             Err(message) => return click_error(message),
         };
         if let ClickTarget::ObservedAction(observed) = &target {
@@ -1061,6 +1166,16 @@ impl ComputerUseLinux {
                 }
                 let point = params.x.zip(params.y).expect("validated coordinates");
                 target = ClickTarget::Coordinates(point.0, point.1);
+            }
+            let claim_error = match &target {
+                ClickTarget::Coordinates(x, y) => {
+                    validate_claimed_window_point(&params.claim, focus.as_ref(), (*x, *y), "click")
+                        .err()
+                }
+                ClickTarget::ObservedCoordinates(_) | ClickTarget::ObservedAction(_) => None,
+            };
+            if let Some(message) = claim_error {
+                return click_error(message);
             }
         }
         let ClickTarget::Coordinates(x, y) = target else {
@@ -1156,6 +1271,18 @@ impl ComputerUseLinux {
         if let Err(error) = self.validate_action_batch(&params) {
             return Json(ActionBatchOutput::validation_error(error));
         }
+        let _claim_guard = match self
+            .mutation_claim_guard(
+                ClaimGuardMode::Acquire,
+                Some(params.window_id),
+                &params.claim,
+                MutationLane::PhysicalSeat,
+            )
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => return Json(ActionBatchOutput::validation_error(error)),
+        };
 
         Json(self.execute_validated_action_batch_unlocked(params).await)
     }
@@ -1193,13 +1320,26 @@ impl ComputerUseLinux {
         }
 
         let window_id = params.batch.window_id;
+        let claim = params.batch.claim.clone();
+        let _claim_guard = self
+            .mutation_claim_guard(
+                ClaimGuardMode::Acquire,
+                Some(window_id),
+                &claim,
+                MutationLane::PhysicalSeat,
+            )
+            .await
+            .map_err(|error| ErrorData::invalid_params(error, None))?;
         let batch = self
             .execute_validated_action_batch_unlocked(params.batch)
             .await;
         let observation = match self
-            .get_app_state(Parameters(
-                params.observation.into_get_app_state_params(window_id),
-            ))
+            .get_app_state_unlocked(
+                params
+                    .observation
+                    .into_get_app_state_params(window_id, claim),
+                ClaimGuardMode::AlreadyHeld,
+            )
             .await
         {
             Ok(observation) => PostActionObservationResult::Completed(observation),
@@ -1224,11 +1364,37 @@ impl ComputerUseLinux {
     ) -> Json<ActionOutput> {
         let owner = self.clone();
         self.desktop_transaction
-            .run(move || async move { owner.perform_action_unlocked(params).await })
+            .run(move || async move {
+                owner
+                    .perform_action_unlocked(params, ClaimGuardMode::Acquire)
+                    .await
+            })
             .await
     }
 
-    async fn perform_action_unlocked(&self, params: ActionParams) -> Json<ActionOutput> {
+    async fn perform_action_unlocked(
+        &self,
+        params: ActionParams,
+        claim_guard_mode: ClaimGuardMode,
+    ) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        let coordination_window_id =
+            match self.observation_window_id(Some(params.observation_id.as_str())) {
+                Ok(window_id) => window_id,
+                Err(message) => return action_error("perform_action", message, received),
+            };
+        let _claim_guard = match self
+            .mutation_claim_guard(
+                claim_guard_mode,
+                coordination_window_id,
+                &params.claim,
+                MutationLane::Window,
+            )
+            .await
+        {
+            Ok(guard) => guard,
+            Err(message) => return action_error("perform_action", message, received),
+        };
         self.perform_element_action(&params).await
     }
 
@@ -1248,12 +1414,37 @@ impl ComputerUseLinux {
     ) -> Json<ActionOutput> {
         let owner = self.clone();
         self.desktop_transaction
-            .run(move || async move { owner.set_value_unlocked(params).await })
+            .run(move || async move {
+                owner
+                    .set_value_unlocked(params, ClaimGuardMode::Acquire)
+                    .await
+            })
             .await
     }
 
-    async fn set_value_unlocked(&self, params: SetValueParams) -> Json<ActionOutput> {
+    async fn set_value_unlocked(
+        &self,
+        params: SetValueParams,
+        claim_guard_mode: ClaimGuardMode,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
+        let coordination_window_id =
+            match self.observation_window_id(Some(params.observation_id.as_str())) {
+                Ok(window_id) => window_id,
+                Err(message) => return action_error("set_value", message, received),
+            };
+        let _claim_guard = match self
+            .mutation_claim_guard(
+                claim_guard_mode,
+                coordination_window_id,
+                &params.claim,
+                MutationLane::Window,
+            )
+            .await
+        {
+            Ok(guard) => guard,
+            Err(message) => return action_error("set_value", message, received),
+        };
         let object_ref = match self.resolve_object_ref(
             Some(params.observation_id.as_str()),
             params.element_index,
@@ -1311,11 +1502,17 @@ impl ComputerUseLinux {
     async fn scroll(&self, Parameters(params): Parameters<ScrollParams>) -> Json<ActionOutput> {
         let owner = self.clone();
         self.desktop_transaction
-            .run(move || async move { owner.scroll_unlocked(params).await })
+            .run(
+                move || async move { owner.scroll_unlocked(params, ClaimGuardMode::Acquire).await },
+            )
             .await
     }
 
-    async fn scroll_unlocked(&self, mut params: ScrollParams) -> Json<ActionOutput> {
+    async fn scroll_unlocked(
+        &self,
+        mut params: ScrollParams,
+        claim_guard_mode: ClaimGuardMode,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let scroll_error = |message| {
             Json(ActionOutput {
@@ -1327,7 +1524,7 @@ impl ComputerUseLinux {
             })
         };
         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
-        let explicit_window_target = params.window_target();
+        let mut explicit_window_target = params.window_target();
         let observed_target = match resolve_observed_scroll_target(
             &self.accessibility_snapshots,
             ScrollTargetRequest {
@@ -1340,6 +1537,34 @@ impl ComputerUseLinux {
             },
         ) {
             Ok(target) => target,
+            Err(message) => return scroll_error(message),
+        };
+        let coordination_window_id = if let Some(target) = &observed_target {
+            Some(target.window_id())
+        } else {
+            match self
+                .coordination_window_id(explicit_window_target.as_ref())
+                .await
+            {
+                Ok(window_id) => window_id,
+                Err(message) => return scroll_error(message),
+            }
+        };
+        if let (Some(window_id), Some(target)) =
+            (coordination_window_id, explicit_window_target.as_mut())
+        {
+            target.window_id = Some(window_id);
+        }
+        let _claim_guard = match self
+            .mutation_claim_guard(
+                claim_guard_mode,
+                coordination_window_id,
+                &params.claim,
+                MutationLane::PhysicalSeat,
+            )
+            .await
+        {
+            Ok(guard) => guard,
             Err(message) => return scroll_error(message),
         };
         // Raise/focus the target window first (parity with click) so wheel
@@ -1420,6 +1645,15 @@ impl ComputerUseLinux {
                         received,
                     });
                 }
+            }
+            let point = observed_target
+                .as_ref()
+                .map_or_else(|| params.x.zip(params.y), |target| Some(target.point()));
+            let claim_error = point.and_then(|point| {
+                validate_claimed_window_point(&params.claim, focus.as_ref(), point, "scroll").err()
+            });
+            if let Some(message) = claim_error {
+                return scroll_error(message);
             }
         }
         let target_point = observed_target
@@ -1533,16 +1767,52 @@ impl ComputerUseLinux {
     async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
         let owner = self.clone();
         self.desktop_transaction
-            .run(move || async move { owner.drag_unlocked(params).await })
+            .run(move || async move { owner.drag_unlocked(params, ClaimGuardMode::Acquire).await })
             .await
     }
 
-    async fn drag_unlocked(&self, params: DragParams) -> Json<ActionOutput> {
+    async fn drag_unlocked(
+        &self,
+        params: DragParams,
+        claim_guard_mode: ClaimGuardMode,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params));
+        let mut window_target = params.window_target();
+        let coordination_window_id = match self.coordination_window_id(Some(&window_target)).await {
+            Ok(window_id) => window_id,
+            Err(message) => return action_error("drag", message, received),
+        };
+        window_target.window_id = coordination_window_id;
+        let _claim_guard = match self
+            .mutation_claim_guard(
+                claim_guard_mode,
+                coordination_window_id,
+                &params.claim,
+                MutationLane::PhysicalSeat,
+            )
+            .await
+        {
+            Ok(guard) => guard,
+            Err(message) => return action_error("drag", message, received),
+        };
+        let focus_result = if window_target.has_target() {
+            self.focus_target_for_input(&window_target).await
+        } else {
+            Ok(None)
+        };
+        let focus = match focus_result {
+            Ok(focus) => focus,
+            Err(message) => return action_error("drag", message, received),
+        };
         for (label, x, y) in [
             ("start", params.start_x, params.start_y),
             ("end", params.end_x, params.end_y),
         ] {
+            if let Err(message) =
+                validate_claimed_window_point(&params.claim, focus.as_ref(), (x, y), "drag")
+            {
+                return action_error("drag", message, received);
+            }
             if let Err(message) = self.validate_capture_space_point(x, y).await {
                 return Json(ActionOutput {
                     ok: false,
@@ -1612,13 +1882,39 @@ impl ComputerUseLinux {
     ) -> Json<ActionOutput> {
         let owner = self.clone();
         self.desktop_transaction
-            .run(move || async move { owner.press_key_unlocked(params).await })
+            .run(move || async move {
+                owner
+                    .press_key_unlocked(params, ClaimGuardMode::Acquire)
+                    .await
+            })
             .await
     }
 
-    async fn press_key_unlocked(&self, params: PressKeyParams) -> Json<ActionOutput> {
+    async fn press_key_unlocked(
+        &self,
+        params: PressKeyParams,
+        claim_guard_mode: ClaimGuardMode,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        let focus = match self.focus_target_for_input(&params.window_target()).await {
+        let mut window_target = params.window_target();
+        let coordination_window_id = match self.coordination_window_id(Some(&window_target)).await {
+            Ok(window_id) => window_id,
+            Err(message) => return action_error("press_key", message, received),
+        };
+        window_target.window_id = coordination_window_id;
+        let _claim_guard = match self
+            .mutation_claim_guard(
+                claim_guard_mode,
+                coordination_window_id,
+                &params.claim,
+                MutationLane::PhysicalSeat,
+            )
+            .await
+        {
+            Ok(guard) => guard,
+            Err(message) => return action_error("press_key", message, received),
+        };
+        let focus = match self.focus_target_for_input(&window_target).await {
             Ok(focus) => focus,
             Err(message) => {
                 return Json(ActionOutput {
@@ -1666,13 +1962,39 @@ impl ComputerUseLinux {
     ) -> Json<ActionOutput> {
         let owner = self.clone();
         self.desktop_transaction
-            .run(move || async move { owner.type_text_unlocked(params).await })
+            .run(move || async move {
+                owner
+                    .type_text_unlocked(params, ClaimGuardMode::Acquire)
+                    .await
+            })
             .await
     }
 
-    async fn type_text_unlocked(&self, params: TypeTextParams) -> Json<ActionOutput> {
+    async fn type_text_unlocked(
+        &self,
+        params: TypeTextParams,
+        claim_guard_mode: ClaimGuardMode,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
-        let focus = match self.focus_target_for_input(&params.window_target()).await {
+        let mut window_target = params.window_target();
+        let coordination_window_id = match self.coordination_window_id(Some(&window_target)).await {
+            Ok(window_id) => window_id,
+            Err(message) => return action_error("type_text", message, received),
+        };
+        window_target.window_id = coordination_window_id;
+        let _claim_guard = match self
+            .mutation_claim_guard(
+                claim_guard_mode,
+                coordination_window_id,
+                &params.claim,
+                MutationLane::PhysicalSeat,
+            )
+            .await
+        {
+            Ok(guard) => guard,
+            Err(message) => return action_error("type_text", message, received),
+        };
+        let focus = match self.focus_target_for_input(&window_target).await {
             Ok(focus) => focus,
             Err(message) => {
                 return Json(ActionOutput {
@@ -1992,8 +2314,10 @@ struct FocusedWindowOutput {
     message: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ActivateWindowParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     #[serde(default)]
     window_id: Option<u64>,
     #[serde(default)]
@@ -2088,6 +2412,8 @@ struct AppCandidate {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct GetAppStateParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     #[serde(default)]
     app_name_or_bundle_identifier: Option<String>,
     #[serde(default)]
@@ -2211,8 +2537,9 @@ struct PostActionObservationParams {
 }
 
 impl PostActionObservationParams {
-    fn into_get_app_state_params(self, window_id: u64) -> GetAppStateParams {
+    fn into_get_app_state_params(self, window_id: u64, claim: ClaimContext) -> GetAppStateParams {
         GetAppStateParams {
+            claim,
             app_name_or_bundle_identifier: None,
             window_id: Some(window_id),
             pid: None,
@@ -2259,6 +2586,8 @@ struct ActionBatchAndObserveOutput {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ScreenshotParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     #[serde(default)]
     window_id: Option<u64>,
     #[serde(default)]
@@ -2439,6 +2768,8 @@ impl ScreenshotMetadata {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ClickParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     /// Opaque ID returned by get_app_state. Required for element-based clicks.
     #[serde(default)]
     observation_id: Option<String>,
@@ -2514,8 +2845,9 @@ impl ClickParams {
 }
 
 impl BatchClick {
-    fn into_click_params(self, window_id: u64) -> ClickParams {
+    fn into_click_params(self, window_id: u64, claim: ClaimContext) -> ClickParams {
         ClickParams {
+            claim,
             observation_id: self.observation_id,
             element_index: self.element_index,
             role: self.role,
@@ -2538,6 +2870,8 @@ impl BatchClick {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ActionParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     /// Opaque ID returned by get_app_state for the selected element.
     observation_id: String,
     #[serde(default)]
@@ -2569,6 +2903,8 @@ impl ActionParams {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct SetValueParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     /// Opaque ID returned by get_app_state for the selected element.
     observation_id: String,
     #[serde(default)]
@@ -2597,8 +2933,10 @@ impl SetValueParams {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ScrollParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     /// Required with element_index; returned by the originating get_app_state.
     #[serde(default)]
     observation_id: Option<String>,
@@ -2655,16 +2993,43 @@ impl ScrollParams {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct DragParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     start_x: i32,
     start_y: i32,
     end_x: i32,
     end_y: i32,
+    #[serde(default)]
+    window_id: Option<u64>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    wm_class: Option<String>,
+    #[serde(default)]
+    window_title: Option<String>,
+}
+
+impl DragParams {
+    fn window_target(&self) -> WindowTarget {
+        WindowTarget {
+            window_id: self.window_id,
+            pid: self.pid,
+            app_id: self.app_id.clone(),
+            wm_class: self.wm_class.clone(),
+            title: self.window_title.clone(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct PressKeyParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     key: String,
     #[serde(default)]
     window_id: Option<u64>,
@@ -2688,6 +3053,8 @@ struct PressKeyParams {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct TypeTextParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     text: String,
     #[serde(default)]
     window_id: Option<u64>,
@@ -2710,8 +3077,9 @@ struct TypeTextParams {
 }
 
 impl PressKeyParams {
-    fn for_window(window_id: u64, key: String) -> Self {
+    fn for_window(window_id: u64, key: String, claim: ClaimContext) -> Self {
         Self {
+            claim,
             key,
             window_id: Some(window_id),
             pid: None,
@@ -2741,8 +3109,9 @@ impl PressKeyParams {
 }
 
 impl TypeTextParams {
-    fn for_window(window_id: u64, text: String) -> Self {
+    fn for_window(window_id: u64, text: String, claim: ClaimContext) -> Self {
         Self {
+            claim,
             text,
             window_id: Some(window_id),
             pid: None,
@@ -2776,25 +3145,38 @@ impl ComputerUseLinux {
         &self,
         params: ActionBatchParams,
     ) -> ActionBatchOutput {
-        execute_action_batch(params, |action, window_id| async move {
-            match action {
-                BatchAction::Click(click) => {
-                    let Json(result) = self
-                        .click(Parameters(click.into_click_params(window_id)))
-                        .await;
-                    BatchActionRun::Completed(result)
-                }
-                BatchAction::TypeText { text } => {
-                    let Json(result) = self
-                        .type_text(Parameters(TypeTextParams::for_window(window_id, text)))
-                        .await;
-                    BatchActionRun::text(result)
-                }
-                BatchAction::PressKey { key } => {
-                    let Json(result) = self
-                        .press_key(Parameters(PressKeyParams::for_window(window_id, key)))
-                        .await;
-                    BatchActionRun::Completed(result)
+        let claim = params.claim.clone();
+        execute_action_batch(params, |action, window_id| {
+            let claim = claim.clone();
+            async move {
+                match action {
+                    BatchAction::Click(click) => {
+                        let Json(result) = self
+                            .click_unlocked(
+                                click.into_click_params(window_id, claim.clone()),
+                                ClaimGuardMode::AlreadyHeld,
+                            )
+                            .await;
+                        BatchActionRun::Completed(result)
+                    }
+                    BatchAction::TypeText { text } => {
+                        let Json(result) = self
+                            .type_text_unlocked(
+                                TypeTextParams::for_window(window_id, text, claim.clone()),
+                                ClaimGuardMode::AlreadyHeld,
+                            )
+                            .await;
+                        BatchActionRun::text(result)
+                    }
+                    BatchAction::PressKey { key } => {
+                        let Json(result) = self
+                            .press_key_unlocked(
+                                PressKeyParams::for_window(window_id, key, claim.clone()),
+                                ClaimGuardMode::AlreadyHeld,
+                            )
+                            .await;
+                        BatchActionRun::Completed(result)
+                    }
                 }
             }
         })
@@ -2806,7 +3188,9 @@ impl ComputerUseLinux {
         for (index, action) in params.actions.iter().enumerate() {
             match action {
                 BatchAction::Click(click) => {
-                    let click = click.clone().into_click_params(params.window_id);
+                    let click = click
+                        .clone()
+                        .into_click_params(params.window_id, params.claim.clone());
                     self.resolve_observed_click_target(&click)
                         .map_err(|error| format!("actions[{index}] is invalid: {error}"))?;
                 }
@@ -3307,6 +3691,43 @@ impl ComputerUseLinux {
         notes
     }
 
+    async fn mutation_claim_guard(
+        &self,
+        mode: ClaimGuardMode,
+        window_id: Option<u64>,
+        context: &ClaimContext,
+        lane: MutationLane,
+    ) -> std::result::Result<Option<crate::claim_coordination::MutationGuards>, String> {
+        match mode {
+            ClaimGuardMode::Acquire => {
+                let coordinator = self
+                    .claim_coordinator
+                    .get_or_init(Coordinator::from_env)
+                    .clone();
+                acquire_mutation_guards(coordinator, window_id, context, lane).await
+            }
+            ClaimGuardMode::AlreadyHeld => Ok(None),
+        }
+    }
+
+    async fn coordination_window_id(
+        &self,
+        target: Option<&WindowTarget>,
+    ) -> std::result::Result<Option<u64>, String> {
+        let Some(target) = target.filter(|target| target.has_target()) else {
+            return Ok(None);
+        };
+        if let Some(window_id) = target.window_id {
+            return Ok(Some(window_id));
+        }
+        let windows = list_windows()
+            .await
+            .map_err(|error| format!("failed to resolve claim window: {error:#}"))?;
+        resolve_window_target(&windows, target)
+            .map(|window| Some(window.window_id))
+            .map_err(|error| format!("failed to resolve claim window: {error:#}"))
+    }
+
     fn record_accessibility_snapshot(
         &self,
         target: AccessibilitySnapshotTarget,
@@ -3343,6 +3764,14 @@ impl ComputerUseLinux {
                     .to_string()
             })?
             .resolve(observation_id)
+    }
+
+    fn observation_window_id(
+        &self,
+        observation_id: Option<&str>,
+    ) -> std::result::Result<Option<u64>, String> {
+        self.accessibility_snapshot(observation_id)
+            .map(|snapshot| snapshot.window_id())
     }
 
     fn resolve_object_ref(
@@ -4116,6 +4545,39 @@ fn window_crop_rect(bounds: &crate::windowing::WindowBounds) -> Option<(i32, i32
     Some((x, y, bounds.width, bounds.height))
 }
 
+fn validate_claimed_window_point(
+    claim: &ClaimContext,
+    focus: Option<&WindowFocusResult>,
+    point: (i32, i32),
+    action: &str,
+) -> std::result::Result<(), String> {
+    if claim.owner_thread_id.is_none() || claim.claim_token.is_none() {
+        return Ok(());
+    }
+    let bounds = focus
+        .and_then(|focus| {
+            focus
+                .focused_window
+                .as_ref()
+                .and_then(|window| window.bounds.as_ref())
+                .or(focus.requested_window.bounds.as_ref())
+        })
+        .and_then(window_crop_rect)
+        .ok_or_else(|| format!("Claimed {action} requires verified target-window bounds."))?;
+    let (x, y, width, height) = bounds;
+    let inside = i64::from(point.0) >= i64::from(x)
+        && i64::from(point.1) >= i64::from(y)
+        && i64::from(point.0) < i64::from(x) + i64::from(width)
+        && i64::from(point.1) < i64::from(y) + i64::from(height);
+    if inside {
+        Ok(())
+    } else {
+        Err(format!(
+            "Claimed {action} coordinates must be inside the authorized target window."
+        ))
+    }
+}
+
 fn apply_window_relative_click_coordinates(
     params: &mut ClickParams,
     focus: &WindowFocusResult,
@@ -4272,6 +4734,20 @@ fn action_result(
             received,
         },
     }
+}
+
+fn action_error(
+    action: &str,
+    message: String,
+    received: Option<serde_json::Value>,
+) -> Json<ActionOutput> {
+    Json(ActionOutput {
+        ok: false,
+        implemented: true,
+        action: action.to_string(),
+        message,
+        received,
+    })
 }
 
 fn portal_action_delivery_failure(
@@ -4982,6 +5458,69 @@ mod tests {
     use super::*;
     use crate::atspi_tree::{AccessibilityAction, Bounds};
     use crate::windows::{WindowBounds, GNOME_SHELL_EXTENSION_BACKEND};
+    use std::io::{BufRead, Write};
+    fn claim_context(owner: &str, token: &str) -> ClaimContext {
+        ClaimContext {
+            owner_thread_id: Some(owner.to_string()),
+            claim_token: Some(token.to_string()),
+        }
+    }
+
+    fn backend_with_live_claim(window_id: u64) -> (ComputerUseLinux, PathBuf) {
+        let root = env::temp_dir().join(format!(
+            "computer-use-linux-server-claim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let binding = std::collections::BTreeMap::from([
+            (
+                "hyprland_instance".to_string(),
+                serde_json::json!("instance"),
+            ),
+            ("uid".to_string(), serde_json::json!(1000)),
+            (
+                "wayland_display".to_string(),
+                serde_json::json!("wayland-1"),
+            ),
+            (
+                "xdg_runtime_dir".to_string(),
+                serde_json::json!("/run/user/1000"),
+            ),
+        ]);
+        let coordinator = Coordinator {
+            state_dir: root.clone(),
+            binding,
+        };
+        let session = coordinator.binding_key();
+        let state = serde_json::json!({
+            "version": 1,
+            "sessions": {
+                session: {
+                    "binding": coordinator.binding,
+                    "claims": {
+                        "capture:test": {
+                            "owner_thread_id": "owner-a",
+                            "claim_token": "token-a",
+                            "expires_at": f64::MAX,
+                            "window": {"address": format!("0x{window_id:x}")}
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            root.join("window-claims.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let backend = ComputerUseLinux::default();
+        assert!(backend.claim_coordinator.set(Some(coordinator)).is_ok());
+        (backend, root)
+    }
 
     fn cache_observation(backend: &ComputerUseLinux, nodes: &[AccessibilityNode]) -> String {
         backend.record_accessibility_snapshot(AccessibilitySnapshotTarget::Desktop, nodes)
@@ -5080,7 +5619,10 @@ mod tests {
         };
 
         assert_eq!(
-            serde_json::to_value(observation.into_get_app_state_params(42)).unwrap(),
+            serde_json::to_value(
+                observation.into_get_app_state_params(42, ClaimContext::default()),
+            )
+            .unwrap(),
             serde_json::json!({
                 "app_name_or_bundle_identifier": null,
                 "window_id": 42,
@@ -5262,8 +5804,320 @@ mod tests {
     }
 
     #[test]
+    fn window_scoped_tools_expose_shared_claim_credentials() {
+        let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
+        for name in [
+            "activate_window",
+            "get_app_state",
+            "screenshot",
+            "perform_action",
+            "set_value",
+            "click",
+            "scroll",
+            "drag",
+            "press_key",
+            "type_text",
+            "run_action_batch",
+            "run_action_batch_and_observe",
+        ] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            assert!(
+                schema["properties"].get("owner_thread_id").is_some(),
+                "{name}"
+            );
+            assert!(schema["properties"].get("claim_token").is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn exact_window_pin_preserves_selectors_and_authorizes_one_identity() {
+        let mut target = WindowTarget {
+            app_id: Some("org.example.App".to_string()),
+            title: Some("Document".to_string()),
+            ..Default::default()
+        };
+
+        target.pin_exact_window_id(42);
+
+        assert_eq!(
+            target,
+            WindowTarget {
+                window_id: Some(42),
+                app_id: Some("org.example.App".to_string()),
+                title: Some("Document".to_string()),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn screenshot_route_rejects_foreign_claim_credentials() {
+        let window_id = u64::MAX;
+        let (backend, root) = backend_with_live_claim(window_id);
+        let error = backend
+            .screenshot(Parameters(ScreenshotParams {
+                window_id: Some(window_id),
+                claim: ClaimContext {
+                    owner_thread_id: Some("owner-b".to_string()),
+                    claim_token: Some("token-b".to_string()),
+                },
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("actively claimed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn screenshot_route_accepts_matching_claim_credentials() {
+        let window_id = u64::MAX;
+        let (backend, root) = backend_with_live_claim(window_id);
+        let error = backend
+            .screenshot(Parameters(ScreenshotParams {
+                window_id: Some(window_id),
+                claim: ClaimContext {
+                    owner_thread_id: Some("owner-a".to_string()),
+                    claim_token: Some("token-a".to_string()),
+                },
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(!error.message.contains("claim_coordination"));
+        assert!(!error.message.contains("actively claimed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn screenshot_focus_waits_for_the_companion_global_lane() {
+        let window_id = u64::MAX;
+        let (backend, root) = backend_with_live_claim(window_id);
+        let lock_path = root.join("pointer-transaction.lock");
+        let mut companion = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl,sys; f=open(sys.argv[1], 'a+'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); input()",
+            ])
+            .arg(lock_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(companion.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "locked\n");
+
+        let mut capture = tokio::spawn(async move {
+            backend
+                .screenshot(Parameters(ScreenshotParams {
+                    window_id: Some(window_id),
+                    claim: ClaimContext {
+                        owner_thread_id: Some("owner-a".to_string()),
+                        claim_token: Some("token-a".to_string()),
+                    },
+                    ..Default::default()
+                }))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut capture)
+                .await
+                .is_err()
+        );
+        companion.stdin.take().unwrap().write_all(b"\n").unwrap();
+        assert!(companion.wait().unwrap().success());
+
+        let error = tokio::time::timeout(Duration::from_secs(5), capture)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(!error.message.contains("claim_coordination"));
+        assert!(!error.message.contains("actively claimed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_app_state_route_rejects_desktop_capture_during_a_live_claim() {
+        let (backend, root) = backend_with_live_claim(u64::MAX);
+        let params = serde_json::from_value(serde_json::json!({})).unwrap();
+        let error = backend.get_app_state(Parameters(params)).await.unwrap_err();
+        assert!(error.message.contains("window_id is required"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mutation_routes_reject_missing_and_wrong_claims_but_accept_matching_claims() {
+        let (backend, root) = backend_with_live_claim(42);
+        let observation_id = cache_window_observation(
+            &backend,
+            &[node_with_actions(7, None, vec![click_action()])],
+        );
+        for (claim, blocked) in [
+            (ClaimContext::default(), true),
+            (claim_context("owner-b", "token-b"), true),
+            (claim_context("owner-a", "token-a"), false),
+        ] {
+            let Json(activate) = backend
+                .activate_window(Parameters(ActivateWindowParams {
+                    claim: claim.clone(),
+                    window_id: Some(42),
+                    ..Default::default()
+                }))
+                .await;
+            let Json(semantic) = backend
+                .perform_action(Parameters(ActionParams {
+                    claim: claim.clone(),
+                    observation_id: observation_id.clone(),
+                    element_index: Some(7),
+                    ..Default::default()
+                }))
+                .await;
+            let Json(value) = backend
+                .set_value(Parameters(SetValueParams {
+                    claim: claim.clone(),
+                    observation_id: observation_id.clone(),
+                    element_index: Some(7),
+                    value: "next".to_string(),
+                    ..Default::default()
+                }))
+                .await;
+            let Json(text) = backend
+                .type_text(Parameters(TypeTextParams::for_window(
+                    42,
+                    "hello".to_string(),
+                    claim.clone(),
+                )))
+                .await;
+            let Json(key) = backend
+                .press_key(Parameters(PressKeyParams::for_window(
+                    42,
+                    "Tab".to_string(),
+                    claim.clone(),
+                )))
+                .await;
+            let Json(click) = backend
+                .click(Parameters(ClickParams {
+                    claim: claim.clone(),
+                    x: Some(1),
+                    y: Some(1),
+                    window_id: Some(42),
+                    ..Default::default()
+                }))
+                .await;
+            let Json(scroll) = backend
+                .scroll(Parameters(ScrollParams {
+                    claim: claim.clone(),
+                    x: Some(1),
+                    y: Some(1),
+                    direction: "down".to_string(),
+                    window_id: Some(42),
+                    ..Default::default()
+                }))
+                .await;
+            let Json(drag) = backend
+                .drag(Parameters(DragParams {
+                    claim: claim.clone(),
+                    start_x: 1,
+                    start_y: 1,
+                    end_x: 2,
+                    end_y: 2,
+                    window_id: Some(42),
+                    ..Default::default()
+                }))
+                .await;
+            let batch = backend
+                .run_action_batch_and_observe(Parameters(ActionBatchAndObserveParams {
+                    batch: ActionBatchParams {
+                        claim,
+                        window_id: 42,
+                        actions: vec![BatchAction::PressKey {
+                            key: "Tab".to_string(),
+                        }],
+                    },
+                    observation: PostActionObservationParams {
+                        include_screenshot: Some(false),
+                        ..Default::default()
+                    },
+                }))
+                .await
+                .map_or_else(
+                    |error| error.message.to_string(),
+                    |result| format!("{result:?}"),
+                );
+
+            for output in [
+                serde_json::to_string(&activate).unwrap(),
+                serde_json::to_string(&semantic).unwrap(),
+                serde_json::to_string(&value).unwrap(),
+                serde_json::to_string(&text).unwrap(),
+                serde_json::to_string(&key).unwrap(),
+                serde_json::to_string(&click).unwrap(),
+                serde_json::to_string(&scroll).unwrap(),
+                serde_json::to_string(&drag).unwrap(),
+                batch,
+            ] {
+                assert_eq!(output.contains("actively claimed"), blocked, "{output}");
+                assert!(!output.contains("token-a"));
+                assert!(!output.contains("token-b"));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn activate_window_waits_for_the_companion_global_lane() {
+        let (backend, root) = backend_with_live_claim(42);
+        let lock_path = root.join("pointer-transaction.lock");
+        let mut companion = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import fcntl,sys; f=open(sys.argv[1], 'a+'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); input()",
+            ])
+            .arg(lock_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(companion.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "locked\n");
+
+        let mut action = tokio::spawn(async move {
+            backend
+                .activate_window(Parameters(ActivateWindowParams {
+                    claim: claim_context("owner-a", "token-a"),
+                    window_id: Some(42),
+                    ..Default::default()
+                }))
+                .await
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut action)
+            .await
+            .is_err());
+        companion.stdin.take().unwrap().write_all(b"\n").unwrap();
+        assert!(companion.wait().unwrap().success());
+
+        let Json(output) = tokio::time::timeout(Duration::from_secs(5), action)
+            .await
+            .unwrap()
+            .unwrap();
+        let output = serde_json::to_string(&output).unwrap();
+        assert!(!output.contains("actively claimed"));
+        assert!(!output.contains("token-a"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn action_batch_preflight_rejects_unsupported_keys_before_execution() {
         let params = ActionBatchParams {
+            claim: ClaimContext::default(),
             window_id: 42,
             actions: vec![
                 BatchAction::PressKey {
@@ -5297,6 +6151,7 @@ mod tests {
             )],
         );
         let params = ActionBatchParams {
+            claim: ClaimContext::default(),
             window_id: 41,
             actions: vec![BatchAction::Click(BatchClick {
                 observation_id: Some(observation_id),
@@ -5920,6 +6775,14 @@ mod tests {
         apply_window_relative_click_coordinates(&mut params, &focus).unwrap();
 
         assert_eq!((params.x, params.y), (Some(107), Some(209)));
+        for action in ["click", "scroll", "drag"] {
+            let validate = |claim: &ClaimContext, point| {
+                validate_claimed_window_point(claim, Some(&focus), point, action)
+            };
+            assert!(validate(&claim_context("owner-a", "token-a"), (107, 209)).is_ok());
+            assert!(validate(&claim_context("owner-a", "token-a"), (99, 209)).is_err());
+            assert!(validate(&ClaimContext::default(), (99, 209)).is_ok());
+        }
     }
 
     #[test]
@@ -6319,10 +7182,12 @@ mod tests {
 
         let Json(output) = backend
             .drag(Parameters(DragParams {
+                claim: ClaimContext::default(),
                 start_x: 20,
                 start_y: 20,
                 end_x: 100,
                 end_y: 40,
+                ..Default::default()
             }))
             .await;
 
@@ -6876,6 +7741,7 @@ mod tests {
     #[test]
     fn relative_scroll_translates_coordinates() {
         let mut params = ScrollParams {
+            claim: ClaimContext::default(),
             observation_id: None,
             element_index: None,
             x: Some(10),
@@ -6905,6 +7771,7 @@ mod tests {
     #[test]
     fn window_targeted_scroll_defaults_to_window_center() {
         let mut params = ScrollParams {
+            claim: ClaimContext::default(),
             observation_id: None,
             element_index: None,
             x: None,
@@ -6934,6 +7801,7 @@ mod tests {
     #[test]
     fn window_targeted_scroll_without_bounds_errors() {
         let mut params = ScrollParams {
+            claim: ClaimContext::default(),
             observation_id: None,
             element_index: None,
             x: None,
@@ -6966,6 +7834,7 @@ mod tests {
     #[test]
     fn relative_scroll_rejects_out_of_bounds() {
         let mut params = ScrollParams {
+            claim: ClaimContext::default(),
             observation_id: None,
             element_index: None,
             x: Some(801),

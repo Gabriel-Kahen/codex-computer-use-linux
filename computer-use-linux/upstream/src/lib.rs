@@ -3,6 +3,7 @@ mod accessibility_snapshot;
 mod action_batch;
 #[path = "atspi_tree.rs"]
 mod atspi_tree_impl;
+mod claim_coordination;
 mod cli;
 mod cosmic_helper;
 mod desktop_transaction;

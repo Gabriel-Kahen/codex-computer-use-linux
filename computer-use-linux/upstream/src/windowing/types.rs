@@ -27,7 +27,7 @@ pub struct WindowBounds {
     pub height: u32,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct WindowTarget {
     #[serde(default)]
     pub window_id: Option<u64>,
@@ -60,6 +60,10 @@ pub struct WindowFocusResult {
 }
 
 impl WindowTarget {
+    pub(crate) fn pin_exact_window_id(&mut self, window_id: u64) {
+        self.window_id = Some(window_id);
+    }
+
     pub fn has_target(&self) -> bool {
         self.window_id.is_some()
             || self.pid.is_some()

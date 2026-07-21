@@ -14,6 +14,7 @@ pub(super) struct ObservedClickAction {
     pub(super) observation_id: String,
     pub(super) object_ref: String,
     pub(super) action_identity: ActionFingerprint,
+    pub(super) window_id: u64,
 }
 
 impl ComputerUseLinux {
@@ -102,6 +103,7 @@ impl ComputerUseLinux {
                 observation_id: observation_id.to_string(),
                 object_ref: node.object_ref,
                 action_identity,
+                window_id,
             }));
         }
         let Some(point) = node.bounds.as_ref().and_then(bounds_center) else {

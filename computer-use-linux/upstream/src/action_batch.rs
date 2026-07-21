@@ -1,3 +1,4 @@
+use crate::claim_coordination::ClaimContext;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -13,6 +14,8 @@ pub(crate) const NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING: &str =
 
 #[derive(Debug, Clone, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct ActionBatchParams {
+    #[serde(flatten)]
+    pub(crate) claim: ClaimContext,
     /// Exact window identifier inherited by every action in the batch.
     pub(crate) window_id: u64,
     pub(crate) actions: Vec<BatchAction>,

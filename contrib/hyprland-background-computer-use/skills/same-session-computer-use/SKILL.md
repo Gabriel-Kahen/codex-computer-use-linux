@@ -11,9 +11,9 @@ Operate the real logged-in session. Never substitute a VM, nested desktop, alter
 
 1. Call `session_status` and `list_window_claims`, then call `list_session_windows`. Follow `next_cursor` through every bounded page until it is null so windows after the first page are not missed.
 2. Reuse an existing matching window. Preserve its process, profile, login, open documents, workspace, and fullscreen state.
-3. Call `claim_session_window` for that exact window. Keep its `claim_token` private to this task, pass it to every broker capture/action, and renew before `expires_at` if work continues.
+3. Call `claim_session_window` for that exact window. Keep its `claim_token` private to this task, record the returned `owner_thread_id`, pass the token to every broker capture/action, and renew before `expires_at` if work continues.
 4. Capture inline with the read-only `get_session_window_capture` and the claim token. Use `save_session_window_capture` only when the user needs a PNG written to an absolute path. Neither operation focuses, moves, or raises the window. Do not use the deprecated `capture_session_window` compatibility tool in new workflows.
-5. Inspect and act with the separate `computer-use-linux@codex-computer-use-linux` plugin's accessibility tools. Refresh app state immediately before choosing an element. If those tools are absent, stop and ask the user to install that companion plugin. Treat the Hyprland claim as authoritative even though external AT-SPI calls do not pass through this broker.
+5. Inspect and act with the separate `computer-use-linux@codex-computer-use-linux` plugin's accessibility tools. Pass the claim's `owner_thread_id` and `claim_token` to its capture and mutation tools; the generic server shares the broker's per-window lock across those operations. Refresh app state immediately before choosing an element. If those tools are absent, stop and ask the user to install that companion plugin.
 6. Prefer semantic AT-SPI operations in this order:
    - `perform_action` for buttons, links, menu items, and other actionable controls.
    - `set_value` or editable-text operations for text fields and sliders.
@@ -23,7 +23,7 @@ Operate the real logged-in session. Never substitute a VM, nested desktop, alter
 
 ## Parallel tasks
 
-For one prompt with independent work in multiple windows, fan out one worker per window. Each worker must use its own host-provided task identity and claim only its assigned window. Different native Wayland windows can capture and mutate concurrently through this broker; actions on one window remain serialized. This broker's XWayland, physical-seat, and fallback operations share one global lane and may wait or fail while that lane is reserved. The separate Computer Use process does not share that lock, so workers must coordinate its AT-SPI and global-input calls by policy.
+For one prompt with independent work in multiple windows, fan out one worker per window. Each worker must use its own host-provided task identity and claim only its assigned window. Different native Wayland windows can capture and mutate concurrently through this broker; actions on one window remain serialized. The generic Computer Use process shares those per-window locks for capture and mutation, and its physical-seat input and focusing screenshots share the broker's global lane. XWayland, physical-seat, and fallback operations may wait or fail while that lane is reserved.
 
 Never share a `claim_token` between workers. A claim defaults to 60 seconds; claimed broker operations renew it, and the owner can explicitly renew from 5 to 300 seconds with `claim_session_window`. Same-owner renewal keeps the token stable. If a token expires, stop acting, reacquire the window, recapture it, and use the newly returned token. A foreign active claim is authoritative even when an action omits `claim_token`.
 
