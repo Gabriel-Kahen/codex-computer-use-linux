@@ -5,6 +5,10 @@ pub mod target;
 pub mod types;
 
 pub(crate) use capture::capture_window_exact;
+
+pub(crate) async fn shutdown_backends() {
+    backends::kwin::shutdown_bridge().await;
+}
 #[allow(unused_imports)]
 pub use registry::{
     COSMIC_WAYLAND_BACKEND, GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND,
@@ -815,6 +819,18 @@ mod tests {
         assert!(script.contains("workspace.clientList()"));
         assert!(script
             .contains(r#"activeWindow = "activeWindow" in workspace ? workspace.activeWindow : workspace.activeClient;"#));
+        assert!(script.contains(r#""windowAdded", "windowRemoved", "windowActivated""#));
+        assert!(script.contains(r#""clientAdded", "clientRemoved", "clientActivated""#));
+        assert!(script.contains("connectSignal(window, name, publishWindows)"));
+        assert!(script.contains(r#""frameGeometryChanged""#));
+        assert!(script.contains(r#""captionChanged""#));
+        assert!(script.contains(r#""desktopFileNameChanged", "windowClassChanged""#));
+        assert!(script.contains(r#"var desktopFile = read(window, "desktopFileName");"#));
+        assert!(script.contains(
+            r#"desktopFile: desktopFile !== null ? desktopFile : read(window, "desktopFile")"#
+        ));
+        assert_eq!(script.matches("publishWindows();").count(), 1);
+        assert!(!script.contains("unloadScript"));
     }
 
     #[test]
