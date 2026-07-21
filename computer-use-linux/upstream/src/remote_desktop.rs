@@ -1,6 +1,11 @@
 use crate::diagnostics::hydrate_session_bus_env;
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use futures_util::StreamExt;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::{collections::HashMap, time::Duration};
 use xkeysym::Keysym;
 use zbus::{
@@ -17,6 +22,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 const DEVICE_KEYBOARD: u32 = 1;
 const DEVICE_POINTER: u32 = 2;
+const PERSIST_MODE_EXPLICITLY_REVOKED: u32 = 2;
+const MAX_RESTORE_TOKEN_BYTES: usize = 4096;
 
 const KEY_RELEASED: u32 = 0;
 const KEY_PRESSED: u32 = 1;
@@ -25,16 +32,24 @@ const AXIS_VERTICAL: u32 = 0;
 const AXIS_HORIZONTAL: u32 = 1;
 
 #[derive(Clone)]
-pub struct PortalPointerSession {
+pub struct PortalSession {
     connection: Connection,
     session_handle: OwnedObjectPath,
+    devices: u32,
 }
 
-#[derive(Clone)]
-pub struct PortalKeyboardSession {
-    connection: Connection,
-    session_handle: OwnedObjectPath,
+impl PortalSession {
+    pub(crate) fn has_pointer(&self) -> bool {
+        self.devices & DEVICE_POINTER != 0
+    }
+
+    pub(crate) fn has_keyboard(&self) -> bool {
+        self.devices & DEVICE_KEYBOARD != 0
+    }
 }
+
+pub type PortalPointerSession = PortalSession;
+pub type PortalKeyboardSession = PortalSession;
 
 #[derive(Debug)]
 pub(crate) enum PortalActionError {
@@ -65,44 +80,61 @@ pub enum ScrollDirection {
     Right,
 }
 
-pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
+pub async fn start_portal_session() -> Result<PortalSession> {
     hydrate_session_bus_env();
 
+    let restore_path = restore_token_path();
+    let lock_path = restore_path.with_extension("lock");
+    let _restore_guard = tokio::task::spawn_blocking(move || restore_token_lock(&lock_path))
+        .await
+        .context("restore-token lock task failed")??;
     let connection = Connection::session()
         .await
         .context("failed to connect to session bus for remote desktop portal")?;
     let session_handle = create_remote_desktop_session(&connection).await?;
-    select_pointer_devices(&connection, &session_handle).await?;
-    let devices = start_remote_desktop_session(&connection, &session_handle).await?;
+    let restore_token = read_restore_token(&restore_path).ok().flatten();
+    select_devices(
+        &connection,
+        &session_handle,
+        DEVICE_POINTER | DEVICE_KEYBOARD,
+        "rd_devices",
+        restore_token.as_deref(),
+    )
+    .await?;
+    let started = start_remote_desktop_session(&connection, &session_handle).await?;
 
-    if devices & DEVICE_POINTER == 0 {
-        bail!("remote desktop portal session started without pointer access");
+    if started.devices & (DEVICE_POINTER | DEVICE_KEYBOARD) == 0 {
+        bail!("remote desktop portal session started without pointer or keyboard access");
     }
+    let _ = update_restore_token(
+        &restore_path,
+        restore_token.is_some(),
+        started.restore_token.as_deref(),
+    );
 
-    Ok(PortalPointerSession {
+    Ok(PortalSession {
         connection,
         session_handle,
+        devices: started.devices,
     })
 }
 
+#[allow(dead_code)]
+pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
+    let session = start_portal_session().await?;
+    if !session.has_pointer() {
+        bail!("remote desktop portal session started without pointer access");
+    }
+    Ok(session)
+}
+
+#[allow(dead_code)]
 pub async fn start_portal_keyboard_session() -> Result<PortalKeyboardSession> {
-    hydrate_session_bus_env();
-
-    let connection = Connection::session()
-        .await
-        .context("failed to connect to session bus for remote desktop portal")?;
-    let session_handle = create_remote_desktop_session(&connection).await?;
-    select_keyboard_devices(&connection, &session_handle).await?;
-    let devices = start_remote_desktop_session(&connection, &session_handle).await?;
-
-    if devices & DEVICE_KEYBOARD == 0 {
+    let session = start_portal_session().await?;
+    if !session.has_keyboard() {
         bail!("remote desktop portal session started without keyboard access");
     }
-
-    Ok(PortalKeyboardSession {
-        connection,
-        session_handle,
-    })
+    Ok(session)
 }
 
 pub fn keysyms_for_text(text: &str) -> Result<Vec<i32>> {
@@ -206,19 +238,12 @@ async fn create_remote_desktop_session(connection: &Connection) -> Result<OwnedO
         .context("RemoteDesktop session_handle was not a valid object path")
 }
 
-async fn select_pointer_devices(connection: &Connection, session: &OwnedObjectPath) -> Result<()> {
-    select_devices(connection, session, DEVICE_POINTER, "rd_devices").await
-}
-
-async fn select_keyboard_devices(connection: &Connection, session: &OwnedObjectPath) -> Result<()> {
-    select_devices(connection, session, DEVICE_KEYBOARD, "rd_keyboard_devices").await
-}
-
 async fn select_devices(
     connection: &Connection,
     session: &OwnedObjectPath,
     device_types: u32,
     request_prefix: &str,
+    restore_token: Option<&str>,
 ) -> Result<()> {
     let remote_proxy = remote_desktop_proxy(connection).await?;
     let (request_path, mut response_stream) =
@@ -229,6 +254,13 @@ async fn select_devices(
         Value::from(last_path_component(&request_path)),
     );
     options.insert("types", Value::from(device_types));
+    let portal_version = remote_proxy.get_property::<u32>("version").await.unwrap_or(1);
+    if portal_version >= 2 {
+        options.insert("persist_mode", Value::from(PERSIST_MODE_EXPLICITLY_REVOKED));
+        if let Some(token) = restore_token {
+            options.insert("restore_token", Value::from(token));
+        }
+    }
 
     let handle: OwnedObjectPath = remote_proxy
         .call("SelectDevices", &(session, options))
@@ -242,10 +274,15 @@ async fn select_devices(
     Ok(())
 }
 
+struct StartedSession {
+    devices: u32,
+    restore_token: Option<String>,
+}
+
 async fn start_remote_desktop_session(
     connection: &Connection,
     session: &OwnedObjectPath,
-) -> Result<u32> {
+) -> Result<StartedSession> {
     let remote_proxy = remote_desktop_proxy(connection).await?;
     let (request_path, mut response_stream) = portal_request_stream(connection, "rd_start").await?;
     let mut options: HashMap<&str, Value<'_>> = HashMap::new();
@@ -268,7 +305,15 @@ async fn start_remote_desktop_session(
         .get("devices")
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or_default();
-    Ok(devices)
+    let restore_token = results
+        .get("restore_token")
+        .and_then(|value| value.try_clone().ok())
+        .and_then(|value| String::try_from(value).ok())
+        .filter(|token| valid_restore_token(token));
+    Ok(StartedSession {
+        devices,
+        restore_token,
+    })
 }
 
 async fn notify_pointer_axis_discrete(
@@ -404,13 +449,134 @@ fn request_token(prefix: &str) -> String {
         'a'..='z' | 'A'..='Z' | '0'..='9' | '_' => ch,
         _ => '_',
     })
-    .collect()
+        .collect()
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RestoreTokenFile {
+    version: u8,
+    token: String,
+}
+
+fn restore_token_path() -> PathBuf {
+    let root = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("computer-use-linux-state"));
+    root.join("computer-use-linux/remote-desktop-restore-token.json")
+}
+
+fn valid_restore_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= MAX_RESTORE_TOKEN_BYTES && !token.contains('\0')
+}
+
+fn prepare_private_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("restore-token path had no parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", parent.display()))
+}
+
+fn restore_token_lock(path: &Path) -> Result<fs::File> {
+    prepare_private_parent(path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("failed to lock {}", path.display()))?;
+    Ok(file)
+}
+
+fn read_restore_token(path: &Path) -> Result<Option<String>> {
+    let serialized = match fs::read(path) {
+        Ok(serialized) => serialized,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    if serialized.len() > MAX_RESTORE_TOKEN_BYTES + 128 {
+        return Ok(None);
+    }
+    let record: RestoreTokenFile = match serde_json::from_slice(&serialized) {
+        Ok(record) => record,
+        Err(_) => return Ok(None),
+    };
+    Ok((record.version == 1 && valid_restore_token(&record.token)).then_some(record.token))
+}
+
+fn update_restore_token(path: &Path, consumed_old: bool, replacement: Option<&str>) -> Result<()> {
+    let replacement = replacement.filter(|token| valid_restore_token(token));
+    let Some(token) = replacement else {
+        if consumed_old {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to remove {}", path.display()));
+                }
+            }
+        }
+        return Ok(());
+    };
+
+    prepare_private_parent(path)?;
+    let serialized = serde_json::to_vec(&RestoreTokenFile {
+        version: 1,
+        token: token.to_string(),
+    })?;
+    let suffix = request_token("restore_token");
+    let temporary = path.with_extension(format!("tmp.{suffix}"));
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        file.write_all(&serialized)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", temporary.display()))?;
+        fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "failed to replace restore token {} with {}",
+                path.display(),
+                temporary.display()
+            )
+        })?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    write_result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use xkeysym::key;
+
+    fn restore_token_test_path(label: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "computer-use-linux-{label}-{}-{}",
+                std::process::id(),
+                request_token("test")
+            ))
+            .join("restore-token.json")
+    }
 
     #[test]
     fn keysyms_for_url_text_round_trips_to_literal_characters() {
@@ -458,5 +624,53 @@ mod tests {
             .to_string();
 
         assert!(error.contains("U+FDD0"));
+    }
+
+    #[test]
+    fn restore_tokens_rotate_atomically_and_are_private() {
+        let path = restore_token_test_path("portal-restore-token");
+        update_restore_token(&path, false, Some("first-token")).expect("write first token");
+        assert_eq!(
+            read_restore_token(&path).expect("read first token"),
+            Some("first-token".to_string())
+        );
+        assert_eq!(
+            fs::metadata(path.parent().expect("parent"))
+                .expect("parent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("token metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        update_restore_token(&path, true, Some("second-token")).expect("rotate token");
+        assert_eq!(
+            read_restore_token(&path).expect("read second token"),
+            Some("second-token".to_string())
+        );
+        update_restore_token(&path, true, None).expect("remove consumed token");
+        assert_eq!(read_restore_token(&path).expect("read removed token"), None);
+        let _ = fs::remove_dir(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn malformed_or_unbounded_restore_tokens_are_ignored() {
+        let path = restore_token_test_path("portal-invalid-token");
+        prepare_private_parent(&path).expect("prepare parent");
+        fs::write(&path, b"not-json").expect("write invalid token");
+        assert_eq!(read_restore_token(&path).expect("read invalid token"), None);
+        assert!(!valid_restore_token(""));
+        assert!(!valid_restore_token(&"x".repeat(MAX_RESTORE_TOKEN_BYTES + 1)));
+        assert!(!valid_restore_token("bad\0token"));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(path.parent().expect("parent"));
     }
 }
