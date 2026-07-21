@@ -2,6 +2,7 @@
 """Exercise capture and targeted input against a real Hyprland session."""
 
 import argparse
+import base64
 import json
 import os
 import signal
@@ -90,8 +91,18 @@ def record(event):
 def activate(application):
     window = Gtk.ApplicationWindow(application=application, title=f"codex-e2e-{role}")
     window.set_default_size(320, 200)
-    button = Gtk.Button(label=f"{role} target")
-    button.connect("clicked", lambda _button: record("click"))
+    color = (1.0, 0.0, 1.0) if role == "target" else (0.0, 1.0, 1.0)
+    canvas = Gtk.DrawingArea()
+
+    def draw(_area, context, _width, _height):
+        context.set_source_rgb(*color)
+        context.paint()
+
+    canvas.set_draw_func(draw)
+    canvas.set_focusable(True)
+    click = Gtk.GestureClick()
+    click.connect("released", lambda *_args: record("click"))
+    canvas.add_controller(click)
     keys = Gtk.EventControllerKey()
     keys.connect(
         "key-pressed",
@@ -101,8 +112,9 @@ def activate(application):
         )[1],
     )
     window.add_controller(keys)
-    window.set_child(button)
+    window.set_child(canvas)
     window.present()
+    canvas.grab_focus()
     record("ready")
 
 app.connect("activate", activate)
@@ -131,6 +143,27 @@ def find_window(env: dict[str, str], title: str) -> dict[str, Any] | None:
 
 def assert_event(path: Path, event: str) -> None:
     wait_for(event, lambda: path.is_file() and event in path.read_text().splitlines())
+
+
+def png_center_rgb(raw: bytes) -> tuple[int, int, int]:
+    import gi
+
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+
+    loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+    loader.write(raw)
+    loader.close()
+    pixbuf = loader.get_pixbuf()
+    if pixbuf is None:
+        raise RuntimeError("decoded PNG has no pixels")
+    channels = pixbuf.get_n_channels()
+    offset = (
+        pixbuf.get_height() // 2 * pixbuf.get_rowstride()
+        + pixbuf.get_width() // 2 * channels
+    )
+    pixels = pixbuf.get_pixels()
+    return tuple(pixels[offset : offset + 3])
 
 
 def main() -> int:
@@ -251,6 +284,12 @@ def main() -> int:
             )
             if capture["content"][1].get("mimeType") != "image/png":
                 raise RuntimeError("exact target capture did not return a PNG")
+            png = base64.b64decode(capture["content"][1]["data"], validate=True)
+            center = png_center_rgb(png)
+            if not (center[0] >= 250 and center[1] <= 5 and center[2] >= 250):
+                raise RuntimeError(
+                    f"exact target capture center was {center}, not target magenta"
+                )
 
             before = {
                 "focus": hypr_json(inner, "activewindow").get("address"),
