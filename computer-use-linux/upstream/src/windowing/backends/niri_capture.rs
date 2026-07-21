@@ -96,9 +96,9 @@ pub(crate) async fn capture_window_exact(window: &WindowInfo) -> Result<RawScree
         .await
         .context("timed out connecting to the session bus for Niri exact capture")?
         .context("failed to connect to the session bus for Niri exact capture")?;
-    let session_path = create_session(&connection).await?;
-    let result = capture_session_window(&connection, &session_path, window_id).await;
-    let stop_result = stop_session(&connection, &session_path).await;
+    let session = ScreenCastSession::new(connection.clone(), create_session(&connection).await?);
+    let result = capture_session_window(&connection, session.path(), window_id).await;
+    let stop_result = session.stop().await;
     let capture = match (result, stop_result) {
         (Ok(capture), Ok(())) => capture,
         (Ok(_), Err(error)) => {
@@ -223,6 +223,48 @@ async fn stop_session(connection: &Connection, session_path: &OwnedObjectPath) -
     .await
     .context("Niri ScreenCast Stop timed out")?
     .context("Niri ScreenCast Stop failed")
+}
+
+struct ScreenCastSession {
+    connection: Option<Connection>,
+    path: OwnedObjectPath,
+}
+
+impl ScreenCastSession {
+    fn new(connection: Connection, path: OwnedObjectPath) -> Self {
+        Self {
+            connection: Some(connection),
+            path,
+        }
+    }
+
+    fn path(&self) -> &OwnedObjectPath {
+        &self.path
+    }
+
+    async fn stop(mut self) -> Result<()> {
+        let connection = self
+            .connection
+            .as_ref()
+            .context("Niri ScreenCast cleanup connection disappeared")?;
+        stop_session(connection, &self.path).await?;
+        self.connection.take();
+        Ok(())
+    }
+}
+
+impl Drop for ScreenCastSession {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        let path = self.path.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(async move {
+                let _ = stop_session(&connection, &path).await;
+            }));
+        }
+    }
 }
 
 async fn capture_pipewire_frame(node_id: u32) -> Result<RawScreenshotCapture> {
