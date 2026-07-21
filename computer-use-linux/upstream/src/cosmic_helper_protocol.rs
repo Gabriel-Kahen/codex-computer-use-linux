@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "name", rename_all = "kebab-case")]
@@ -7,7 +8,13 @@ pub enum CosmicServiceCommand {
     Probe,
     ListWindows,
     FocusedWindow,
-    ActivateWindow { window_id: u64 },
+    ActivateWindow {
+        window_id: u64,
+    },
+    CaptureWindow {
+        window_id: u64,
+        output_path: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

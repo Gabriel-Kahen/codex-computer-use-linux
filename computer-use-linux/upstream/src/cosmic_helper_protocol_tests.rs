@@ -19,6 +19,27 @@ fn service_protocol_round_trips_activation_requests() {
 }
 
 #[test]
+fn service_protocol_round_trips_capture_requests() {
+    let request = CosmicServiceRequest {
+        id: 10,
+        command: CosmicServiceCommand::CaptureWindow {
+            window_id: 42,
+            output_path: "/tmp/cosmic.png".into(),
+        },
+    };
+    let json = serde_json::to_string(&request).unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<CosmicServiceRequest>(&json).unwrap(),
+        request
+    );
+    assert_eq!(
+        json,
+        r#"{"id":10,"command":{"name":"capture-window","window_id":42,"output_path":"/tmp/cosmic.png"}}"#
+    );
+}
+
+#[test]
 fn service_errors_do_not_fabricate_results() {
     let response = CosmicServiceResponse::error(3, "bad request");
     let value = serde_json::to_value(response).unwrap();

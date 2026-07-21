@@ -1,7 +1,8 @@
+use crate::cosmic_helper;
 use crate::screenshot::RawScreenshotCapture;
 use crate::screenshot_impl::{read_png_as_capture_inner, temp_png_path};
 use crate::windowing::backends::hyprland;
-use crate::windowing::{WindowInfo, HYPRLAND_BACKEND};
+use crate::windowing::{WindowInfo, COSMIC_WAYLAND_BACKEND, HYPRLAND_BACKEND};
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,24 @@ static GRIM_EXACT_CAPTURE: OnceCell<bool> = OnceCell::const_new();
 pub(crate) async fn capture_window_exact(
     window: &WindowInfo,
 ) -> Result<Option<RawScreenshotCapture>> {
+    if window.backend == COSMIC_WAYLAND_BACKEND {
+        let window_id = window.window_id;
+        let temporary = TemporaryCapture::new(temp_png_path("cosmic-window"));
+        let path = temporary.path().to_path_buf();
+        let capture_path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            cosmic_helper::capture_window(window_id, &capture_path)
+        })
+        .await
+        .context("COSMIC exact capture task failed")??;
+        let capture = tokio::task::spawn_blocking(move || {
+            read_png_as_capture_inner(&path, "cosmic-ext-image-copy-exact")
+        })
+        .await
+        .context("exact screenshot decode task failed")??;
+        return Ok(Some(capture));
+    }
+
     if window.backend != HYPRLAND_BACKEND || !grim_supports_exact_capture().await {
         return Ok(None);
     }

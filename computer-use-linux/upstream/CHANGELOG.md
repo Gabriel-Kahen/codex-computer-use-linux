@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - COSMIC activation now succeeds only after the compositor reports the target
   focused; the previous short-lived synthetic focus marker has been removed.
 
+### Added
+- COSMIC can capture an inactive window directly through the compositor's
+  foreign-toplevel image-copy protocols. The helper revalidates the stable
+  toplevel handle, rejects stale or minimized targets, bounds SHM allocation,
+  and fails closed instead of substituting a desktop crop.
+
 ## [0.5.0] - 2026-07-16
 
 ### Changed

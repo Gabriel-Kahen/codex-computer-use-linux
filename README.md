@@ -31,11 +31,11 @@ on that desktop.
 - **Target the right window.** Supported backends can discover compositor
   windows, focus or claim an exact window, and verify targeted keyboard input.
 - **Work in the background where the desktop allows it.** Hyprland can capture
-  inactive windows and target shortcuts and pointer actions at them. Plasma and
-  X11 can capture inactive windows but use the shared desktop seat for reliable
-  input. GNOME generally needs to focus a window for exact capture or simulated
-  input. Accessibility actions can avoid focus on every backend when the
-  application exposes the required AT-SPI interfaces.
+  inactive windows and target shortcuts and pointer actions at them. COSMIC,
+  Plasma, and X11 can capture inactive windows but use the shared desktop seat
+  for reliable input. GNOME generally needs to focus a window for exact capture
+  or simulated input. Accessibility actions can avoid focus on every backend
+  when the application exposes the required AT-SPI interfaces.
 - **Coordinate parallel agents.** The Hyprland, GNOME, Plasma, and X11 backends
   let each agent reserve a window so agents can work on different apps without
   racing each other. Actions that use the shared keyboard or pointer stay
@@ -74,7 +74,7 @@ application APIs such as browser automation, D-Bus, or OBS WebSocket.
 | [KDE Plasma](./contrib/plasma-same-session-computer-use/)  | **Yes**                      | **Application-dependent** | **No**                   | **No**                 |
 | [Generic X11/EWMH](./contrib/x11-background-computer-use/) | **Usually**                  | **Application-dependent** | **Best effort**          | **No reliable path**   |
 | Niri                                                       | **No dedicated path**        | **Application-dependent** | **No dedicated path**    | **No dedicated path**  |
-| COSMIC Wayland                                             | **No dedicated path**        | **Application-dependent** | **No dedicated path**    | **No dedicated path**  |
+| COSMIC Wayland                                             | **Yes**                      | **Application-dependent** | **No dedicated path**    | **No dedicated path**  |
 | i3                                                         | **No dedicated path**        | **Application-dependent** | **No dedicated path**    | **No dedicated path**  |
 
 In practical terms:
@@ -99,10 +99,14 @@ In practical terms:
   lease focuses the target and restores desktop, focus, pointer, and minimized
   state. Exact capture requires a mapped window; minimized windows must first
   be restored.
-- **Niri, COSMIC, and i3** provide window discovery, focus, accessibility, and
-  shared input through the generic engine, without the stronger per-window
-  background-control and recovery guarantees of the companion integrations.
-  Compatible i3/EWMH sessions may instead use the X11 companion.
+- **COSMIC** provides exact inactive-window capture through its compositor's
+  foreign-toplevel image-copy protocols. The persistent helper revalidates the
+  stable toplevel identity and rejects stale or minimized windows; it never
+  substitutes a desktop crop. Keyboard and pointer input still use the shared
+  seat and may require focus.
+- **Niri and i3** provide window discovery, focus, accessibility, and shared
+  input through the generic engine, without stronger per-window background
+  control. Compatible i3/EWMH sessions may instead use the X11 companion.
 
 ### Declared targets
 
@@ -118,7 +122,8 @@ In practical terms:
   MATE, LXQt/Openbox, and legacy GNOME or KDE sessions.
 - **Niri:** requires `NIRI_SOCKET` and working `niri msg` access.
 - **COSMIC Wayland:** uses the bundled persistent `computer-use-linux-cosmic`
-  helper, with automatic restart and a compatible one-shot fallback.
+  helper and requires the compositor's version-1 foreign-toplevel image-capture
+  source and image-copy-capture protocols for exact background capture.
 - **i3:** requires `i3-msg`; `xprop` adds process details when available.
 
 Real behavior depends on the portal, accessibility, compositor, and input

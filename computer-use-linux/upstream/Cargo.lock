@@ -334,6 +334,7 @@ dependencies = [
  "futures-util",
  "image",
  "mimalloc",
+ "polling",
  "rmcp",
  "schemars",
  "serde",
