@@ -20,6 +20,7 @@ use crate::attestation::AttestationProvider;
 use crate::audio_preparation::prepare_response_items as prepare_audio_response_items;
 use crate::build_available_skills;
 use crate::compact;
+use crate::compact::CompactedHistoryMetadata;
 use crate::config::ManagedFeatures;
 use crate::config::resolve_tool_suggest_config_from_layer_stack;
 use crate::context::ApprovedCommandPrefixSaved;
@@ -1336,9 +1337,16 @@ impl Session {
                     state.set_token_info(Some(info));
                 }
 
-                // Paginated subagents persist inherited model context while creating the live
-                // thread so the copied prefix is not observed as child-owned metadata.
-                if !rollout_items.is_empty() && !is_paginated_subagent {
+                let thread_settings_applied =
+                    RolloutItem::EventMsg(handlers::thread_settings_applied_event(self).await);
+                if is_paginated_subagent {
+                    // Paginated subagents persist inherited model context while creating the live
+                    // thread so the copied prefix is not observed as child-owned metadata.
+                    self.persist_rollout_items(&[thread_settings_applied]).await;
+                } else {
+                    // Keep the copied prefix and the child's effective settings in one append so a
+                    // cold resume cannot observe inherited settings as the child's latest value.
+                    rollout_items.push(thread_settings_applied);
                     self.persist_rollout_items(&rollout_items).await;
                 }
 
@@ -3045,7 +3053,7 @@ impl Session {
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<Arc<WorldState>>,
-        compacted_item: CompactedItem,
+        metadata: CompactedHistoryMetadata,
     ) {
         let items = if turn_context.item_ids_enabled() {
             Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned()
@@ -3053,8 +3061,15 @@ impl Session {
             items
         };
         let compacted_item = CompactedItem {
+            message: metadata.message,
             replacement_history: Some(items.clone()),
-            ..compacted_item
+            window_number: Some(metadata.window_number),
+            first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
+            previous_window_id: metadata
+                .window_ids
+                .previous_window_id
+                .map(|id| id.to_string()),
+            window_id: Some(metadata.window_ids.window_id.to_string()),
         };
         // Compaction starts a new history window, so its WorldState baseline must be full.
         let mut world_state_item = None;
@@ -3145,8 +3160,9 @@ impl Session {
 
     async fn build_turn_context_contribution_items(
         &self,
-        turn_context: &TurnContext,
+        step_context: &StepContext,
     ) -> Vec<ResponseItem> {
+        let turn_context = step_context.turn.as_ref();
         let mut developer_sections = Vec::new();
         let mut contextual_user_sections = Vec::new();
         let mut separate_developer_sections = Vec::new();
@@ -3160,6 +3176,7 @@ impl Session {
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
+                    step_store: &step_context.extension_data,
                     model_context_window: turn_context.model_context_window(),
                 })
                 .await
@@ -3194,21 +3211,29 @@ impl Session {
         items
     }
 
+    #[cfg(test)]
     pub(crate) async fn build_initial_context_with_world_state(
         &self,
         turn_context: &TurnContext,
         world_state: &WorldState,
     ) -> Vec<ResponseItem> {
         let mcp = self.services.latest_mcp_runtime();
-        self.build_initial_context_with_world_state_and_mcp(turn_context, world_state, &mcp)
-            .await
+        let step_store = codex_extension_api::ExtensionData::new(turn_context.sub_id.clone());
+        self.build_initial_context_with_world_state_and_mcp(
+            turn_context,
+            world_state,
+            &mcp,
+            &step_store,
+        )
+        .await
     }
 
-    async fn build_initial_context_with_world_state_and_mcp(
+    pub(crate) async fn build_initial_context_with_world_state_and_mcp(
         &self,
         turn_context: &TurnContext,
         world_state: &WorldState,
         mcp: &McpRuntimeSnapshot,
+        step_store: &codex_extension_api::ExtensionData,
     ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
@@ -3323,6 +3348,7 @@ impl Session {
                 .contribute_thread_context(
                     &self.services.session_extension_data,
                     &self.services.thread_extension_data,
+                    step_store,
                 )
                 .await
             {
@@ -3342,6 +3368,7 @@ impl Session {
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
+                    step_store,
                     model_context_window: turn_context.model_context_window(),
                 })
                 .await
@@ -3502,16 +3529,22 @@ impl Session {
 
     pub(crate) async fn start_new_context_window(
         &self,
-        turn_context: &TurnContext,
+        step_context: &StepContext,
         world_state: Arc<WorldState>,
     ) -> u64 {
+        let turn_context = step_context.turn.as_ref();
         let window = {
             let mut state = self.state.lock().await;
             state.start_new_context_window()
         };
         let (window_number, window_ids) = window;
         let context_items = self
-            .build_initial_context_with_world_state(turn_context, world_state.as_ref())
+            .build_initial_context_with_world_state_and_mcp(
+                turn_context,
+                world_state.as_ref(),
+                step_context.mcp.as_ref(),
+                &step_context.extension_data,
+            )
             .await;
         let turn_context_item = turn_context.to_turn_context_item();
         self.replace_compacted_history(
@@ -3519,13 +3552,10 @@ impl Session {
             context_items,
             Some(turn_context_item),
             Some(world_state),
-            CompactedItem {
+            CompactedHistoryMetadata {
                 message: String::new(),
-                replacement_history: None,
-                window_number: Some(window_number),
-                first_window_id: Some(window_ids.first_window_id.to_string()),
-                previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
-                window_id: Some(window_ids.window_id.to_string()),
+                window_number,
+                window_ids,
             },
         )
         .await;
@@ -3572,6 +3602,7 @@ impl Session {
                     turn_context,
                     world_state.as_ref(),
                     step_context.mcp.as_ref(),
+                    &step_context.extension_data,
                 )
                 .await;
             let snapshot = world_state.snapshot();
@@ -3604,7 +3635,7 @@ impl Session {
         };
         if !should_inject_full_context && turn_context_changed {
             context_items.extend(
-                self.build_turn_context_contribution_items(turn_context)
+                self.build_turn_context_contribution_items(step_context)
                     .await,
             );
         }
