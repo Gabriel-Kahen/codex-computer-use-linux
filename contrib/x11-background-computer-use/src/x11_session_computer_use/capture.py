@@ -51,7 +51,11 @@ def _native_launcher() -> Path | None:
 
 
 def native_transport_available() -> bool:
-    return _native_launcher() is not None
+    return (
+        bool(os.environ.get("DISPLAY"))
+        and os.environ.get("CODEX_X11_NATIVE_CAPTURE", "1") != "0"
+        and _native_launcher() is not None
+    )
 
 
 def _stop_native_transport() -> None:
@@ -74,6 +78,11 @@ def _start_native_transport() -> subprocess.Popen[bytes]:
     if _native_owner_pid is not None and _native_owner_pid != os.getpid():
         # A fork inherited the file descriptors, but it must not share a
         # request stream or terminate the parent's worker.
+        inherited = _native_process
+        if inherited is not None:
+            for stream in (inherited.stdin, inherited.stdout):
+                if stream is not None:
+                    stream.close()
         _native_process = None
         _native_owner_pid = None
     if _native_process is not None and _native_process.poll() is None:
@@ -136,7 +145,9 @@ def _native_request(request: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
             header = json.loads(_readline_with_deadline(process.stdout, deadline))
             if (
                 not isinstance(header, dict)
-                or header.get("protocol") != 1
+                or type(header.get("protocol")) is not int
+                or header["protocol"] != 1
+                or type(header.get("ok")) is not bool
                 or isinstance(header.get("bytes"), bool)
                 or not isinstance(header.get("bytes"), int)
                 or not 0 <= header["bytes"] <= MAX_CAPTURE_BYTES

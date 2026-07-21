@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +53,31 @@ class CaptureBuildTests(TestCase):
         with tempfile.TemporaryDirectory() as temporary, patch.object(capture, "CACHE_ROOT", Path(temporary)), patch.object(capture, "build_requirements", return_value={"cc": False, "pkg-config": True}):
             with self.assertRaisesRegex(RuntimeError, "cc"):
                 capture.ensure_capture_helper()
+
+
+class NativeTransportTests(TestCase):
+    def tearDown(self) -> None:
+        capture._native_process = None
+        capture._native_owner_pid = None
+
+    def test_forked_process_closes_inherited_worker_pipes(self) -> None:
+        inherited = Mock()
+        inherited.stdin = Mock()
+        inherited.stdout = Mock()
+        capture._native_process = inherited
+        capture._native_owner_pid = os.getpid() + 1
+
+        with patch.object(capture, "_native_launcher", return_value=None):
+            with self.assertRaises(capture.NativeTransportUnavailable):
+                capture._start_native_transport()
+
+        inherited.stdin.close.assert_called_once_with()
+        inherited.stdout.close.assert_called_once_with()
+
+    def test_availability_honors_runtime_disable_switch(self) -> None:
+        with patch.object(capture, "_native_launcher", return_value=Path("/worker")):
+            with patch.dict(os.environ, {"DISPLAY": ":1", "CODEX_X11_NATIVE_CAPTURE": "0"}):
+                self.assertFalse(capture.native_transport_available())
 
 
 class BrokerCaptureTests(TestCase):

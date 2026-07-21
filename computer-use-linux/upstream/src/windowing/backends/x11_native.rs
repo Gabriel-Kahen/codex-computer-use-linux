@@ -91,6 +91,7 @@ struct NativeSession {
     compositor_selection: Atom,
     composite_supported: Option<bool>,
     res_supported: Option<bool>,
+    healthy: bool,
 }
 
 pub(super) fn probe() -> Result<String> {
@@ -142,7 +143,9 @@ fn with_session<T>(operation: impl FnOnce(&mut NativeSession) -> Result<T>) -> R
         *guard = Some(NativeSession::connect(display)?);
     }
     let result = operation(guard.as_mut().expect("native X11 session initialized"));
-    if result.as_ref().is_err_and(is_connection_failure) {
+    if guard.as_ref().is_some_and(|session| !session.healthy)
+        || result.as_ref().is_err_and(is_connection_failure)
+    {
         *guard = None;
     }
     result
@@ -206,6 +209,7 @@ impl NativeSession {
             compositor_selection,
             composite_supported: None,
             res_supported: None,
+            healthy: true,
         })
     }
 
@@ -345,6 +349,7 @@ impl NativeSession {
         let window_width = geometry.width;
         let window_height = geometry.height;
         let window_border = geometry.border_width;
+        let window_depth = geometry.depth;
         if let Some((expected_width, expected_height)) = expected_size {
             if u32::from(geometry.width) != expected_width
                 || u32::from(geometry.height) != expected_height
@@ -372,8 +377,14 @@ impl NativeSession {
         let pixmap = match self.connection.generate_id() {
             Ok(pixmap) => pixmap,
             Err(error) => {
-                self.release_capture_redirect(window)
-                    .context("failed to release X11 capture redirection after ID allocation")?;
+                if let Err(cleanup_error) = self
+                    .release_capture_redirect(window)
+                    .context("failed to release X11 capture redirection after ID allocation")
+                {
+                    self.healthy = false;
+                    return Err(cleanup_error);
+                }
+                self.healthy = false;
                 return Err(error.into());
             }
         };
@@ -386,11 +397,14 @@ impl NativeSession {
             let pixmap_height = u32::from(window_height) + u32::from(window_border) * 2;
             if u32::from(geometry.width) != pixmap_width
                 || u32::from(geometry.height) != pixmap_height
+                || geometry.depth != window_depth
             {
                 bail!(
-                    "X11 window pixmap changed size during capture (expected {pixmap_width}x{pixmap_height}, found {}x{})",
+                    "X11 window pixmap geometry changed during capture (expected {pixmap_width}x{pixmap_height} depth {}, found {}x{} depth {})",
+                    window_depth,
                     geometry.width,
-                    geometry.height
+                    geometry.height,
+                    geometry.depth
                 );
             }
             let pixel_count = u64::from(window_width) * u64::from(window_height);
@@ -408,12 +422,20 @@ impl NativeSession {
                 window_width,
                 window_height,
             )?;
+            let final_attributes = self.connection.get_window_attributes(window)?.reply()?;
             let final_geometry = self.connection.get_geometry(window)?.reply()?;
             if final_geometry.width != window_width
                 || final_geometry.height != window_height
                 || final_geometry.border_width != window_border
+                || final_attributes.visual != attributes.visual
             {
                 bail!("X11 window bounds changed during capture for window 0x{window:08x}");
+            }
+            if final_attributes.map_state != MapState::VIEWABLE {
+                bail!("X11 window 0x{window:08x} was unmapped during capture");
+            }
+            if !self.client_windows()?.contains(&window) {
+                bail!("X11 window 0x{window:08x} left the EWMH client list during capture");
             }
             let final_pid = self.authenticated_pid(window)?;
             if final_pid != authenticated_pid {
@@ -430,14 +452,18 @@ impl NativeSession {
         let free_result = (|| -> Result<()> {
             self.connection.free_pixmap(pixmap)?.check()?;
             Ok(())
-        })();
+        })()
+        .context("failed to release X11 capture pixmap");
         let unredirect_result = self.release_capture_redirect(window);
         let flush_result = self.connection.flush();
-        let pixels = capture_result?;
-        free_result.context("failed to release X11 capture pixmap")?;
-        unredirect_result.context("failed to release X11 capture redirection")?;
-        flush_result.context("failed to flush X11 capture cleanup")?;
-        Ok(Some(pixels))
+        let cleanup_result = free_result
+            .and(unredirect_result.context("failed to release X11 capture redirection"))
+            .and(flush_result.context("failed to flush X11 capture cleanup"));
+        if let Err(error) = cleanup_result {
+            self.healthy = false;
+            return Err(error);
+        }
+        capture_result.map(Some)
     }
 
     fn release_capture_redirect(&self, window: Window) -> Result<()> {

@@ -40,9 +40,7 @@ pub(crate) async fn capture_window_exact(
     }
 }
 
-async fn capture_x11_window_exact(
-    window: &WindowInfo,
-) -> Result<Option<RawScreenshotCapture>> {
+async fn capture_x11_window_exact(window: &WindowInfo) -> Result<Option<RawScreenshotCapture>> {
     let window_id = window.window_id;
     let expected_pid = window.pid;
     let expected_size = window
