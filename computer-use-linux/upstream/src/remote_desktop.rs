@@ -254,7 +254,10 @@ async fn select_devices(
         Value::from(last_path_component(&request_path)),
     );
     options.insert("types", Value::from(device_types));
-    let portal_version = remote_proxy.get_property::<u32>("version").await.unwrap_or(1);
+    let portal_version = remote_proxy
+        .get_property::<u32>("version")
+        .await
+        .unwrap_or(1);
     if portal_version >= 2 {
         options.insert("persist_mode", Value::from(PERSIST_MODE_EXPLICITLY_REVOKED));
         if let Some(token) = restore_token {
@@ -449,7 +452,7 @@ fn request_token(prefix: &str) -> String {
         'a'..='z' | 'A'..='Z' | '0'..='9' | '_' => ch,
         _ => '_',
     })
-        .collect()
+    .collect()
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -461,9 +464,7 @@ struct RestoreTokenFile {
 fn restore_token_path() -> PathBuf {
     let root = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .unwrap_or_else(|| std::env::temp_dir().join("computer-use-linux-state"));
     root.join("computer-use-linux/remote-desktop-restore-token.json")
 }
@@ -476,8 +477,7 @@ fn prepare_private_parent(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .context("restore-token path had no parent directory")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("failed to secure {}", parent.display()))
 }
@@ -668,7 +668,9 @@ mod tests {
         fs::write(&path, b"not-json").expect("write invalid token");
         assert_eq!(read_restore_token(&path).expect("read invalid token"), None);
         assert!(!valid_restore_token(""));
-        assert!(!valid_restore_token(&"x".repeat(MAX_RESTORE_TOKEN_BYTES + 1)));
+        assert!(!valid_restore_token(
+            &"x".repeat(MAX_RESTORE_TOKEN_BYTES + 1)
+        ));
         assert!(!valid_restore_token("bad\0token"));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(path.parent().expect("parent"));
