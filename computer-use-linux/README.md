@@ -45,7 +45,17 @@ both Codex-branded binaries and a `SHA256SUMS` manifest. The launcher verifies
 that manifest before executing a release binary and fails closed if the bundle
 is incomplete or modified. Source checkouts keep the existing locked Cargo
 build behavior; `CODEX_COMPUTER_USE_LINUX_BUILD_FROM_SOURCE=1` explicitly uses
-that path from a release bundle.
+that path from a release bundle. Tagged archives also have GitHub build
+provenance attestations. After downloading an archive and its matching
+`.sha256` file, verify both its bytes and provenance before extraction:
+
+```shell
+sha256sum --check codex-computer-use-linux-*.tar.gz.sha256
+gh attestation verify codex-computer-use-linux-*.tar.gz \
+  --repo Gabriel-Kahen/codex-computer-use-linux \
+  --signer-workflow \
+  Gabriel-Kahen/codex-computer-use-linux/.github/workflows/computer-use-prebuilt-release.yml
+```
 
 The isolated Chrome host is optional and is not started by the MCP plugin:
 
@@ -77,10 +87,11 @@ Bump `PREBUILT_VERSION` and `.codex-plugin/plugin.json` together, merge the
 validated change, and tag that commit with `computer-use-v<version>`. The
 `computer-use-prebuilt-release` workflow builds both supported architectures on
 Ubuntu 22.04, assembles minimal marketplace archives, smoke-tests the x86_64
-archive without Cargo, and publishes each archive with its SHA-256 file. Uploads
-remain in a retryable draft until every asset is present, then the workflow
-publishes without changing the repository-wide latest release. It rejects a tag
-that does not exactly match the plugin version.
+archive without Cargo, verifies each archive's SHA-256 file after artifact
+transfer, and records signed build provenance for each archive before release.
+Uploads remain in a retryable draft until every asset is present, then the
+workflow publishes without changing the repository-wide latest release. It
+rejects a tag that does not exactly match the plugin version.
 
 ## Upstream maintenance
 
