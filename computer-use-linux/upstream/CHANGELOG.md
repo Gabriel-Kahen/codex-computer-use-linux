@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback.
 
 ### Changed
+- Plasma/KWin window observations now call `org.kde.KWin.ScreenShot2.CaptureWindow`
+  directly from Rust, with bounded FD transport and QImage-to-PNG conversion. This
+  removes the per-capture Qt helper process and preserves compositor-native capture
+  for inactive windows.
+- RemoteDesktop pointer sessions can now share a ScreenCast selection and map
+  logical AT-SPI/window coordinates to the correct monitor stream for portal
+  clicks and targeted scrolling. Raw screenshot coordinates, including drag
+  coordinates, continue to fail closed when no safe transform exists.
 - **Breaking:** Element-targeted `scroll` calls now require the originating
   `observation_id` alongside `element_index`. Coordinate scrolls must provide
   both `x` and `y` and cannot be combined with `element_index`.

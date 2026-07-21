@@ -184,14 +184,14 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
     BackendDescriptor {
         id: KWIN_BACKEND,
         failure_label: "KWin",
-        list_note: "Window list came from KWin/Plasma DBus scripting. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
+        list_note: "Window list came from the process-lifetime KWin/Plasma DBus bridge. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On KDE/Plasma, ensure KWin exposes org.kde.KWin scripting on the session bus.",
         can_exact_focus: true,
         #[cfg(test)]
         support: BackendSupport {
             desktop_session: "KDE Plasma / KWin",
-            window_backend: "temporary KWin DBus scripting",
-            notes: "Lists and focuses windows through `org.kde.KWin` scripting when the session bus exposes it.",
+            window_backend: "persistent KWin DBus window bridge",
+            notes: "Keeps one event-driven Plasma 5/6 window snapshot bridge loaded for the MCP process and reloads it when the `org.kde.KWin` bus owner changes; focus actions still use short-lived scripts. Exact target capture calls `org.kde.KWin.ScreenShot2` directly from Rust, including inactive windows, without a screenshot helper process.",
         },
     },
     BackendDescriptor {
