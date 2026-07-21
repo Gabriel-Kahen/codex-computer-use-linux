@@ -469,10 +469,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (std::string{__hyprland_api_get_hash()} != std::string{__hyprland_api_get_client_hash()})
         throw std::runtime_error("same-session-target-pointer: Hyprland header/runtime version mismatch");
 
-    const auto command = HyprlandAPI::registerHyprCtlCommand(
-        PHANDLE, SHyprCtlCommand{.name = "cutarget", .exact = false, .fn = handleRequest});
-    if (!command) throw std::runtime_error("same-session-target-pointer: failed to register cutarget command");
-
+    // Hyprland dispatches non-exact commands by registration order. Register
+    // the longer command before the legacy `cutarget` prefix so a batch can
+    // never be consumed by the single-action parser.
     const auto batchCommand = HyprlandAPI::registerHyprCtlCommand(
         PHANDLE, SHyprCtlCommand{.name = "cutargetbatch", .exact = false, .fn = handleBatchRequest});
     if (!batchCommand) throw std::runtime_error("same-session-target-pointer: failed to register cutargetbatch command");
@@ -480,6 +479,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     const auto statusCommand = HyprlandAPI::registerHyprCtlCommand(
         PHANDLE, SHyprCtlCommand{.name = "cutargetstatus", .exact = true, .fn = handleStatus});
     if (!statusCommand) throw std::runtime_error("same-session-target-pointer: failed to register cutargetstatus command");
+
+    const auto command = HyprlandAPI::registerHyprCtlCommand(
+        PHANDLE, SHyprCtlCommand{.name = "cutarget", .exact = false, .fn = handleRequest});
+    if (!command) throw std::runtime_error("same-session-target-pointer: failed to register cutarget command");
 
     return {"same-session-target-pointer", "Atomic window-targeted pointer events without cursor movement", "Gabe", CU_PLUGIN_VERSION};
 }

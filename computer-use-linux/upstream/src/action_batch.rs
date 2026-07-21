@@ -113,17 +113,6 @@ impl ActionBatchOutput {
     }
 }
 
-pub(crate) async fn execute_action_batch<F, Fut>(
-    params: ActionBatchParams,
-    run_action: F,
-) -> ActionBatchOutput
-where
-    F: FnMut(BatchAction, u64) -> Fut,
-    Fut: Future<Output = BatchActionRun>,
-{
-    execute_action_batch_with_prefix(params, Vec::new(), run_action).await
-}
-
 pub(crate) async fn execute_action_batch_with_prefix<F, Fut>(
     params: ActionBatchParams,
     mut results: Vec<ActionOutput>,

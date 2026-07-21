@@ -134,12 +134,16 @@ async fn executes_actions_in_order_with_the_exact_inherited_window_id() {
         action_output(true, "third"),
     ]));
 
-    let result = execute_action_batch(batch(actions.clone()), |action, window_id| {
-        calls.borrow_mut().push((window_id, action));
-        ready(BatchActionRun::Completed(
-            outputs.borrow_mut().pop_front().unwrap(),
-        ))
-    })
+    let result = execute_action_batch_with_prefix(
+        batch(actions.clone()),
+        Vec::new(),
+        |action, window_id| {
+            calls.borrow_mut().push((window_id, action));
+            ready(BatchActionRun::Completed(
+                outputs.borrow_mut().pop_front().unwrap(),
+            ))
+        },
+    )
     .await;
 
     assert_eq!(
@@ -185,12 +189,16 @@ async fn stops_after_a_middle_failure_and_reports_completed_actions() {
         action_output(true, "must not run"),
     ]));
 
-    let result = execute_action_batch(batch(actions.clone()), |action, window_id| {
-        calls.borrow_mut().push((window_id, action));
-        ready(BatchActionRun::Completed(
-            outputs.borrow_mut().pop_front().unwrap(),
-        ))
-    })
+    let result = execute_action_batch_with_prefix(
+        batch(actions.clone()),
+        Vec::new(),
+        |action, window_id| {
+            calls.borrow_mut().push((window_id, action));
+            ready(BatchActionRun::Completed(
+                outputs.borrow_mut().pop_front().unwrap(),
+            ))
+        },
+    )
     .await;
 
     assert_eq!(
@@ -275,12 +283,16 @@ async fn stops_before_enter_when_text_landing_feedback_warns() {
         action_output(true, "must not run"),
     ]));
 
-    let result = execute_action_batch(batch(actions.clone()), |action, window_id| {
-        calls.borrow_mut().push((window_id, action));
-        ready(BatchActionRun::text(
-            outputs.borrow_mut().pop_front().unwrap(),
-        ))
-    })
+    let result = execute_action_batch_with_prefix(
+        batch(actions.clone()),
+        Vec::new(),
+        |action, window_id| {
+            calls.borrow_mut().push((window_id, action));
+            ready(BatchActionRun::text(
+                outputs.borrow_mut().pop_front().unwrap(),
+            ))
+        },
+    )
     .await;
 
     assert_eq!(calls.into_inner(), vec![(42, actions[0].clone())]);
@@ -317,7 +329,7 @@ async fn redacts_arguments_and_bounds_the_serialized_batch_output() {
             .collect::<Vec<_>>(),
     ));
 
-    let result = execute_action_batch(batch(actions), |_, _| {
+    let result = execute_action_batch_with_prefix(batch(actions), Vec::new(), |_, _| {
         ready(outputs.borrow_mut().pop_front().unwrap())
     })
     .await;
