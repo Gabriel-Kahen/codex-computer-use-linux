@@ -41,6 +41,13 @@ def window_key(window: dict[str, Any]) -> str:
     return f"address:{address}"
 
 
+def window_lock_key(window: dict[str, Any]) -> str:
+    address = str(window.get("address") or "")
+    if not address:
+        raise RuntimeError("selected window has no compositor address")
+    return f"address:{address}"
+
+
 def _lock_key(binding: dict[str, Any], key: str) -> str:
     return hashlib.sha256(f"{binding_key(binding)}\0{key}".encode()).hexdigest()
 
@@ -55,7 +62,7 @@ def _window_guard_for_key(binding: dict[str, Any], key: str):
 @contextmanager
 def window_guard(binding: dict[str, Any], window: dict[str, Any]):
     """Serialize observe/mutate transactions for one compositor window."""
-    with _window_guard_for_key(binding, window_key(window)):
+    with _window_guard_for_key(binding, window_lock_key(window)):
         yield
 
 
@@ -190,7 +197,8 @@ def claim_window(
         )
     current_time = time.time() if now is None else now
     key = window_key(window)
-    with _window_guard_for_key(binding, key):
+    lock_key = window_lock_key(window)
+    with window_guard(binding, window):
         reserved_by = reservation_owner() if reservation_owner else None
         if reserved_by is not None and reserved_by != owner_thread_id:
             raise RuntimeError("window is reserved by another agent's active coordinate lease")
@@ -198,6 +206,14 @@ def claim_window(
             state = _load_state()
             _prune_expired(state, current_time)
             claims = _session_claims(state, binding, create=True)
+            key = next(
+                (
+                    claimed_window
+                    for claimed_window, candidate in claims.items()
+                    if window_lock_key(candidate.get("window") or {}) == lock_key
+                ),
+                key,
+            )
             existing = claims.get(key)
             if existing and existing.get("owner_thread_id") != owner_thread_id:
                 raise RuntimeError(
@@ -289,7 +305,7 @@ def release_claim(
         if claim.get("owner_thread_id") != owner_thread_id:
             raise RuntimeError("only the agent that owns a live window claim may release it")
 
-    with _window_guard_for_key(binding, key):
+    with _window_guard_for_key(binding, window_lock_key(claim.get("window") or {})):
         with file_guard(CLAIMS_LOCK_FILE):
             state = _load_state()
             _prune_expired(state, current_time)

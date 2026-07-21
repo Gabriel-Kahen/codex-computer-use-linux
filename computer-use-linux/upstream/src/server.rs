@@ -11,6 +11,7 @@ use crate::atspi_tree::{
     snapshot_compact_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
     ActionFingerprint, Bounds, FocusedElementSummary, ValueSetInvocation,
 };
+use crate::claim_coordination::{acquire_claim_guard, ClaimContext, Coordinator};
 use crate::desktop_transaction::DesktopTransaction;
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
@@ -56,7 +57,7 @@ use std::{
     os::unix::net::{UnixDatagram, UnixStream},
     path::PathBuf,
     process::{Command, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -99,6 +100,7 @@ pub struct ComputerUseLinux {
     /// full-frame capture; used for off-screen window/coordinate warnings.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
     diagnostics_cache: Arc<Mutex<DiagnosticsCache>>,
+    claim_coordinator: Arc<OnceLock<Option<Coordinator>>>,
 }
 
 fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
@@ -392,6 +394,16 @@ impl ComputerUseLinux {
         let max_nodes = params.max_nodes.unwrap_or(120).clamp(1, 500);
         let max_depth = params.max_depth.unwrap_or(12).min(12);
         let include_screenshot = params.include_screenshot.unwrap_or(true);
+        let _claim_guard = if include_screenshot {
+            self.acquire_claim_guard(
+                window_context.as_ref().map(|window| window.window_id),
+                &params.claim,
+            )
+            .await
+            .map_err(|error| ErrorData::invalid_params(error, None))?
+        } else {
+            None
+        };
         let screenshot_options = params.screenshot_options();
         let screenshot_target_requested = params.window_target().has_target();
         let screenshot_future = async {
@@ -752,6 +764,17 @@ impl ComputerUseLinux {
     ) -> Result<CallToolResult, ErrorData> {
         let target = params.window_target();
         let full_screen = params.full_screen.unwrap_or(false);
+        let coordination_window_id = if full_screen {
+            None
+        } else {
+            self.coordination_window_id(target.as_ref())
+                .await
+                .map_err(|error| screenshot_failure("claim_coordination", target.as_ref(), error))?
+        };
+        let _claim_guard = self
+            .acquire_claim_guard(coordination_window_id, &params.claim)
+            .await
+            .map_err(|error| screenshot_failure("claim_coordination", target.as_ref(), error))?;
         let raise_window = params.raise_window.unwrap_or(true);
         if let Some(target) = target.as_ref().filter(|_| raise_window) {
             let focus = focus_window_target(target)
@@ -2088,6 +2111,8 @@ struct AppCandidate {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct GetAppStateParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     #[serde(default)]
     app_name_or_bundle_identifier: Option<String>,
     #[serde(default)]
@@ -2213,6 +2238,7 @@ struct PostActionObservationParams {
 impl PostActionObservationParams {
     fn into_get_app_state_params(self, window_id: u64) -> GetAppStateParams {
         GetAppStateParams {
+            claim: ClaimContext::default(),
             app_name_or_bundle_identifier: None,
             window_id: Some(window_id),
             pid: None,
@@ -2259,6 +2285,8 @@ struct ActionBatchAndObserveOutput {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ScreenshotParams {
+    #[serde(flatten)]
+    claim: ClaimContext,
     #[serde(default)]
     window_id: Option<u64>,
     #[serde(default)]
@@ -3305,6 +3333,36 @@ impl ComputerUseLinux {
             notes.push(note);
         }
         notes
+    }
+
+    async fn acquire_claim_guard(
+        &self,
+        window_id: Option<u64>,
+        context: &ClaimContext,
+    ) -> std::result::Result<Option<crate::claim_coordination::ClaimGuard>, String> {
+        let coordinator = self
+            .claim_coordinator
+            .get_or_init(Coordinator::from_env)
+            .clone();
+        acquire_claim_guard(coordinator, window_id, context).await
+    }
+
+    async fn coordination_window_id(
+        &self,
+        target: Option<&WindowTarget>,
+    ) -> std::result::Result<Option<u64>, String> {
+        let Some(target) = target.filter(|target| target.has_target()) else {
+            return Ok(None);
+        };
+        if let Some(window_id) = target.window_id {
+            return Ok(Some(window_id));
+        }
+        let windows = list_windows()
+            .await
+            .map_err(|error| format!("failed to resolve claim window: {error:#}"))?;
+        resolve_window_target(&windows, target)
+            .map(|window| Some(window.window_id))
+            .map_err(|error| format!("failed to resolve claim window: {error:#}"))
     }
 
     fn record_accessibility_snapshot(
@@ -4983,6 +5041,62 @@ mod tests {
     use crate::atspi_tree::{AccessibilityAction, Bounds};
     use crate::windows::{WindowBounds, GNOME_SHELL_EXTENSION_BACKEND};
 
+    fn backend_with_live_claim(window_id: u64) -> (ComputerUseLinux, PathBuf) {
+        let root = env::temp_dir().join(format!(
+            "computer-use-linux-server-claim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let binding = std::collections::BTreeMap::from([
+            (
+                "hyprland_instance".to_string(),
+                serde_json::json!("instance"),
+            ),
+            ("uid".to_string(), serde_json::json!(1000)),
+            (
+                "wayland_display".to_string(),
+                serde_json::json!("wayland-1"),
+            ),
+            (
+                "xdg_runtime_dir".to_string(),
+                serde_json::json!("/run/user/1000"),
+            ),
+        ]);
+        let coordinator = Coordinator {
+            state_dir: root.clone(),
+            binding,
+        };
+        let session = coordinator.binding_key();
+        let state = serde_json::json!({
+            "version": 1,
+            "sessions": {
+                session: {
+                    "binding": coordinator.binding,
+                    "claims": {
+                        "capture:test": {
+                            "owner_thread_id": "owner-a",
+                            "claim_token": "token-a",
+                            "expires_at": f64::MAX,
+                            "window": {"address": format!("0x{window_id:x}")}
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            root.join("window-claims.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let backend = ComputerUseLinux::default();
+        assert!(backend.claim_coordinator.set(Some(coordinator)).is_ok());
+        (backend, root)
+    }
+
     fn cache_observation(backend: &ComputerUseLinux, nodes: &[AccessibilityNode]) -> String {
         backend.record_accessibility_snapshot(AccessibilitySnapshotTarget::Desktop, nodes)
     }
@@ -5080,7 +5194,7 @@ mod tests {
         };
 
         assert_eq!(
-            serde_json::to_value(observation.into_get_app_state_params(42)).unwrap(),
+            serde_json::to_value(observation.into_get_app_state_params(42),).unwrap(),
             serde_json::json!({
                 "app_name_or_bundle_identifier": null,
                 "window_id": 42,
@@ -5259,6 +5373,68 @@ mod tests {
                 .as_array()
                 .is_some_and(|required| required.iter().any(|field| field == "observation_id")));
         }
+    }
+
+    #[test]
+    fn capture_tools_expose_shared_claim_credentials() {
+        let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
+        for name in ["get_app_state", "screenshot"] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            assert!(
+                schema["properties"].get("owner_thread_id").is_some(),
+                "{name}"
+            );
+            assert!(schema["properties"].get("claim_token").is_some(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn screenshot_route_rejects_foreign_claim_credentials() {
+        let window_id = u64::MAX;
+        let (backend, root) = backend_with_live_claim(window_id);
+        let error = backend
+            .screenshot(Parameters(ScreenshotParams {
+                window_id: Some(window_id),
+                claim: ClaimContext {
+                    owner_thread_id: Some("owner-b".to_string()),
+                    claim_token: Some("token-b".to_string()),
+                },
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("actively claimed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn screenshot_route_accepts_matching_claim_credentials() {
+        let window_id = u64::MAX;
+        let (backend, root) = backend_with_live_claim(window_id);
+        let error = backend
+            .screenshot(Parameters(ScreenshotParams {
+                window_id: Some(window_id),
+                claim: ClaimContext {
+                    owner_thread_id: Some("owner-a".to_string()),
+                    claim_token: Some("token-a".to_string()),
+                },
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(!error.message.contains("claim_coordination"));
+        assert!(!error.message.contains("actively claimed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_app_state_route_rejects_desktop_capture_during_a_live_claim() {
+        let (backend, root) = backend_with_live_claim(u64::MAX);
+        let params = serde_json::from_value(serde_json::json!({})).unwrap();
+        let error = backend.get_app_state(Parameters(params)).await.unwrap_err();
+        assert!(error.message.contains("window_id is required for capture"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

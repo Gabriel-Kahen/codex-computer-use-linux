@@ -64,6 +64,14 @@ class ClaimStoreTests(TestCase):
             active_patch.stop()
         self.temporary.cleanup()
 
+    def test_window_lock_key_matches_generic_backend_address_identity(self) -> None:
+        self.assertEqual(coordination.window_lock_key(WINDOW), "address:0x1")
+        self.assertEqual(
+            coordination.window_lock_key({**WINDOW, "capture_id": "replacement"}),
+            "address:0x1",
+        )
+        self.assertEqual(coordination.window_key(WINDOW), "capture:42")
+
     def test_same_owner_renews_without_changing_the_fencing_token(self) -> None:
         first = coordination.claim_window(BINDING, WINDOW, "thread-a", 30, now=1000)
         renewed = coordination.claim_window(BINDING, WINDOW, "thread-a", 60, now=1010)
@@ -72,6 +80,14 @@ class ClaimStoreTests(TestCase):
         self.assertFalse(first["renewed"])
         self.assertTrue(renewed["renewed"])
         self.assertEqual(renewed["expires_at"], 1070)
+
+    def test_capture_identity_rotation_keeps_one_address_claim(self) -> None:
+        first = coordination.claim_window(BINDING, WINDOW, "thread-a", now=1000)
+        replacement = {**WINDOW, "capture_id": "43"}
+        renewed = coordination.claim_window(BINDING, replacement, "thread-a", now=1001)
+
+        self.assertEqual(renewed["claim_token"], first["claim_token"])
+        self.assertEqual(len(coordination.list_claims(BINDING, now=1002)), 1)
 
     def test_claimed_operation_renews_ownership(self) -> None:
         claim = coordination.claim_window(BINDING, WINDOW, "thread-a", 30, now=1000)
