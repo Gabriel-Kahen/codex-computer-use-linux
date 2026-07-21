@@ -6,4 +6,4 @@ pub mod kwin;
 pub mod niri;
 mod niri_ipc;
 pub mod x11;
-mod x11_native;
+pub(crate) mod x11_native;

@@ -1,8 +1,8 @@
 use crate::diagnostics::hydrate_session_bus_env;
 use crate::screenshot::RawScreenshotCapture;
 use crate::screenshot_impl::{read_png_as_capture_inner, temp_png_path};
-use crate::windowing::backends::{hyprland, kwin};
-use crate::windowing::{WindowInfo, HYPRLAND_BACKEND, KWIN_BACKEND};
+use crate::windowing::backends::{hyprland, kwin, x11_native};
+use crate::windowing::{WindowInfo, HYPRLAND_BACKEND, KWIN_BACKEND, X11_BACKEND};
 use anyhow::{bail, Context, Result};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use std::collections::HashMap;
@@ -35,8 +35,30 @@ pub(crate) async fn capture_window_exact(
     match window.backend.as_str() {
         KWIN_BACKEND => capture_kwin_window_exact(window).await,
         HYPRLAND_BACKEND => capture_hyprland_window_exact(window).await,
+        X11_BACKEND => capture_x11_window_exact(window).await,
         _ => Ok(None),
     }
+}
+
+async fn capture_x11_window_exact(window: &WindowInfo) -> Result<Option<RawScreenshotCapture>> {
+    let window_id = window.window_id;
+    let expected_pid = window.pid;
+    let expected_size = window
+        .bounds
+        .as_ref()
+        .map(|bounds| (bounds.width, bounds.height));
+    let capture = tokio::task::spawn_blocking(move || {
+        x11_native::capture_window(window_id, expected_pid, expected_size)
+    })
+    .await
+    .context("native X11 capture task failed")??;
+    Ok(capture.map(|capture| RawScreenshotCapture {
+        mime_type: "image/png".to_string(),
+        bytes: capture.png,
+        source: "x11-xcomposite-native".to_string(),
+        width: capture.width,
+        height: capture.height,
+    }))
 }
 
 async fn capture_hyprland_window_exact(
