@@ -1,12 +1,15 @@
 use anyhow::{anyhow, bail, Context, Result};
+use computer_use_linux::cosmic_helper_protocol::{
+    read_cosmic_service_message, CosmicServiceCommand, CosmicServiceRequest, CosmicServiceResponse,
+    COSMIC_SERVICE_PROTOCOL_VERSION,
+};
 use cosmic_protocols::{
     toplevel_info::v1::client::{zcosmic_toplevel_handle_v1, zcosmic_toplevel_info_v1},
     toplevel_management::v1::client::zcosmic_toplevel_manager_v1,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::io::{self, Write};
 use wayland_client::{
     event_created_child,
     globals::{registry_queue_init, GlobalListContents},
@@ -17,9 +20,8 @@ use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1, ext_foreign_toplevel_list_v1,
 };
 
-const HELP: &str = "computer-use-linux-cosmic\n\nUsage:\n  computer-use-linux-cosmic probe\n  computer-use-linux-cosmic list-windows\n  computer-use-linux-cosmic focused-window\n  computer-use-linux-cosmic activate-window --window-id <id>";
+const HELP: &str = "computer-use-linux-cosmic\n\nUsage:\n  computer-use-linux-cosmic probe\n  computer-use-linux-cosmic list-windows\n  computer-use-linux-cosmic focused-window\n  computer-use-linux-cosmic activate-window --window-id <id>\n  computer-use-linux-cosmic serve";
 const BACKEND: &str = "cosmic-wayland";
-const ACTIVATION_STATE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WindowInfo {
@@ -58,12 +60,6 @@ struct ActivationOutput {
     detail: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ActivationState {
-    window_id: u64,
-    timestamp_ms: u64,
-}
-
 #[derive(Debug, Clone, Default)]
 struct ToplevelRecord {
     foreign: Option<ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1>,
@@ -77,6 +73,7 @@ struct ToplevelRecord {
 
 impl ToplevelRecord {
     fn to_window(&self) -> Option<WindowInfo> {
+        self.foreign.as_ref()?;
         let identifier = self.identifier.as_deref()?;
         Some(WindowInfo {
             window_id: stable_window_id(identifier),
@@ -98,12 +95,12 @@ impl ToplevelRecord {
 struct AppData {
     toplevel_info: Option<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1>,
     toplevel_manager: Option<zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1>,
+    toplevel_list_available: bool,
     seats: Vec<wl_seat::WlSeat>,
     capabilities:
         Vec<WEnum<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>>,
-    records: Vec<ToplevelRecord>,
-    by_foreign_id: HashMap<u32, usize>,
-    by_cosmic_id: HashMap<u32, usize>,
+    records: HashMap<u32, ToplevelRecord>,
+    by_cosmic_id: HashMap<u32, u32>,
 }
 
 fn main() -> Result<()> {
@@ -112,6 +109,7 @@ fn main() -> Result<()> {
         Command::ListWindows => print_json(&collect_windows()?),
         Command::FocusedWindow => print_json(&focused_window()?),
         Command::ActivateWindow { window_id } => print_json(&activate_window(window_id)?),
+        Command::Serve => serve(),
     }
 }
 
@@ -121,6 +119,7 @@ enum Command {
     ListWindows,
     FocusedWindow,
     ActivateWindow { window_id: u64 },
+    Serve,
 }
 
 impl Command {
@@ -129,6 +128,7 @@ impl Command {
             [command] if command == "probe" => Ok(Self::Probe),
             [command] if command == "list-windows" => Ok(Self::ListWindows),
             [command] if command == "focused-window" => Ok(Self::FocusedWindow),
+            [command] if command == "serve" => Ok(Self::Serve),
             [command, flag, value] if command == "activate-window" && flag == "--window-id" => {
                 Ok(Self::ActivateWindow {
                     window_id: value
@@ -144,35 +144,13 @@ impl Command {
                 println!("{HELP}");
                 std::process::exit(0);
             }
-            _ => bail!("unknown arguments. Expected one of: probe, list-windows, focused-window, activate-window --window-id <id>"),
+            _ => bail!("unknown arguments. Expected one of: probe, list-windows, focused-window, activate-window --window-id <id>, serve"),
         }
     }
 }
 
 fn probe() -> Result<ProbeOutput> {
-    let snapshot = Snapshot::collect()?;
-    let windows = snapshot.windows();
-    let can_activate = snapshot.can_activate_windows();
-    Ok(ProbeOutput {
-        ok: !windows.is_empty(),
-        can_list_windows: !windows.is_empty(),
-        can_activate_windows: can_activate,
-        detail: if !windows.is_empty() {
-            if can_activate {
-                format!(
-                    "COSMIC foreign toplevel listing is available and activation is supported for {} window(s).",
-                    windows.len()
-                )
-            } else {
-                format!(
-                    "COSMIC foreign toplevel listing is available for {} window(s), but activation support is incomplete.",
-                    windows.len()
-                )
-            }
-        } else {
-            "COSMIC foreign toplevel listing is unavailable in this session.".to_string()
-        },
-    })
+    Ok(Snapshot::collect()?.probe())
 }
 
 fn collect_windows() -> Result<Vec<WindowInfo>> {
@@ -181,38 +159,80 @@ fn collect_windows() -> Result<Vec<WindowInfo>> {
 
 fn focused_window() -> Result<Option<WindowInfo>> {
     let snapshot = Snapshot::collect()?;
-    if let Some(window) = snapshot.windows().into_iter().find(|window| window.focused) {
-        clear_activation_state();
-        return Ok(Some(window));
-    }
-
-    let Some(state) = read_activation_state() else {
-        return Ok(None);
-    };
-
-    if state_is_stale(&state) {
-        clear_activation_state();
-        return Ok(None);
-    }
-
-    let mut window = snapshot
-        .windows()
-        .into_iter()
-        .find(|window| window.window_id == state.window_id);
-    if let Some(window) = window.as_mut() {
-        window.focused = true;
-    }
-    Ok(window)
+    Ok(snapshot.focused_window())
 }
 
 fn activate_window(window_id: u64) -> Result<ActivationOutput> {
     let mut snapshot = Snapshot::collect()?;
-    snapshot.activate(window_id)?;
-    write_activation_state(window_id)?;
-    Ok(ActivationOutput {
-        ok: true,
-        detail: format!("Requested COSMIC activation for window_id {window_id}."),
-    })
+    snapshot.activate(window_id)
+}
+
+fn serve() -> Result<()> {
+    let mut snapshot = Snapshot::collect()?;
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let mut stdout = io::stdout().lock();
+    while let Some(line) =
+        read_cosmic_service_message(&mut stdin).context("failed to read COSMIC service request")?
+    {
+        let request = match serde_json::from_str::<CosmicServiceRequest>(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                write_service_response(
+                    &mut stdout,
+                    &CosmicServiceResponse::error(0, format!("invalid request: {error}")),
+                )?;
+                continue;
+            }
+        };
+        if request.version != COSMIC_SERVICE_PROTOCOL_VERSION {
+            write_service_response(
+                &mut stdout,
+                &CosmicServiceResponse::error(
+                    request.id,
+                    format!(
+                        "unsupported protocol version {}; expected {COSMIC_SERVICE_PROTOCOL_VERSION}",
+                        request.version
+                    ),
+                ),
+            )?;
+            continue;
+        }
+
+        snapshot.refresh()?;
+        let response = match execute_service_command(&mut snapshot, request.command) {
+            Ok(result) => CosmicServiceResponse::success(request.id, result),
+            Err(error) => CosmicServiceResponse::error(request.id, format!("{error:#}")),
+        };
+        write_service_response(&mut stdout, &response)?;
+    }
+    Ok(())
+}
+
+fn execute_service_command(
+    snapshot: &mut Snapshot,
+    command: CosmicServiceCommand,
+) -> Result<serde_json::Value> {
+    match command {
+        CosmicServiceCommand::Probe => serde_json::to_value(snapshot.probe()),
+        CosmicServiceCommand::ListWindows => serde_json::to_value(snapshot.windows()),
+        CosmicServiceCommand::FocusedWindow => serde_json::to_value(snapshot.focused_window()),
+        CosmicServiceCommand::ActivateWindow { window_id } => {
+            serde_json::to_value(snapshot.activate(window_id)?)
+        }
+    }
+    .context("failed to serialize COSMIC service result")
+}
+
+fn write_service_response(stdout: &mut impl Write, response: &CosmicServiceResponse) -> Result<()> {
+    serde_json::to_writer(&mut *stdout, response)
+        .context("failed to serialize COSMIC service response")?;
+    stdout
+        .write_all(b"\n")
+        .context("failed to terminate COSMIC service response")?;
+    stdout
+        .flush()
+        .context("failed to flush COSMIC service response")
 }
 
 struct Snapshot {
@@ -231,7 +251,7 @@ impl Snapshot {
         };
         let qh = snapshot.event_queue.handle();
         snapshot.app_data.toplevel_info = globals
-            .bind::<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _, _>(&qh, 1..=3, ())
+            .bind::<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _, _>(&qh, 2..=3, ())
             .ok();
         snapshot.app_data.toplevel_manager = globals
             .bind::<zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, _, _>(&qh, 1..=4, ())
@@ -251,15 +271,9 @@ impl Snapshot {
                 }
             }
         });
-        if snapshot.app_data.toplevel_info.is_some() {
-            let _ = globals
-                .bind::<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, _, _>(
-                    &qh,
-                    1..=1,
-                    (),
-                )
-                .ok();
-        }
+        snapshot.app_data.toplevel_list_available = globals
+            .bind::<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, _, _>(&qh, 1..=1, ())
+            .is_ok();
         snapshot.prime()?;
         Ok(snapshot)
     }
@@ -273,18 +287,57 @@ impl Snapshot {
         Ok(())
     }
 
+    fn refresh(&mut self) -> Result<()> {
+        self.event_queue
+            .roundtrip(&mut self.app_data)
+            .context("Wayland refresh roundtrip failed")?;
+        Ok(())
+    }
+
     fn windows(&self) -> Vec<WindowInfo> {
-        self.app_data
+        let mut windows = self
+            .app_data
             .records
-            .iter()
+            .values()
             .filter_map(ToplevelRecord::to_window)
-            .collect()
+            .collect::<Vec<_>>();
+        windows.sort_by_key(|window| window.window_id);
+        windows
+    }
+
+    fn focused_window(&self) -> Option<WindowInfo> {
+        self.windows().into_iter().find(|window| window.focused)
+    }
+
+    fn probe(&self) -> ProbeOutput {
+        let window_count = self.windows().len();
+        let can_activate = self.can_activate_windows();
+        ProbeOutput {
+            ok: self.app_data.toplevel_list_available,
+            can_list_windows: self.app_data.toplevel_list_available,
+            can_activate_windows: can_activate,
+            detail: if !self.app_data.toplevel_list_available {
+                "COSMIC foreign toplevel listing is unavailable in this session.".to_string()
+            } else if can_activate {
+                format!(
+                    "COSMIC foreign toplevel listing is available and activation is supported for {window_count} window(s)."
+                )
+            } else {
+                format!(
+                    "COSMIC foreign toplevel listing is available for {window_count} window(s), but activation support is incomplete."
+                )
+            },
+        }
     }
 
     fn can_activate_windows(&self) -> bool {
         !self.app_data.seats.is_empty()
             && self.app_data.toplevel_manager.is_some()
-            && self.app_data.records.iter().any(|record| record.cosmic.is_some())
+            && self
+                .app_data
+                .records
+                .values()
+                .any(|record| record.cosmic.is_some())
             && self.app_data.capabilities.iter().any(|capability| {
                 matches!(
                     capability,
@@ -295,41 +348,62 @@ impl Snapshot {
             })
     }
 
-    fn activate(&mut self, window_id: u64) -> Result<()> {
+    fn activate(&mut self, window_id: u64) -> Result<ActivationOutput> {
         if !self.can_activate_windows() {
-            bail!("COSMIC activation capability is unavailable");
+            return Ok(ActivationOutput {
+                ok: false,
+                detail: "COSMIC activation capability is unavailable.".to_string(),
+            });
         }
         let seat = self
             .app_data
             .seats
             .first()
             .cloned()
-            .ok_or_else(|| anyhow!("no wl_seat available for activation"))?;
-        let record = self
+            .ok_or_else(|| anyhow!("activation capability advertised without a wl_seat"))?;
+        let cosmic = self
             .app_data
             .records
-            .iter()
+            .values()
             .find(|record| {
                 record
                     .identifier
                     .as_deref()
                     .is_some_and(|id| stable_window_id(id) == window_id)
             })
-            .ok_or_else(|| anyhow!("no COSMIC toplevel matched window_id {window_id}"))?;
-        let cosmic = record
-            .cosmic
-            .as_ref()
-            .ok_or_else(|| anyhow!("matched window has no COSMIC activation handle"))?;
+            .and_then(|record| record.cosmic.clone());
+        let Some(cosmic) = cosmic else {
+            return Ok(ActivationOutput {
+                ok: false,
+                detail: format!("No activatable COSMIC toplevel matched window_id {window_id}."),
+            });
+        };
         let manager = self
             .app_data
             .toplevel_manager
             .as_ref()
             .ok_or_else(|| anyhow!("COSMIC toplevel management protocol not advertised"))?;
-        manager.activate(cosmic, &seat);
+        manager.activate(&cosmic, &seat);
         self.event_queue
             .roundtrip(&mut self.app_data)
             .context("Wayland roundtrip after activation failed")?;
-        Ok(())
+        let focused = self.app_data.records.values().any(|record| {
+            record.focused
+                && record
+                    .identifier
+                    .as_deref()
+                    .is_some_and(|identifier| stable_window_id(identifier) == window_id)
+        });
+        Ok(ActivationOutput {
+            ok: focused,
+            detail: if focused {
+                format!("COSMIC confirmed activation for window_id {window_id}.")
+            } else {
+                format!(
+                    "COSMIC did not confirm activation for window_id {window_id}; the compositor may have denied the request."
+                )
+            },
+        })
     }
 }
 
@@ -345,7 +419,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for AppData {
         if let wl_registry::Event::Global {
             name,
             interface,
-            version: _,
+            version,
         } = event
         {
             match interface.as_str() {
@@ -356,32 +430,49 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for AppData {
                         qh,
                         (),
                     );
+                    app_data.toplevel_list_available = true;
                 }
-                "zcosmic_toplevel_info_v1" => {
-                    app_data.toplevel_info = Some(
-                        registry.bind::<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _, _>(
+                "zcosmic_toplevel_info_v1" if version >= 2 => {
+                    let info = registry
+                        .bind::<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, _, _>(
                             name,
-                            3,
+                            version.min(3),
                             qh,
                             (),
-                        ),
-                    );
+                        );
+                    for (foreign_id, record) in &mut app_data.records {
+                        if record.cosmic.is_some() {
+                            continue;
+                        }
+                        let Some(foreign) = record.foreign.as_ref() else {
+                            continue;
+                        };
+                        let cosmic = info.get_cosmic_toplevel(foreign, qh, ());
+                        app_data
+                            .by_cosmic_id
+                            .insert(cosmic.id().protocol_id(), *foreign_id);
+                        record.cosmic = Some(cosmic);
+                    }
+                    app_data.toplevel_info = Some(info);
                 }
                 "zcosmic_toplevel_manager_v1" => {
                     app_data.toplevel_manager = Some(
                         registry
                             .bind::<zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, _, _>(
                                 name,
-                                4,
+                                version.min(4),
                                 qh,
                                 (),
                             ),
                     );
                 }
                 "wl_seat" => {
-                    app_data
-                        .seats
-                        .push(registry.bind::<wl_seat::WlSeat, _, _>(name, 9, qh, ()));
+                    app_data.seats.push(registry.bind::<wl_seat::WlSeat, _, _>(
+                        name,
+                        version.min(9),
+                        qh,
+                        (),
+                    ));
                 }
                 _ => {}
             }
@@ -392,7 +483,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for AppData {
 impl Dispatch<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, ()> for AppData {
     fn event(
         app_data: &mut Self,
-        _list: &ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1,
+        list: &ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1,
         event: ext_foreign_toplevel_list_v1::Event,
         _: &(),
         _conn: &Connection,
@@ -409,15 +500,15 @@ impl Dispatch<ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1, ()> for Ap
                     let cosmic = info.get_cosmic_toplevel(&toplevel, qh, ());
                     app_data
                         .by_cosmic_id
-                        .insert(cosmic.id().protocol_id(), app_data.records.len());
+                        .insert(cosmic.id().protocol_id(), foreign_id);
                     record.cosmic = Some(cosmic);
                 }
-                app_data
-                    .by_foreign_id
-                    .insert(foreign_id, app_data.records.len());
-                app_data.records.push(record);
+                app_data.records.insert(foreign_id, record);
             }
-            ext_foreign_toplevel_list_v1::Event::Finished => {}
+            ext_foreign_toplevel_list_v1::Event::Finished => {
+                app_data.toplevel_list_available = false;
+                list.destroy();
+            }
             _ => unreachable!(),
         }
     }
@@ -440,14 +531,10 @@ impl Dispatch<ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()> fo
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        let Some(index) = app_data
-            .by_foreign_id
-            .get(&handle.id().protocol_id())
-            .copied()
-        else {
+        let foreign_id = handle.id().protocol_id();
+        let Some(record) = app_data.records.get_mut(&foreign_id) else {
             return;
         };
-        let record = &mut app_data.records[index];
         match event {
             ext_foreign_toplevel_handle_v1::Event::Identifier { identifier } => {
                 record.identifier = Some(identifier);
@@ -460,8 +547,13 @@ impl Dispatch<ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()> fo
             }
             ext_foreign_toplevel_handle_v1::Event::Done => {}
             ext_foreign_toplevel_handle_v1::Event::Closed => {
-                app_data.records[index].foreign = None;
-                app_data.records[index].cosmic = None;
+                if let Some(record) = app_data.records.remove(&foreign_id) {
+                    if let Some(cosmic) = record.cosmic {
+                        app_data.by_cosmic_id.remove(&cosmic.id().protocol_id());
+                        cosmic.destroy();
+                    }
+                    handle.destroy();
+                }
             }
             _ => unreachable!(),
         }
@@ -497,22 +589,33 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppDa
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let Some(index) = app_data
-            .by_cosmic_id
-            .get(&handle.id().protocol_id())
-            .copied()
-        else {
+        let cosmic_id = handle.id().protocol_id();
+        let Some(foreign_id) = app_data.by_cosmic_id.get(&cosmic_id).copied() else {
             return;
         };
-        let record = &mut app_data.records[index];
+        if matches!(&event, zcosmic_toplevel_handle_v1::Event::Closed) {
+            app_data.by_cosmic_id.remove(&cosmic_id);
+            if let Some(record) = app_data.records.get_mut(&foreign_id) {
+                record.cosmic = None;
+                record.focused = false;
+                record.hidden = false;
+            }
+            handle.destroy();
+            return;
+        }
+        let Some(record) = app_data.records.get_mut(&foreign_id) else {
+            return;
+        };
         match event {
             zcosmic_toplevel_handle_v1::Event::State { state } => {
                 record.focused = false;
                 record.hidden = false;
                 for value in state.chunks_exact(4) {
-                    if let Ok(parsed) = zcosmic_toplevel_handle_v1::State::try_from(
-                        u32::from_ne_bytes(value.try_into().unwrap()),
-                    ) {
+                    if let Ok(parsed) =
+                        zcosmic_toplevel_handle_v1::State::try_from(u32::from_ne_bytes([
+                            value[0], value[1], value[2], value[3],
+                        ]))
+                    {
                         if parsed == zcosmic_toplevel_handle_v1::State::Activated {
                             record.focused = true;
                         }
@@ -531,8 +634,7 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppDa
             | zcosmic_toplevel_handle_v1::Event::ExtWorkspaceLeave { .. }
             | zcosmic_toplevel_handle_v1::Event::Title { .. }
             | zcosmic_toplevel_handle_v1::Event::AppId { .. }
-            | zcosmic_toplevel_handle_v1::Event::Done
-            | zcosmic_toplevel_handle_v1::Event::Closed => {}
+            | zcosmic_toplevel_handle_v1::Event::Done => {}
             _ => unreachable!(),
         }
     }
@@ -550,8 +652,10 @@ impl Dispatch<zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, ()> for App
         match event {
             zcosmic_toplevel_manager_v1::Event::Capabilities { capabilities } => {
                 app_data.capabilities = capabilities
-                    .chunks(4)
-                    .map(|chunk| WEnum::from(u32::from_ne_bytes(chunk.try_into().unwrap())))
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        WEnum::from(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    })
                     .collect();
             }
             _ => unreachable!(),
@@ -592,49 +696,6 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
-fn activation_state_path() -> PathBuf {
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(runtime_dir).join("computer-use-linux-cosmic-last-activation.json")
-    } else {
-        std::env::temp_dir().join("computer-use-linux-cosmic-last-activation.json")
-    }
-}
-
-fn write_activation_state(window_id: u64) -> Result<()> {
-    let state = ActivationState {
-        window_id,
-        timestamp_ms: now_timestamp_ms()?,
-    };
-    let path = activation_state_path();
-    let json = serde_json::to_vec(&state).context("failed to serialize activation state")?;
-    std::fs::write(&path, json)
-        .with_context(|| format!("failed to write activation state to {}", path.display()))
-}
-
-fn read_activation_state() -> Option<ActivationState> {
-    let path = activation_state_path();
-    let contents = std::fs::read(&path).ok()?;
-    serde_json::from_slice(&contents).ok()
-}
-
-fn clear_activation_state() {
-    let _ = std::fs::remove_file(activation_state_path());
-}
-
-fn state_is_stale(state: &ActivationState) -> bool {
-    let Ok(now_ms) = now_timestamp_ms() else {
-        return false;
-    };
-    now_ms.saturating_sub(state.timestamp_ms) > ACTIVATION_STATE_TTL.as_millis() as u64
-}
-
-fn now_timestamp_ms() -> Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before UNIX_EPOCH")?
-        .as_millis() as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,23 +719,10 @@ mod tests {
     }
 
     #[test]
-    fn activation_state_expires_after_ttl() {
-        let state = ActivationState {
-            window_id: 7,
-            timestamp_ms: now_timestamp_ms().unwrap()
-                - (ACTIVATION_STATE_TTL.as_millis() as u64 + 1),
-        };
-
-        assert!(state_is_stale(&state));
-    }
-
-    #[test]
-    fn activation_state_is_fresh_within_ttl() {
-        let state = ActivationState {
-            window_id: 7,
-            timestamp_ms: now_timestamp_ms().unwrap(),
-        };
-
-        assert!(!state_is_stale(&state));
+    fn parse_serve_command() {
+        assert!(matches!(
+            Command::parse(vec!["serve".to_string()]).unwrap(),
+            Command::Serve
+        ));
     }
 }

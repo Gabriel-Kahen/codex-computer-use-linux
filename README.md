@@ -128,7 +128,8 @@ In practical terms:
   event-stream or action path is unavailable. Exact inactive capture requires
   Niri's ScreenCast service plus `gst-launch-1.0` with `pipewiresrc`,
   `videoconvert`, and `pngenc`.
-- **COSMIC Wayland:** uses the bundled `computer-use-linux-cosmic` helper.
+- **COSMIC Wayland:** uses the bundled persistent `computer-use-linux-cosmic`
+  helper, with automatic restart and a compatible one-shot fallback.
 - **i3:** requires `i3-msg`; `xprop` adds process details when available.
 
 Real behavior depends on the portal, accessibility, compositor, and input
