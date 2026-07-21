@@ -80,25 +80,42 @@ pub enum ScrollDirection {
     Right,
 }
 
+enum PortalPersistence<'a> {
+    Disabled,
+    Enabled { restore_token: Option<&'a str> },
+}
+
 pub async fn start_portal_session() -> Result<PortalSession> {
     hydrate_session_bus_env();
 
-    let restore_path = restore_token_path();
-    let lock_path = restore_path.with_extension("lock");
-    let _restore_guard = tokio::task::spawn_blocking(move || restore_token_lock(&lock_path))
-        .await
-        .context("restore-token lock task failed")??;
+    let restore_store = if let Some(restore_path) = restore_token_path() {
+        let lock_path = restore_path.with_extension("lock");
+        match tokio::task::spawn_blocking(move || restore_token_lock(&lock_path)).await {
+            Ok(Ok(guard)) => Some((restore_path, guard)),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    } else {
+        None
+    };
     let connection = Connection::session()
         .await
         .context("failed to connect to session bus for remote desktop portal")?;
     let session_handle = create_remote_desktop_session(&connection).await?;
-    let restore_token = read_restore_token(&restore_path).ok().flatten();
+    let restore_token = restore_store
+        .as_ref()
+        .and_then(|(path, _guard)| read_restore_token(path).ok().flatten());
+    let persistence = match restore_store.as_ref() {
+        Some(_) => PortalPersistence::Enabled {
+            restore_token: restore_token.as_deref(),
+        },
+        None => PortalPersistence::Disabled,
+    };
     select_devices(
         &connection,
         &session_handle,
         DEVICE_POINTER | DEVICE_KEYBOARD,
         "rd_devices",
-        restore_token.as_deref(),
+        persistence,
     )
     .await?;
     let started = start_remote_desktop_session(&connection, &session_handle).await?;
@@ -106,11 +123,13 @@ pub async fn start_portal_session() -> Result<PortalSession> {
     if started.devices & (DEVICE_POINTER | DEVICE_KEYBOARD) == 0 {
         bail!("remote desktop portal session started without pointer or keyboard access");
     }
-    let _ = update_restore_token(
-        &restore_path,
-        restore_token.is_some(),
-        started.restore_token.as_deref(),
-    );
+    if let Some((restore_path, _guard)) = restore_store {
+        let _ = update_restore_token(
+            &restore_path,
+            restore_token.is_some(),
+            started.restore_token.as_deref(),
+        );
+    }
 
     Ok(PortalSession {
         connection,
@@ -243,7 +262,7 @@ async fn select_devices(
     session: &OwnedObjectPath,
     device_types: u32,
     request_prefix: &str,
-    restore_token: Option<&str>,
+    persistence: PortalPersistence<'_>,
 ) -> Result<()> {
     let remote_proxy = remote_desktop_proxy(connection).await?;
     let (request_path, mut response_stream) =
@@ -258,11 +277,19 @@ async fn select_devices(
         .get_property::<u32>("version")
         .await
         .unwrap_or(1);
-    if portal_version >= 2 {
-        options.insert("persist_mode", Value::from(PERSIST_MODE_EXPLICITLY_REVOKED));
-        if let Some(token) = restore_token {
-            options.insert("restore_token", Value::from(token));
+    match (portal_version >= 2, persistence) {
+        (true, PortalPersistence::Enabled { restore_token }) => {
+            options.insert(
+                "persist_mode",
+                Value::from(PERSIST_MODE_EXPLICITLY_REVOKED),
+            );
+            if let Some(token) = restore_token {
+                options.insert("restore_token", Value::from(token));
+            }
         }
+        (true, PortalPersistence::Disabled)
+        | (false, PortalPersistence::Disabled)
+        | (false, PortalPersistence::Enabled { .. }) => {}
     }
 
     let handle: OwnedObjectPath = remote_proxy
@@ -461,12 +488,17 @@ struct RestoreTokenFile {
     token: String,
 }
 
-fn restore_token_path() -> PathBuf {
+fn restore_token_path() -> Option<PathBuf> {
     let root = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(|| std::env::temp_dir().join("computer-use-linux-state"));
-    root.join("computer-use-linux/remote-desktop-restore-token.json")
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".local/state"))
+        })?;
+    Some(root.join("computer-use-linux/remote-desktop-restore-token.json"))
 }
 
 fn valid_restore_token(token: &str) -> bool {
