@@ -76,7 +76,7 @@ fn ignores_unknown_valid_events_but_rejects_malformed_json() {
 }
 
 #[test]
-fn reconnects_after_socket_replacement_and_replaces_stale_state() {
+fn reconnects_after_socket_replacement_while_old_stream_is_active() {
     let temporary = TestDir::new();
     let socket_path = temporary.path().join("niri.sock");
     let first_listener = UnixListener::bind(&socket_path).unwrap();
@@ -101,9 +101,17 @@ fn reconnects_after_socket_replacement_and_replaces_stale_state() {
         release_first_rx
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
+        loop {
+            if writeln!(writer, r#"{{"FutureNiriEvent":{{"active":true}}}}"#).is_err()
+                || writer.flush().is_err()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     });
 
-    let client = EventClient::start(socket_path.clone());
+    let mut client = EventClient::start(socket_path.clone());
     first_connected_rx
         .recv_timeout(Duration::from_secs(1))
         .unwrap();
@@ -126,6 +134,7 @@ fn reconnects_after_socket_replacement_and_replaces_stale_state() {
         .unwrap();
         writer.flush().unwrap();
     });
+    release_first_tx.send(()).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -139,9 +148,85 @@ fn reconnects_after_socket_replacement_and_replaces_stale_state() {
         assert!(Instant::now() < deadline, "client did not reconnect");
     }
     client.stop();
-    release_first_tx.send(()).unwrap();
     first_server.join().unwrap();
     second_server.join().unwrap();
+}
+
+#[test]
+fn rejected_event_stream_waits_for_socket_replacement() {
+    let temporary = TestDir::new();
+    let socket_path = temporary.path().join("niri.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (replied_tx, replied_rx) = mpsc::channel();
+    let (reconnected_tx, reconnected_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "client did not connect");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to accept connection: {error}"),
+            }
+        };
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        writeln!(stream, r#"{{"Err":"unknown variant `EventStream`"}}"#).unwrap();
+        stream.flush().unwrap();
+        replied_tx.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(400);
+        let reconnected = loop {
+            match listener.accept() {
+                Ok(_) => break true,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to accept connection: {error}"),
+            }
+        };
+        reconnected_tx.send(reconnected).unwrap();
+    });
+
+    let mut client = EventClient::start(socket_path);
+    replied_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(!reconnected_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+    client.stop();
+    server.join().unwrap();
+}
+
+#[test]
+fn sends_direct_focus_request() {
+    let temporary = TestDir::new();
+    let socket_path = temporary.path().join("niri.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&request).unwrap(),
+            serde_json::json!({"Action": {"FocusWindow": {"id": 42}}})
+        );
+        writeln!(stream, r#"{{"Ok":"Handled"}}"#).unwrap();
+    });
+
+    send_request(
+        &socket_path,
+        &serde_json::json!({"Action": {"FocusWindow": {"id": 42}}}),
+    )
+    .unwrap();
+    server.join().unwrap();
 }
 
 #[test]

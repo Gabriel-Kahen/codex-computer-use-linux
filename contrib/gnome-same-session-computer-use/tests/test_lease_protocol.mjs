@@ -25,6 +25,7 @@ function pendingProtocol() {
         target: '11',
         targetMinimized: false,
         original: {workspace: 2},
+        generation: 'g'.repeat(64),
     });
     return protocol;
 }
@@ -152,6 +153,18 @@ test('capability and unique caller jointly authorize a lease', () => {
     assert.throws(() => protocol.require(OTHER_CAPABILITY, OWNER), /invalid Shell lease capability/);
     assert.throws(() => protocol.require(CAPABILITY, OTHER_OWNER), /another D-Bus caller/);
     assert.equal(protocol.require(CAPABILITY, OWNER).phase, 'pending');
+    assert.equal(protocol.require(CAPABILITY, OWNER).generation, 'g'.repeat(64));
+});
+
+test('lease creation requires an operation generation', () => {
+    const protocol = new LeaseProtocol();
+    assert.throws(() => protocol.begin({
+        capability: CAPABILITY,
+        owner: OWNER,
+        target: '11',
+        targetMinimized: false,
+        original: {workspace: 2},
+    }), /lease generation/);
 });
 
 test('phase gates activation and active input authorization', () => {
@@ -178,6 +191,7 @@ test('claimed lease recovery waits for expiry even when capability is known', ()
         target: '11',
         targetMinimized: false,
         original: {workspace: 2},
+        generation: 'g'.repeat(64),
         recoveryDeadlineUsec: 2_000_000,
     });
     protocol.activate(CAPABILITY, OWNER);

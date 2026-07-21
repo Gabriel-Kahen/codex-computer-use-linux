@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const INITIAL_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(350);
@@ -141,6 +142,7 @@ impl Default for SharedState {
 struct EventClient {
     socket_path: PathBuf,
     shared: Arc<SharedState>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl EventClient {
@@ -148,13 +150,14 @@ impl EventClient {
         let shared = Arc::new(SharedState::default());
         let worker_shared = Arc::clone(&shared);
         let worker_path = socket_path.clone();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("computer-use-niri-ipc".to_string())
             .spawn(move || event_worker(&worker_path, &worker_shared))
             .expect("failed to start Niri IPC event worker");
         Self {
             socket_path,
             shared,
+            worker: Some(worker),
         }
     }
 
@@ -185,9 +188,18 @@ impl EventClient {
         Ok(state.windows.values().cloned().collect())
     }
 
-    fn stop(&self) {
+    fn stop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         self.shared.changed.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for EventClient {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -199,9 +211,11 @@ fn lock_state(shared: &SharedState) -> MutexGuard<'_, EventState> {
 }
 
 fn event_worker(socket_path: &Path, shared: &SharedState) {
+    mark_disconnected(shared);
     while !shared.stop.load(Ordering::Acquire) {
+        let result = consume_event_stream(socket_path, shared);
         mark_disconnected(shared);
-        if consume_event_stream(socket_path, shared).is_ok() {
+        if result.is_ok() {
             continue;
         }
         if shared.stop.load(Ordering::Acquire) {
@@ -241,7 +255,13 @@ fn consume_event_stream(socket_path: &Path, shared: &SharedState) -> Result<()> 
 
     let mut reader = BufReader::new(stream);
     let reply = read_required_line(&mut reader, shared, socket_path, identity)?;
-    ensure_handled_reply(reply.trim())?;
+    match parse_reply(reply.trim())? {
+        Reply::Handled => {}
+        Reply::Rejected(_) => {
+            wait_for_socket_replacement(socket_path, identity, shared);
+            return Ok(());
+        }
+    }
 
     loop {
         if shared.stop.load(Ordering::Acquire) {
@@ -251,6 +271,9 @@ fn consume_event_stream(socket_path: &Path, shared: &SharedState) -> Result<()> 
         match reader.read_line(&mut line) {
             Ok(0) => bail!("Niri event stream closed"),
             Ok(_) => {
+                if socket_identity(socket_path).ok() != Some(identity) {
+                    bail!("Niri IPC socket was replaced");
+                }
                 let changed = {
                     let mut state = lock_state(shared);
                     state.apply_line(line.trim_end())?
@@ -266,6 +289,14 @@ fn consume_event_stream(socket_path: &Path, shared: &SharedState) -> Result<()> 
             }
             Err(error) => return Err(error).context("failed to read Niri event stream"),
         }
+    }
+}
+
+fn wait_for_socket_replacement(socket_path: &Path, identity: SocketIdentity, shared: &SharedState) {
+    while !shared.stop.load(Ordering::Acquire)
+        && socket_identity(socket_path).ok() == Some(identity)
+    {
+        thread::sleep(SOCKET_POLL_INTERVAL);
     }
 }
 
@@ -308,15 +339,28 @@ fn socket_identity(path: &Path) -> std::io::Result<SocketIdentity> {
     })
 }
 
-fn ensure_handled_reply(line: &str) -> Result<()> {
+#[derive(Debug, Eq, PartialEq)]
+enum Reply {
+    Handled,
+    Rejected(String),
+}
+
+fn parse_reply(line: &str) -> Result<Reply> {
     let reply: Value = serde_json::from_str(line).context("invalid Niri IPC reply JSON")?;
     if reply == serde_json::json!({"Ok": "Handled"}) {
-        return Ok(());
+        return Ok(Reply::Handled);
     }
     if let Some(error) = reply.get("Err").and_then(Value::as_str) {
-        bail!("Niri IPC request failed: {error}");
+        return Ok(Reply::Rejected(error.to_string()));
     }
     bail!("unexpected Niri IPC reply: {reply}")
+}
+
+fn ensure_handled_reply(line: &str) -> Result<()> {
+    match parse_reply(line)? {
+        Reply::Handled => Ok(()),
+        Reply::Rejected(error) => bail!("Niri IPC request failed: {error}"),
+    }
 }
 
 fn manager() -> &'static Mutex<Option<EventClient>> {
@@ -340,7 +384,7 @@ pub(super) fn cached_windows() -> Result<Vec<NiriWindow>> {
         .as_ref()
         .is_none_or(|client| client.socket_path != socket_path)
     {
-        if let Some(client) = manager.as_ref() {
+        if let Some(client) = manager.as_mut() {
             client.stop();
         }
         *manager = Some(EventClient::start(socket_path));

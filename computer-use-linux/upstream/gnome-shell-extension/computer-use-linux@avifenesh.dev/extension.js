@@ -6,6 +6,12 @@ import Shell from 'gi://Shell';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {
+    bridgeInfo,
+    CONTRACT_FILENAME,
+    parseBridgeContract,
+    stableWindowId,
+} from './gnome_shell_bridge_contract.js';
 
 const SERVICE_NAME = 'dev.avifenesh.ComputerUseLinux.WindowControl';
 const OBJECT_PATH = '/dev/avifenesh/ComputerUseLinux/WindowControl';
@@ -15,6 +21,9 @@ const WINDOW_CONTROL_XML = `
 <node>
   <interface name="${SERVICE_NAME}">
     <method name="ListWindows">
+      <arg name="json" type="s" direction="out"/>
+    </method>
+    <method name="GetBridgeInfo">
       <arg name="json" type="s" direction="out"/>
     </method>
     <method name="ActivateWindow">
@@ -50,8 +59,10 @@ const WINDOW_CONTROL_XML = `
 
 const WindowControlDBus = GObject.registerClass(
 class WindowControlDBus extends GObject.Object {
-    constructor() {
+    constructor(contract) {
         super();
+
+        this._contract = contract;
 
         this._dbusObject = Gio.DBusExportedObject.wrapJSObject(
             WINDOW_CONTROL_XML, this);
@@ -76,6 +87,14 @@ class WindowControlDBus extends GObject.Object {
 
     ListWindowsAsync(_params, invocation) {
         this._returnJson(invocation, this._listWindows());
+    }
+
+    GetBridgeInfoAsync(_params, invocation) {
+        this._returnJson(invocation, bridgeInfo(
+            this._contract,
+            'window-control',
+            ['enumerate', 'activate', 'move', 'resize', 'desktop-capture'],
+        ));
     }
 
     ActivateWindowAsync([windowId], invocation) {
@@ -257,6 +276,7 @@ class WindowControlDBus extends GObject.Object {
 
         return {
             window_id: Number(window.get_id()),
+            stable_window_id: stableWindowId(window),
             title: window.get_title?.() ?? null,
             app_id: app?.get_id?.() ?? null,
             wm_class: window.get_wm_class?.() ?? null,
@@ -301,7 +321,9 @@ function clientTypeName(value) {
 
 export default class ComputerUseLinuxWindowControlExtension extends Extension {
     enable() {
-        this._dbusServer = new WindowControlDBus();
+        const [, contents] = this.dir.get_child(CONTRACT_FILENAME).load_contents(null);
+        const contract = parseBridgeContract(new TextDecoder().decode(contents));
+        this._dbusServer = new WindowControlDBus(contract);
     }
 
     disable() {
