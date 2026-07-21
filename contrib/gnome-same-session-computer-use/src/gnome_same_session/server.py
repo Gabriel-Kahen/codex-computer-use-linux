@@ -53,6 +53,8 @@ MAX_RESPONSE_COLLECTION_ITEMS = 8
 MAX_RESPONSE_DEPTH = 4
 CLAIMED_LEASE_PROTOCOL_VERSION = 2
 CLAIMED_LEASE_CAPABILITY = "claimed_focus_leases"
+WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION = 3
+WINDOW_ACTOR_CAPTURE_CAPABILITY = "window_actor_capture"
 BUS_NAME = "org.gnome.Shell.Extensions.BackgroundComputerUse"
 OBJECT_PATH = "/org/gnome/Shell/Extensions/BackgroundComputerUse"
 INTERFACE = BUS_NAME
@@ -97,9 +99,9 @@ TOOLS = [
     tool("claim_session_window", "Exclusively claim one window for this Codex thread while allowing other threads to claim different windows concurrently.", {"window": WINDOW, "lease_seconds": {"type": "integer", "minimum": MIN_LEASE_SECONDS, "maximum": MAX_LEASE_SECONDS, "default": DEFAULT_LEASE_SECONDS}}, ["window"]),
     tool("release_session_window", "Release a window claim owned by this Codex thread.", {"claim_token": CLAIM_TOKEN}, ["claim_token"], idempotent=True),
     tool("list_window_claims", "List one bounded page of live window claims without exposing their capability tokens.", {"cursor": CURSOR, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_CLAIMS_PER_PAGE}}, [], read_only=True, idempotent=True),
-    tool("capture_session_window", "Deprecated compatibility tool. Capture an exact focused window and optionally write save_path. Prefer get_session_window_capture for inline capture or save_session_window_capture for writes.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}, "claim_token": CLAIM_TOKEN}, ["window"], idempotent=True),
-    tool("get_session_window_capture", "Return an inline PNG of an exact focused window without creating a caller-selected file. An unfocused window must first be placed under an acknowledged focus lease.", {"window": WINDOW, "claim_token": CLAIM_TOKEN}, ["window"], read_only=True, idempotent=True),
-    tool("save_session_window_capture", "Capture an exact focused window and atomically create or replace an absolute PNG path. Also returns the PNG inline.", {"window": WINDOW, "save_path": {"type": "string", "minLength": 1, "maxLength": 4096}, "claim_token": CLAIM_TOKEN}, ["window", "save_path"], open_world=False),
+    tool("capture_session_window", "Deprecated compatibility tool. Capture an exact GNOME window and optionally write save_path. Prefer get_session_window_capture for inline capture or save_session_window_capture for writes.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}, "claim_token": CLAIM_TOKEN}, ["window"], idempotent=True),
+    tool("get_session_window_capture", "Return an inline exact-window PNG from Mutter's compositor actor without changing focus. Older extension versions require an acknowledged focus lease for unfocused windows.", {"window": WINDOW, "claim_token": CLAIM_TOKEN}, ["window"], read_only=True, idempotent=True),
+    tool("save_session_window_capture", "Capture an exact GNOME window without changing focus and atomically create or replace an absolute PNG path. Also returns the PNG inline.", {"window": WINDOW, "save_path": {"type": "string", "minLength": 1, "maxLength": 4096}, "claim_token": CLAIM_TOKEN}, ["window", "save_path"], open_world=False),
     tool("begin_focus_lease", "Journal desktop state, switch to and focus an existing window, and authorize brief global-seat contention until restored.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}, "claim_token": CLAIM_TOKEN}, ["window", "acknowledge_interference"]),
     tool("lease_pointer_click", "Click a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
     tool("lease_pointer_scroll", "Scroll in a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
@@ -143,6 +145,35 @@ def dbus_call(method: str, *arguments: str) -> Any:
         return json.loads(response.unpack()[0])
     except Exception as exc:
         raise RuntimeError(f"GNOME integration method {method} failed: {exc}") from exc
+
+
+def dbus_capture_window(window_id: str) -> tuple[bytes, dict[str, Any]]:
+    global _DBUS_CONNECTION
+    ensure_session_environment()
+    if Gio is None or GLib is None:
+        raise RuntimeError("PyGObject (python3-gobject) is required for GNOME window capture")
+    try:
+        with DBUS_LOCK:
+            if _DBUS_CONNECTION is None or _DBUS_CONNECTION.is_closed():
+                _DBUS_CONNECTION = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            response = _DBUS_CONNECTION.call_sync(
+                BUS_NAME,
+                OBJECT_PATH,
+                INTERFACE,
+                "CaptureWindow",
+                GLib.Variant("(s)", (window_id,)),
+                GLib.VariantType.new("(ays)"),
+                Gio.DBusCallFlags.NONE,
+                20_000,
+                None,
+            )
+        raw, serialized = response.unpack()
+        metadata = json.loads(serialized)
+        if not isinstance(metadata, dict):
+            raise RuntimeError("GNOME integration returned invalid capture metadata")
+        return bytes(raw), metadata
+    except Exception as exc:
+        raise RuntimeError(f"GNOME integration window capture failed: {exc}") from exc
 
 
 def bounded_text(value: Any, limit: int = MAX_WINDOW_TEXT_CHARS) -> str:
@@ -310,6 +341,16 @@ def shell_supports_claimed_leases(integration: dict[str, Any]) -> bool:
         and integration["protocol_version"] >= CLAIMED_LEASE_PROTOCOL_VERSION
         and isinstance(capabilities, list)
         and CLAIMED_LEASE_CAPABILITY in capabilities
+    )
+
+
+def shell_supports_window_actor_capture(integration: dict[str, Any]) -> bool:
+    capabilities = integration.get("capabilities")
+    return (
+        type(integration.get("protocol_version")) is int
+        and integration["protocol_version"] >= WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION
+        and isinstance(capabilities, list)
+        and WINDOW_ACTOR_CAPTURE_CAPABILITY in capabilities
     )
 
 
@@ -660,17 +701,24 @@ def capture_window(
     expected_shell_instance: str | None = None,
 ) -> dict[str, Any]:
     selected = selected or resolve_window(arguments.get("window"))
-    active_lease = load_lease()
-    if active_lease and active_lease.get("owner_thread_id") is not None:
-        if active_lease["owner_thread_id"] != owner:
-            raise RuntimeError("capture cannot use another computer-use agent's focus lease")
-        require_bound_claim(active_lease, claim)
-    permitted = selected.get("focused") or (
-        active_lease and active_lease.get("phase") == "active" and
-        lease_window_id(active_lease) == str(selected.get("id"))
+    integration = (
+        require_shell_instance(expected_shell_instance)
+        if expected_shell_instance is not None
+        else None
     )
-    if not permitted:
-        raise RuntimeError("stock Mutter can only capture the focused window exactly; begin_focus_lease first")
+    actor_capture = bool(integration and shell_supports_window_actor_capture(integration))
+    if not actor_capture:
+        active_lease = load_lease()
+        if active_lease and active_lease.get("owner_thread_id") is not None:
+            if active_lease["owner_thread_id"] != owner:
+                raise RuntimeError("capture cannot use another computer-use agent's focus lease")
+            require_bound_claim(active_lease, claim)
+        permitted = selected.get("focused") or (
+            active_lease and active_lease.get("phase") == "active" and
+            lease_window_id(active_lease) == str(selected.get("id"))
+        )
+        if not permitted:
+            raise RuntimeError("stock Mutter can only capture the focused window exactly; begin_focus_lease first")
     destination_value = arguments.get("save_path")
     destination = Path(str(destination_value)).expanduser() if destination_value else None
     if destination and not destination.is_absolute():
@@ -678,46 +726,78 @@ def capture_window(
     directory = destination.parent if destination else None
     if directory:
         directory.mkdir(parents=True, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}." if destination else "gnome-window-", suffix=".png", dir=directory)
-    os.close(descriptor)
-    temporary = Path(name)
-    temporary.unlink(missing_ok=True)
-    try:
-        if expected_shell_instance is not None:
-            require_shell_instance(expected_shell_instance)
-        proc = run([
-            "gdbus", "call", "--session", "--dest", "org.gnome.Shell.Screenshot",
-            "--object-path", "/org/gnome/Shell/Screenshot", "--method",
-            "org.gnome.Shell.Screenshot.ScreenshotWindow", "true", "false", "false", str(temporary),
-        ], timeout=20)
-        if proc.returncode or not temporary.is_file():
-            if not shutil.which("gnome-screenshot"):
-                raise RuntimeError(proc.stderr.strip() or "GNOME focused-window screenshot service failed")
-            fallback = run(["gnome-screenshot", "-w", "-f", str(temporary)], timeout=20)
-            if fallback.returncode or not temporary.is_file():
-                raise RuntimeError(fallback.stderr.strip() or "focused-window capture failed")
-        if expected_shell_instance is None:
-            current = resolve_window(str(selected["id"]))
-        else:
-            current, _ = resolve_window_for_shell(
-                str(selected["id"]), expected_shell_instance
-            )
-        if not current.get("focused"):
-            raise RuntimeError("the leased window lost focus during capture; screenshot discarded")
-        raw = read_bounded_png(temporary)
-        temporary.chmod(0o600)
+    capture_source = "focused-window-screenshot"
+    capture_requires_focus = True
+    potentially_stale = False
+    if actor_capture:
+        raw, capture_metadata = dbus_capture_window(str(selected["id"]))
+        if len(raw) > MAX_CAPTURE_PNG_BYTES:
+            raise RuntimeError(f"captured PNG exceeds the {MAX_CAPTURE_PNG_BYTES}-byte MCP transport limit")
+        if not valid_png(raw):
+            raise RuntimeError("window actor capture returned an invalid PNG")
+        if capture_metadata.get("shell_instance") != expected_shell_instance:
+            raise RuntimeError("GNOME Shell restarted during window actor capture")
+        current = capture_metadata.get("window")
+        if not isinstance(current, dict) or str(current.get("id")) != str(selected["id"]):
+            raise RuntimeError("GNOME integration returned capture data for a different window")
+        require_shell_instance(expected_shell_instance)
+        selected = current
+        capture_source = "meta-window-actor"
+        capture_requires_focus = False
+        potentially_stale = capture_metadata.get("potentially_stale") is True
         if destination:
-            temporary.replace(destination)
-    finally:
+            descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".png", dir=directory)
+            temporary = Path(name)
+            try:
+                with os.fdopen(descriptor, "wb") as image:
+                    image.write(raw)
+                    image.flush()
+                    os.fsync(image.fileno())
+                temporary.chmod(0o600)
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+    else:
+        descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}." if destination else "gnome-window-", suffix=".png", dir=directory)
+        os.close(descriptor)
+        temporary = Path(name)
         temporary.unlink(missing_ok=True)
+        try:
+            proc = run([
+                "gdbus", "call", "--session", "--dest", "org.gnome.Shell.Screenshot",
+                "--object-path", "/org/gnome/Shell/Screenshot", "--method",
+                "org.gnome.Shell.Screenshot.ScreenshotWindow", "true", "false", "false", str(temporary),
+            ], timeout=20)
+            if proc.returncode or not temporary.is_file():
+                if not shutil.which("gnome-screenshot"):
+                    raise RuntimeError(proc.stderr.strip() or "GNOME focused-window screenshot service failed")
+                fallback = run(["gnome-screenshot", "-w", "-f", str(temporary)], timeout=20)
+                if fallback.returncode or not temporary.is_file():
+                    raise RuntimeError(fallback.stderr.strip() or "focused-window capture failed")
+            if expected_shell_instance is None:
+                current = resolve_window(str(selected["id"]))
+            else:
+                current, _ = resolve_window_for_shell(
+                    str(selected["id"]), expected_shell_instance
+                )
+            if not current.get("focused"):
+                raise RuntimeError("the leased window lost focus during capture; screenshot discarded")
+            raw = read_bounded_png(temporary)
+            temporary.chmod(0o600)
+            if destination:
+                temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
     summary = window_summary(selected)
     frame = summary["frame"]
     metadata = {
         "window": summary,
         "saved_to": str(destination) if destination else None,
         "coordinate_space": coordinate_space(frame, raw),
-        "capture_requires_focus": True,
+        "capture_requires_focus": capture_requires_focus,
         "focus_changed_by_capture": False,
+        "capture_source": capture_source,
+        "potentially_stale": potentially_stale,
     }
     return {
         "content": [
@@ -946,6 +1026,7 @@ def status() -> dict[str, Any]:
     checks["focused_window_screenshot"] = screenshot_service or shutil.which("gnome-screenshot") is not None
     ready = integration is not None
     claimed_leases_ready = ready and shell_supports_claimed_leases(integration)
+    actor_capture_ready = ready and shell_supports_window_actor_capture(integration)
     claim_count: int | None = None
     claim_error: str | None = None
     if integration:
@@ -960,8 +1041,8 @@ def status() -> dict[str, Any]:
         "capabilities": {
             "window_enumeration": ready,
             "stable_window_ids": ready,
-            "exact_background_window_capture": False,
-            "exact_focused_window_capture": ready and checks["focused_window_screenshot"],
+            "exact_background_window_capture": actor_capture_ready,
+            "exact_focused_window_capture": actor_capture_ready or (ready and checks["focused_window_screenshot"]),
             "background_semantic_actions": False,
             "targeted_background_pointer": False,
             "targeted_background_keyboard": False,
@@ -974,13 +1055,14 @@ def status() -> dict[str, Any]:
             **checks,
             "gnome_shell_extension": ready,
             "claimed_focus_lease_protocol": claimed_leases_ready,
+            "window_actor_capture_protocol": actor_capture_ready,
             "background_semantic_actions": "provided by the separate computer-use-linux@codex-computer-use-linux AT-SPI plugin; broker claims are policy coordination there, not a mechanical fence",
         },
         "active_lease": load_lease() is not None,
         "active_window_claims": claim_count,
         "claim_journal_error": claim_error,
         "session_identity": SESSION_IDENTITY,
-        "safety_note": "Mutter exposes one global seat; lease input can visibly contend with physical input and cannot detect every held hardware button.",
+        "safety_note": "Window-actor capture does not change focus. Minimized clients may stop rendering, so their capture can contain the last compositor buffer. Mutter still exposes one global seat; lease input can visibly contend with physical input and cannot detect every held hardware button.",
     }
 
 
@@ -1184,7 +1266,7 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": SERVER_INFO,
-                "instructions": "Operate the real GNOME session. Claim one window per parallel agent, treat claims as cooperative policy for the separate AT-SPI process, and use this broker's serialized acknowledged focus-lease lane for capture or global-seat input.",
+                "instructions": "Operate the real GNOME session. Claim one window per parallel agent, capture claimed windows without changing focus when window_actor_capture_protocol is available, and use an acknowledged focus lease only for global-seat input or the legacy focused-window capture fallback.",
             }
         elif method == "tools/list":
             result = {"tools": TOOLS}

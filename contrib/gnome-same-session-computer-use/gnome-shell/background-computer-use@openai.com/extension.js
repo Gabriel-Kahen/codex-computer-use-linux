@@ -23,7 +23,9 @@ import {
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.BackgroundComputerUse';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/BackgroundComputerUse';
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
+const MAX_CAPTURE_BYTES = 5 * 1024 * 1024;
+const MAX_CAPTURE_PIXELS = 7680 * 4320;
 const XML = `<node>
   <interface name="org.gnome.Shell.Extensions.BackgroundComputerUse">
     <method name="Status"><arg type="s" direction="out"/></method>
@@ -36,8 +38,11 @@ const XML = `<node>
     <method name="RecoverLease"><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="InjectPointer"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="InjectKeys"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="CaptureWindow"><arg type="s" direction="in"/><arg type="ay" direction="out"/><arg type="s" direction="out"/></method>
   </interface>
 </node>`;
+
+Gio._promisify(Shell.Screenshot, 'composite_to_stream');
 
 function json(value) {
     return JSON.stringify(value);
@@ -52,6 +57,7 @@ export default class BackgroundComputerUseExtension extends Extension {
         this._protocol = new LeaseProtocol();
         this._shellInstance = GLib.uuid_string_random();
         this._leaseExpiryId = null;
+        this._captureActive = false;
         this._object = Gio.DBusExportedObject.wrapJSObject(XML, this);
         this._object.export(Gio.DBus.session, OBJECT_PATH);
         this._owner = Gio.bus_own_name_on_connection(
@@ -79,6 +85,7 @@ export default class BackgroundComputerUseExtension extends Extension {
         this._protocol = null;
         this._shellInstance = null;
         this._leaseExpiryId = null;
+        this._captureActive = false;
     }
 
     _windows() {
@@ -179,7 +186,7 @@ export default class BackgroundComputerUseExtension extends Extension {
     Status() {
         return json({
             protocol_version: PROTOCOL_VERSION,
-            capabilities: ['claimed_focus_leases'],
+            capabilities: ['claimed_focus_leases', 'window_actor_capture'],
             shell_version: Config.PACKAGE_VERSION,
             locked: Main.sessionMode.isLocked,
             overview_visible: Main.overview.visible,
@@ -193,6 +200,72 @@ export default class BackgroundComputerUseExtension extends Extension {
 
     ListWindows() {
         return json(this._windows().map(window => this._window(window)));
+    }
+
+    CaptureWindowAsync([id], invocation) {
+        this._captureWindow(id)
+            .then(({bytes, metadata}) => {
+                invocation.return_value(new GLib.Variant('(ays)', [bytes, json(metadata)]));
+            })
+            .catch(error => {
+                invocation.return_dbus_error(
+                    `${BUS_NAME}.Error`, String(error.message ?? error));
+            });
+    }
+
+    async _captureWindow(id) {
+        if (Main.sessionMode.isLocked)
+            throw new Error('cannot capture a window while the GNOME session is locked');
+        if (this._captureActive)
+            throw new Error('another window capture is already in progress');
+
+        const window = this._find(id);
+        const actor = window.get_compositor_private();
+        if (!actor || actor.is_destroyed())
+            throw new Error(`window ${id} has no live compositor actor`);
+
+        this._captureActive = true;
+        try {
+            const content = actor.paint_to_content(null);
+            if (!content)
+                throw new Error(`window ${id} has no capturable compositor content`);
+            const texture = content.get_texture();
+            if (!texture)
+                throw new Error(`window ${id} has no capturable compositor texture`);
+            const width = texture.get_width();
+            const height = texture.get_height();
+            if (width <= 0 || height <= 0 || width * height > MAX_CAPTURE_PIXELS)
+                throw new Error(`window ${id} capture dimensions are outside the supported bounds`);
+
+            const stream = Gio.MemoryOutputStream.new_resizable();
+            await Shell.Screenshot.composite_to_stream(
+                texture,
+                0, 0, -1, -1,
+                1,
+                null, 0, 0, 1,
+                stream,
+            );
+            stream.close(null);
+            const bytes = stream.steal_as_bytes().get_data();
+            if (bytes.length > MAX_CAPTURE_BYTES)
+                throw new Error(`captured PNG exceeds the ${MAX_CAPTURE_BYTES}-byte transport limit`);
+
+            const current = this._find(id);
+            if (current.get_compositor_private() !== actor || actor.is_destroyed())
+                throw new Error(`window ${id} changed while it was being captured`);
+            return {
+                bytes,
+                metadata: {
+                    window: this._window(current),
+                    screenshot_pixels: {width, height},
+                    shell_instance: this._shellInstance,
+                    source: 'meta-window-actor',
+                    potentially_stale: Boolean(current.minimized),
+                },
+            };
+        } finally {
+            this._captureActive = false;
+        }
     }
 
     BeginLeaseAsync([id], invocation) {

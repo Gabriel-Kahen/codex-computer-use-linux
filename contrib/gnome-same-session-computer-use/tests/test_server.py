@@ -743,6 +743,34 @@ class StatusTests(TestCase):
         self.assertTrue(capabilities["recoverable_focus_lease"])
         self.assertTrue(capabilities["parallel_window_claims"])
 
+    def test_reports_window_actor_capture_without_claiming_background_input(self) -> None:
+        integration = {
+            "shell_version": "45",
+            "shell_instance": "shell-1",
+            "protocol_version": server.WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION,
+            "capabilities": [
+                server.CLAIMED_LEASE_CAPABILITY,
+                server.WINDOW_ACTOR_CAPTURE_CAPABILITY,
+            ],
+        }
+        with (
+            patch.dict(server.os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}),
+            patch.object(server, "Gio", object()),
+            patch.object(server, "GLib", object()),
+            patch.object(server.shutil, "which", return_value=None),
+            patch.object(server, "dbus_call", return_value=integration),
+            patch.object(server, "load_lease", return_value=None),
+            patch.object(server.CLAIMS, "list", return_value=[]),
+        ):
+            result = server.status()
+
+        capabilities = result["capabilities"]
+        self.assertTrue(capabilities["exact_background_window_capture"])
+        self.assertTrue(capabilities["exact_focused_window_capture"])
+        self.assertFalse(capabilities["targeted_background_pointer"])
+        self.assertFalse(capabilities["targeted_background_keyboard"])
+        self.assertTrue(result["requirements"]["window_actor_capture_protocol"])
+
     def test_old_extension_keeps_legacy_leases_but_disables_claimed_leases(self) -> None:
         legacy = {"shell_version": "45", "shell_instance": "shell-1"}
         with (
