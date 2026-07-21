@@ -220,7 +220,14 @@ def ensure_native_input_safe() -> dict[str, Any]:
     if status.get("safe_to_inject") is not True:
         blocked = [
             name
-            for name in ("session_locked", "held_buttons", "pointer_constrained", "pointer_locked", "dnd_active")
+            for name in (
+                "session_locked",
+                "held_buttons",
+                "pointer_constrained",
+                "pointer_locked",
+                "pointer_grab",
+                "dnd_active",
+            )
             if status.get(name) is True
         ]
         if status.get("pointer_seat") is not True:

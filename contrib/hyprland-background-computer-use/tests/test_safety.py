@@ -315,9 +315,15 @@ class PluginBuildTests(TestCase):
 
 class SafetyProbeTests(TestCase):
     def test_rejects_an_unsafe_native_status(self) -> None:
-        status = {"ok": True, "safe_to_inject": False, "pointer_seat": True, "held_buttons": True}
+        status = {"safe_to_inject": False, "pointer_seat": True, "held_buttons": True}
         with patch.object(native_plugin, "native_input_status", return_value=status):
             with self.assertRaisesRegex(RuntimeError, "held_buttons"):
+                native_plugin.ensure_native_input_safe()
+
+    def test_rejects_an_active_pointer_grab(self) -> None:
+        status = {"safe_to_inject": False, "pointer_seat": True, "pointer_grab": True}
+        with patch.object(native_plugin, "native_input_status", return_value=status):
+            with self.assertRaisesRegex(RuntimeError, "pointer_grab"):
                 native_plugin.ensure_native_input_safe()
 
     def test_xwayland_pointer_checks_safety_before_snapshot(self) -> None:
