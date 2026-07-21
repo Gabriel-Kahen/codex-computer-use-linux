@@ -121,7 +121,7 @@ fn unscoped_capture_is_rejected_while_any_claim_is_live() {
         .unwrap();
     assert_eq!(
         error,
-        "window_id is required for capture while this session has active window claims"
+        "window_id is required while this session has active window claims"
     );
     fs::remove_dir_all(root).unwrap();
 }

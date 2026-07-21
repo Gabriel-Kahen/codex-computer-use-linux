@@ -33,7 +33,7 @@ This project lets an automation agent inspect and operate the applications that 
 
 The broker identifies each caller from the host-only `tools/call.params._meta.threadId`; tool arguments cannot override that identity. A window claim has a 60-second default lease (configurable from 5 to 300 seconds), an opaque `claim_token`, and an absolute `expires_at`. Reclaiming from the same task renews the lease without rotating its live token. Another task cannot capture or mutate the claimed window through this broker, even if it omits the token. Supplying the token adds explicit fencing, and a stale or wrong-window token is rejected.
 
-Claim state is atomically replaced, mode `0600`, and scoped to the real user's Wayland display and Hyprland instance. Cross-process file locks make same-window claim and mutation races deterministic. Different native Wayland windows use separate locks and can progress concurrently. Same-window operations remain serialized. XWayland, global-seat, and coordinate-fallback operations issued through this broker use one global lane because those paths share compositor or XTEST state. The repository's generic Computer Use server consumes the same claim state and locks for standalone screenshot capture: pass the claim result's `owner_thread_id` and `claim_token` to `get_app_state` or `screenshot`. Generic AT-SPI, portal, input, and combined action-and-observe mutations are not yet claim-enforced.
+Claim state is atomically replaced, mode `0600`, and scoped to the real user's Wayland display and Hyprland instance. Cross-process file locks make same-window claim and mutation races deterministic. Different native Wayland windows use separate locks and can progress concurrently. Same-window operations remain serialized. XWayland, global-seat, and coordinate-fallback operations use one global lane because those paths share compositor or XTEST state. The generic Computer Use server takes that same global lane before its window lock for physical-seat input, and consumes the same claim state and window locks for capture, AT-SPI, portal, pointer, keyboard, text, and combined action-and-observe operations: pass the claim result's `owner_thread_id` and `claim_token` to those tools.
 
 The native extension sends a complete event transaction directly to the selected Wayland surface, then restores pointer focus before the next compositor event. It never moves Hyprland's physical pointer. XWayland actions snapshot and restore XWayland's separate internal pointer.
 
@@ -46,7 +46,7 @@ Window discovery is paginated and bounds compositor-provided text only when retu
 For a prompt that can be split across windows, the coordinating agent should enumerate the current windows and give each worker a distinct target. Every worker then:
 
 1. Calls `claim_session_window` before its first capture or action.
-2. Passes the returned `claim_token` to this broker's capture, targeted pointer/shortcut, and coordinate-lease tools. Passes both `owner_thread_id` and `claim_token` to the generic Computer Use capture tools.
+2. Passes the returned `claim_token` to this broker's capture, targeted pointer/shortcut, and coordinate-lease tools. Passes both `owner_thread_id` and `claim_token` to the generic Computer Use capture and mutation tools.
 3. Lets claimed broker operations renew automatically, and calls `claim_session_window` before `expires_at` during longer external semantic work. A renewal from the same task keeps the token stable.
 4. Recaptures immediately before coordinate selection and after each mutation.
 5. Ends any coordinate lease and calls `release_session_window` in cleanup, including after failures.
@@ -94,7 +94,7 @@ codex plugin add computer-use-linux@codex-computer-use-linux
 codex plugin add same-session-computer-use@codex-computer-use-linux
 ```
 
-Start a new Codex task after installation. The repository-owned `computer-use-linux@codex-computer-use-linux` plugin owns AT-SPI semantic actions and focus-dependent global input. This plugin adds task-owned window claims, exact Hyprland window capture, address-targeted shortcuts, native Wayland pointer targeting, XWayland pointer targeting, and the transactional headless-output lease. The generic plugin reads the same claim state and takes the same per-window locks for screenshot capture. Its mutation paths still require policy coordination until the follow-up enforcement stage lands.
+Start a new Codex task after installation. The repository-owned `computer-use-linux@codex-computer-use-linux` plugin owns AT-SPI semantic actions and focus-dependent global input. This plugin adds task-owned window claims, exact Hyprland window capture, address-targeted shortcuts, native Wayland pointer targeting, XWayland pointer targeting, and the transactional headless-output lease. The generic plugin reads the same claim state and takes the same per-window locks across capture and mutation paths.
 
 Check that Codex sees both plugins:
 

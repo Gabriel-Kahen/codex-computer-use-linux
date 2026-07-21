@@ -15,14 +15,25 @@ const MAX_CLAIM_TOKEN_LENGTH: usize = 128;
 /// Credentials returned by the Hyprland companion's `claim_session_window` tool.
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct ClaimContext {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub(crate) owner_thread_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub(crate) claim_token: Option<String>,
 }
 
 pub(crate) struct ClaimGuard {
     _lock: File,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum MutationLane {
+    Window,
+    PhysicalSeat,
+}
+
+pub(crate) struct MutationGuards {
+    _claim: ClaimGuard,
+    _global_input: Option<File>,
 }
 
 #[derive(Clone)]
@@ -95,6 +106,29 @@ impl Coordinator {
         }
     }
 
+    fn acquire_mutation(
+        &self,
+        window_id: Option<u64>,
+        context: &ClaimContext,
+        lane: MutationLane,
+    ) -> Result<MutationGuards, String> {
+        self.prepare_state_dir()?;
+        let global_input = match lane {
+            MutationLane::Window => None,
+            MutationLane::PhysicalSeat => {
+                let lock = open_lock(&self.state_dir.join("pointer-transaction.lock"))?;
+                FileExt::lock_exclusive(&lock)
+                    .map_err(|error| format!("failed to lock global input lane: {error}"))?;
+                Some(lock)
+            }
+        };
+        let claim = self.acquire(window_id, context)?;
+        Ok(MutationGuards {
+            _claim: claim,
+            _global_input: global_input,
+        })
+    }
+
     fn acquire_window(&self, window_id: u64, context: &ClaimContext) -> Result<ClaimGuard, String> {
         validate_context(context)?;
         let address = format!("0x{window_id:x}");
@@ -132,8 +166,7 @@ impl Coordinator {
             .map_err(|error| format!("failed to read window claims: {error}"))?;
         if !self.live_claims()?.is_empty() {
             return Err(
-                "window_id is required for capture while this session has active window claims"
-                    .to_string(),
+                "window_id is required while this session has active window claims".to_string(),
             );
         }
         Ok(ClaimGuard { _lock: lock })
@@ -216,6 +249,24 @@ pub(crate) async fn acquire_claim_guard(
         .await
         .map_err(|error| format!("window claim check failed: {error}"))??;
     Ok(Some(guard))
+}
+
+pub(crate) async fn acquire_mutation_guards(
+    coordinator: Option<Coordinator>,
+    window_id: Option<u64>,
+    context: &ClaimContext,
+    lane: MutationLane,
+) -> Result<Option<MutationGuards>, String> {
+    let Some(coordinator) = coordinator else {
+        return Ok(None);
+    };
+    let context = context.clone();
+    let guards = tokio::task::spawn_blocking(move || {
+        coordinator.acquire_mutation(window_id, &context, lane)
+    })
+    .await
+    .map_err(|error| format!("window claim check failed: {error}"))??;
+    Ok(Some(guards))
 }
 
 fn env_value(name: &str) -> serde_json::Value {
