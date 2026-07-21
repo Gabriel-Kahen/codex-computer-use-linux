@@ -1,7 +1,7 @@
 use crate::diagnostics::hydrate_session_bus_env;
 use crate::screenshot::RawScreenshotCapture;
 use crate::screenshot_impl::{read_png_as_capture_inner, temp_png_path};
-use crate::windowing::backends::{hyprland, kwin, x11_native};
+use crate::windowing::backends::{hyprland, kwin, niri::NIRI_BACKEND, niri_capture, x11_native};
 use crate::windowing::{WindowInfo, HYPRLAND_BACKEND, KWIN_BACKEND, X11_BACKEND};
 use anyhow::{bail, Context, Result};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -26,13 +26,16 @@ const KWIN_SCREENSHOT_INTERFACE: &str = "org.kde.KWin.ScreenShot2";
 static GRIM_EXACT_CAPTURE: OnceCell<bool> = OnceCell::const_new();
 static KWIN_EXACT_CAPTURE: OnceCell<bool> = OnceCell::const_new();
 
-/// Capture exact window-local pixels, returning `None` when the runtime lacks
-/// compositor-native support. Once support is confirmed, capture failures are
-/// returned rather than falling back to desktop pixels.
+/// Capture exact window-local pixels. Backends with trustworthy desktop bounds
+/// may return `None` when native capture is unavailable and use the existing
+/// crop path. Niri has no global window origin, so missing exact-capture
+/// prerequisites and capture failures are explicit errors rather than desktop
+/// substitutions.
 pub(crate) async fn capture_window_exact(
     window: &WindowInfo,
 ) -> Result<Option<RawScreenshotCapture>> {
     match window.backend.as_str() {
+        NIRI_BACKEND => niri_capture::capture_window_exact(window).await.map(Some),
         KWIN_BACKEND => capture_kwin_window_exact(window).await,
         HYPRLAND_BACKEND => capture_hyprland_window_exact(window).await,
         X11_BACKEND => capture_x11_window_exact(window).await,
