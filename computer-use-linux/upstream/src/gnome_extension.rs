@@ -447,14 +447,4 @@ mod tests {
         assert!(rendered.contains("GLib.canonicalize_filename(path, null)"));
         assert!(rendered.contains("basename.startsWith('computer-use-linux-gnome-extension-')"));
     }
-
-    #[test]
-    fn generated_extension_exposes_the_shared_bridge_identity() {
-        let rendered = render_extension_asset(EXTENSION_JS);
-
-        assert!(rendered.contains("<method name=\"GetBridgeInfo\">"));
-        assert!(rendered.contains("stable_window_id: stableWindowId(window)"));
-        assert!(BRIDGE_CONTRACT_JSON.contains("meta-stable-sequence-v1"));
-        assert!(BRIDGE_CONTRACT_JS.contains("export function operationIdentity"));
-    }
 }

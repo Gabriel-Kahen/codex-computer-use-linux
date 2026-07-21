@@ -393,12 +393,14 @@ def save_lease(state: dict[str, Any]) -> None:
 
 def shell_contract_valid(integration: dict[str, Any]) -> bool:
     actual = integration.get("bridge_contract")
+    capabilities = integration.get("capabilities")
     return (
         isinstance(actual, dict)
         and actual.get("role") == "background-computer-use"
         and all(actual.get(key) == value for key, value in BRIDGE_CONTRACT.items())
         and isinstance(actual.get("features"), list)
-        and BRIDGE_CONTRACT_CAPABILITY in integration.get("capabilities", [])
+        and isinstance(capabilities, list)
+        and BRIDGE_CONTRACT_CAPABILITY in capabilities
     )
 
 
@@ -575,8 +577,11 @@ def begin_lease(
     if load_lease():
         raise RuntimeError("a focus lease is already active; end or recover it first")
     selected = selected or resolve_window(arguments.get("window"))
-    if expected_shell_instance is not None:
+    integration = (
         require_shell_instance(expected_shell_instance)
+        if expected_shell_instance is not None
+        else None
+    )
     if claim:
         prepared = dbus_call(
             "BeginClaimedLease", str(selected["id"]), claim_recovery_seconds(claim)
@@ -589,8 +594,14 @@ def begin_lease(
     if not isinstance(capability, str) or not 64 <= len(capability) <= 256:
         raise RuntimeError("GNOME integration returned an invalid lease capability")
     lease_generation = prepared.get("lease_generation")
-    if lease_generation is not None and (
-        not isinstance(lease_generation, str) or not 32 <= len(lease_generation) <= 256
+    protocol_version = integration.get("protocol_version") if integration else None
+    generation_required = (
+        type(protocol_version) is int
+        and protocol_version >= BRIDGE_CONTRACT_PROTOCOL_VERSION
+    )
+    if (generation_required and lease_generation is None) or (
+        lease_generation is not None
+        and (not isinstance(lease_generation, str) or not 32 <= len(lease_generation) <= 256)
     ):
         raise RuntimeError("GNOME integration returned an invalid lease generation")
     state = {
@@ -868,17 +879,18 @@ def capture_window(
         else None
     )
     actor_capture = bool(integration and shell_supports_window_actor_capture(integration))
-    active_lease = load_lease()
-    if active_lease and active_lease.get("owner_thread_id") is not None:
-        if active_lease["owner_thread_id"] != owner:
-            raise RuntimeError("capture cannot use another computer-use agent's focus lease")
-        require_bound_claim(active_lease, claim)
-    permitted = selected.get("focused") or (
-        active_lease and active_lease.get("phase") == "active" and
-        lease_window_id(active_lease) == str(selected.get("id"))
-    )
-    if not permitted and not actor_capture:
-        raise RuntimeError("stock Mutter can only capture the focused window exactly; begin_focus_lease first")
+    if not actor_capture:
+        active_lease = load_lease()
+        if active_lease and active_lease.get("owner_thread_id") is not None:
+            if active_lease["owner_thread_id"] != owner:
+                raise RuntimeError("capture cannot use another computer-use agent's focus lease")
+            require_bound_claim(active_lease, claim)
+        permitted = selected.get("focused") or (
+            active_lease and active_lease.get("phase") == "active" and
+            lease_window_id(active_lease) == str(selected.get("id"))
+        )
+        if not permitted:
+            raise RuntimeError("stock Mutter can only capture the focused window exactly; begin_focus_lease first")
     if actor_capture and selected.get("minimized"):
         raise RuntimeError(
             "minimized GNOME windows may expose stale compositor buffers; use "
@@ -1243,7 +1255,15 @@ def act_and_observe(
         current = capture_metadata.get("window")
         if not isinstance(current, dict) or str(current.get("id")) != str(selected["id"]):
             raise RuntimeError("GNOME integration observed a different window after the action")
-        if capture_metadata.get("potentially_stale") is True or current.get("minimized") is True:
+        potentially_stale = capture_metadata.get("potentially_stale")
+        if (
+            potentially_stale is True
+            or current.get("minimized") is True
+            or (
+                integration.get("protocol_version", 0) >= BRIDGE_CONTRACT_PROTOCOL_VERSION
+                and potentially_stale is not False
+            )
+        ):
             raise RuntimeError("GNOME act-and-observe could not prove the captured buffer is fresh")
         require_operation_identity(
             capture_metadata,
@@ -1476,7 +1496,7 @@ def status() -> dict[str, Any]:
         "active_window_claims": claim_count,
         "claim_journal_error": claim_error,
         "session_identity": SESSION_IDENTITY,
-        "safety_note": "Mapped window-actor capture does not change focus. Minimized buffers are never returned directly; the explicit minimized-capture transaction briefly activates and unminimizes the target under a recovery lease, requires client damage plus a compositor paint before capture, then restores minimized state, workspace, and focus. Mutter still exposes one global seat; lease input can visibly contend with physical input and cannot detect every held hardware button.",
+        "safety_note": "Mapped window-actor capture does not change focus. Minimized buffers are never returned directly; the explicit minimized-capture transaction briefly activates and unminimizes the target under a recovery lease, requires client damage plus a compositor paint before capture, then restores minimized state, workspace, focus, and pointer. Mutter still exposes one global seat; lease input can visibly contend with physical input and cannot detect every held hardware button.",
     }
 
 
@@ -1712,7 +1732,7 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": SERVER_INFO,
-                "instructions": "Operate the real GNOME session. Claim one window per parallel agent, treat claims as cooperative policy for the separate AT-SPI process, and use this broker's serialized acknowledged focus-lease lane for capture or global-seat input.",
+                "instructions": "Operate the real GNOME session. Claim one window per parallel agent, capture claimed windows without changing focus when window_actor_capture_protocol is available, and use an acknowledged focus lease only for global-seat input or the legacy focused-window capture fallback.",
             }
         elif method == "tools/list":
             result = {"tools": TOOLS}

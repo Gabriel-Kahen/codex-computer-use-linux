@@ -14,9 +14,10 @@ import {
     renewLeaseAsync,
 } from './lease_dbus.js';
 import {
+    actAndCaptureTransaction,
     activateLeaseTransaction,
     assertInputSafe,
-    assertFreshWindowFrame,
+    captureMinimizedWindowTransaction,
     injectKeyTransaction,
     injectPointerTransaction,
     restoreLeaseTransaction,
@@ -326,66 +327,63 @@ export default class BackgroundComputerUseExtension extends Extension {
             throw new Error('another window capture is already in progress');
 
         this._captureActive = true;
-        const startedUsec = GLib.get_monotonic_time();
-        let captured = null;
-        let settle = null;
-        let operationError = null;
         try {
-            this._assertInputSafe();
-            const target = this._find(lease.target);
-            const freshFrame = this._waitForWindowFrame(target, 1000);
-            const time = global.get_current_time();
-            activateLeaseTransaction(lease, {
-                findWindow: id => this._windows().find(window => this._id(window) === id) ?? null,
-                workspaceForWindow: window => window.get_workspace(),
-                markLeaseActive: () => this._protocol.activate(capability, sender),
-                activateWorkspace: workspace => workspace.activate(time),
-                unminimizeWindow: window => window.unminimize(),
-                focusWindow: window => window.activate(time),
-                state: () => this._state(),
+            let unminimized = false;
+            const {captured, transaction} = await captureMinimizedWindowTransaction(lease.target, {
+                armWindowFrame: () => this._armWindowFrame(
+                    this._find(lease.target), 1000, () => unminimized),
+                activate: () => {
+                    this._assertInputSafe();
+                    const time = global.get_current_time();
+                    activateLeaseTransaction(lease, {
+                        findWindow: id => this._windows().find(window => this._id(window) === id) ?? null,
+                        workspaceForWindow: window => window.get_workspace(),
+                        markLeaseActive: () => this._protocol.activate(capability, sender),
+                        activateWorkspace: workspace => workspace.activate(time),
+                        unminimizeWindow: window => {
+                            unminimized = true;
+                            window.unminimize();
+                        },
+                        focusWindow: window => window.activate(time),
+                        state: () => this._state(),
+                    });
+                    this._cancelPendingExpiry();
+                },
+                capture: async () => {
+                    const captured = await this._captureMappedWindow(lease.target);
+                    captured.metadata.source = 'meta-window-actor-freshened';
+                    captured.metadata.freshness = 'client-damage-after-unminimize';
+                    captured.metadata.operation_identity = operationIdentity(
+                        this._bridgeContract,
+                        this._shellInstance,
+                        this._find(lease.target),
+                        'fresh-minimized-capture',
+                        lease.generation,
+                    );
+                    return captured;
+                },
+                restore: () => this._restoreLease(lease),
+                monotonicTimeUsec: () => GLib.get_monotonic_time(),
             });
-            this._cancelPendingExpiry();
-            settle = await freshFrame;
-            assertFreshWindowFrame(settle, lease.target);
-            captured = await this._captureMappedWindow(lease.target);
-            captured.metadata.source = 'meta-window-actor-freshened';
-            captured.metadata.freshness = 'client-damage-after-unminimize';
-            captured.metadata.operation_identity = operationIdentity(
-                this._bridgeContract,
-                this._shellInstance,
-                this._find(lease.target),
-                'fresh-minimized-capture',
-                lease.generation,
-            );
-        } catch (error) {
-            operationError = error;
+            captured.metadata.window = this._window(this._find(lease.target));
+            captured.metadata.transaction = transaction;
+            return captured;
         } finally {
             this._captureActive = false;
         }
-
-        const restoration = this._restoreLease(lease);
-        if (restoration.recovery_complete !== true) {
-            throw new Error(
-                `fresh minimized capture completed without full desktop restoration: ${json(restoration.errors ?? [])}`);
-        }
-        if (operationError)
-            throw operationError;
-
-        captured.metadata.window = this._window(this._find(lease.target));
-        captured.metadata.transaction = {
-            settle,
-            restoration,
-            interference_milliseconds: (GLib.get_monotonic_time() - startedUsec) / 1000,
-        };
-        return captured;
     }
 
-    _waitForWindowFrame(window, timeoutMs = 180) {
+    _armWindowFrame(window, timeoutMs = 180, acceptDamage = () => true) {
         const actor = window.get_compositor_private();
-        if (!actor || actor.is_destroyed())
-            return Promise.resolve({reason: 'actor-unavailable'});
+        if (!actor || actor.is_destroyed()) {
+            return {
+                promise: Promise.resolve({reason: 'actor-unavailable'}),
+                cancel: () => {},
+            };
+        }
 
-        return new Promise(resolve => {
+        let cancel = null;
+        const promise = new Promise(resolve => {
             let damageId = 0;
             let destroyId = 0;
             let afterPaintId = 0;
@@ -405,8 +403,9 @@ export default class BackgroundComputerUseExtension extends Extension {
                 timeoutId = 0;
                 resolve({reason});
             };
+            cancel = () => finish('cancelled');
             damageId = actor.connect('damaged', () => {
-                if (afterPaintId)
+                if (afterPaintId || !acceptDamage())
                     return;
                 afterPaintId = global.stage.connect('after-paint', () => {
                     finish('damaged-and-painted');
@@ -420,6 +419,7 @@ export default class BackgroundComputerUseExtension extends Extension {
                 return GLib.SOURCE_REMOVE;
             });
         });
+        return {promise, cancel: () => cancel()};
     }
 
     ActAndCaptureAsync([capability, serialized], invocation) {
@@ -436,46 +436,25 @@ export default class BackgroundComputerUseExtension extends Extension {
     async _actAndCapture(capability, serialized, sender) {
         const lease = this._requireLease(capability, sender, 'active');
         const request = JSON.parse(serialized);
-        const startedUsec = GLib.get_monotonic_time();
-        let actionResult = null;
-        let settle = null;
-        let captured = null;
-        let operationError = null;
-
-        try {
-            if (request.kind === 'pointer')
-                actionResult = this._injectPointer(capability, json(request.action), sender);
-            else if (request.kind === 'keys')
-                actionResult = this._injectKeys(capability, json(request.action), sender);
-            else
-                throw new Error(`unsupported transactional action kind ${request.kind}`);
-            settle = await this._waitForWindowFrame(this._find(lease.target));
-            captured = await this._captureWindow(lease.target);
-            captured.metadata.operation_identity = operationIdentity(
-                this._bridgeContract,
-                this._shellInstance,
-                this._find(lease.target),
-                'act-and-capture',
-                lease.generation,
-            );
-        } catch (error) {
-            operationError = error;
-        }
-
-        const restoration = this._restoreLease(lease);
-        if (restoration.recovery_complete !== true) {
-            throw new Error(
-                `transaction completed without full desktop restoration: ${json(restoration.errors ?? [])}`);
-        }
-        if (operationError)
-            throw operationError;
-
-        captured.metadata.transaction = {
-            action: actionResult,
-            settle,
-            restoration,
-            interference_milliseconds: (GLib.get_monotonic_time() - startedUsec) / 1000,
-        };
+        const {captured, transaction} = await actAndCaptureTransaction(request, {
+            armWindowFrame: () => this._armWindowFrame(this._find(lease.target)),
+            injectPointer: action => this._injectPointer(capability, json(action), sender),
+            injectKeys: action => this._injectKeys(capability, json(action), sender),
+            capture: async () => {
+                const captured = await this._captureWindow(lease.target);
+                captured.metadata.operation_identity = operationIdentity(
+                    this._bridgeContract,
+                    this._shellInstance,
+                    this._find(lease.target),
+                    'act-and-capture',
+                    lease.generation,
+                );
+                return captured;
+            },
+            restore: () => this._restoreLease(lease),
+            monotonicTimeUsec: () => GLib.get_monotonic_time(),
+        });
+        captured.metadata.transaction = transaction;
         return captured;
     }
 
