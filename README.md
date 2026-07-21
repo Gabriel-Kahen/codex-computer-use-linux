@@ -8,6 +8,11 @@ computer use**: Codex can inspect and operate applications that are already
 running in your real desktop session while keeping their processes, profiles,
 signed-in state, files, and open windows.
 
+> [!IMPORTANT]
+> This is an experimental, independently maintained community fork. It is not
+> an OpenAI product, and OpenAI does not provide support for the Linux
+> integrations maintained here.
+
 Same-session computer use is one feature implemented across several desktop
 backends. Every backend uses the shared Linux engine for screenshots,
 accessibility, and input, then adds the compositor-specific behavior available
@@ -25,10 +30,12 @@ on that desktop.
   semantic elements or coordinates.
 - **Target the right window.** Supported backends can discover compositor
   windows, focus or claim an exact window, and verify targeted keyboard input.
-- **Work in the background where the desktop allows it.** Hyprland can send
-  input directly to a window, while Plasma and X11 can capture exact windows in
-  the background. When a desktop exposes only one keyboard and pointer, the
-  backend coordinates access and restores the user's state afterward.
+- **Work in the background where the desktop allows it.** Hyprland can capture
+  inactive windows and target shortcuts and pointer actions at them. Plasma and
+  X11 can capture inactive windows but use the shared desktop seat for reliable
+  input. GNOME generally needs to focus a window for exact capture or simulated
+  input. Accessibility actions can avoid focus on every backend when the
+  application exposes the required AT-SPI interfaces.
 - **Coordinate parallel agents.** The Hyprland, GNOME, Plasma, and X11 backends
   let each agent reserve a window so agents can work on different apps without
   racing each other. Actions that use the shared keyboard or pointer stay
@@ -44,15 +51,74 @@ on that desktop.
 
 ## Supported desktop backends
 
-| Desktop backend | Same-session capabilities | Background and input behavior | Declared support |
-|---|---|---|---|
-| [Hyprland](./contrib/hyprland-background-computer-use/) | Window discovery, exact inactive-window capture, AT-SPI, per-window claims, targeted shortcuts, and native Wayland/XWayland pointer actions | Window-local operations avoid the physical pointer; a recoverable workspace/output lease handles apps that require real focus | Full integration targets Hyprland 0.55.4; native extensions must match the running ABI |
-| [GNOME](./contrib/gnome-same-session-computer-use/) | Shell window discovery, screenshots, AT-SPI, per-window claims, and recoverable focus/workspace restoration | GNOME exposes one global seat, so exact capture and coordinate/keyboard work use serialized, acknowledged focus leases | Full integration targets GNOME Shell 45 on Wayland or Xorg; the shared engine can use GNOME Shell or portal paths on other releases |
-| [KDE Plasma](./contrib/plasma-same-session-computer-use/) | Stable KWin window IDs, AT-SPI, parallel exact capture, cross-process claims, and owner-bound recovery | Capture can stay in the background; keyboard and pointer work use one acknowledged global-seat lease | Full integration targets Plasma 6/KWin Wayland; the shared KWin backend supports window discovery and focus on Plasma 5/6 |
-| [Generic X11/EWMH](./contrib/x11-background-computer-use/) | EWMH discovery, AT-SPI, exact XComposite capture, per-window claims, best-effort no-focus shortcuts, and recoverable XTEST input | Capture can run per window; reliable input is serialized through the shared physical seat | Xorg desktops such as Xfce, Cinnamon, MATE, LXQt/Openbox, and legacy GNOME or KDE |
-| Niri | Niri IPC window discovery and focus plus shared screenshots, AT-SPI, and input | Uses the session's shared capture and input paths; no exact per-window background integration yet | Requires `NIRI_SOCKET` and working `niri msg` access |
-| COSMIC Wayland | COSMIC toplevel discovery and focus plus shared screenshots, AT-SPI, and input | Uses the session's shared capture and input paths | Uses the bundled `computer-use-linux-cosmic` helper |
-| i3 | i3 IPC window discovery and focus, optional process hydration, AT-SPI, capture, and X11 input | Uses the X11 shared seat for reliable input | Requires `i3-msg`; `xprop` adds process details |
+The most important distinction is between seeing a window and controlling it:
+
+- **Exact background capture** returns the pixels of one inactive window
+  without focusing, moving, or uncovering it.
+- **Semantic control** invokes an application's accessibility actions or edits
+  an accessible value directly. It is not simulated keyboard or pointer input,
+  and support depends on the application and control.
+- **Targeted background input** sends simulated input to one inactive window
+  while another window remains focused.
+- A **focus lease** temporarily activates the target, uses the desktop's shared
+  keyboard or pointer, and then restores the previous state. It is reliable but
+  may be visible and can briefly interfere with the user.
+
+The table describes capabilities provided by this repository, not separate
+application APIs such as browser automation, D-Bus, or OBS WebSocket.
+
+| Backend                                                    | Exact capture while inactive | Semantic UI/text changes  | Shortcuts while inactive | Pointer while inactive |
+| ---------------------------------------------------------- | ---------------------------- | ------------------------- | ------------------------ | ---------------------- |
+| [Hyprland](./contrib/hyprland-background-computer-use/)    | **Yes**                      | **Application-dependent** | **Yes**                  | **Yes**                |
+| [GNOME](./contrib/gnome-same-session-computer-use/)        | **No**                       | **Application-dependent** | **No**                   | **No**                 |
+| [KDE Plasma](./contrib/plasma-same-session-computer-use/)  | **Yes**                      | **Application-dependent** | **No**                   | **No**                 |
+| [Generic X11/EWMH](./contrib/x11-background-computer-use/) | **Usually**                  | **Application-dependent** | **Best effort**          | **No reliable path**   |
+| Niri                                                       | **No dedicated path**        | **Application-dependent** | **No dedicated path**    | **No dedicated path**  |
+| COSMIC Wayland                                             | **No dedicated path**        | **Application-dependent** | **No dedicated path**    | **No dedicated path**  |
+| i3                                                         | **No dedicated path**        | **Application-dependent** | **No dedicated path**    | **No dedicated path**  |
+
+In practical terms:
+
+- **Hyprland** provides the strongest background control. Codex can see a
+  window, send it shortcuts, and use its pointer while the user keeps working
+  in another window. General text editing still prefers AT-SPI, and applications
+  that insist on real focus use a recoverable temporary-output lease. Native
+  Wayland pointer targeting uses a Hyprland extension; XWayland uses its
+  internal XTEST pointer.
+- **GNOME** provides same-session automation, but not general inactive-window
+  capture or simulated input. Codex can sometimes operate an inactive window
+  through AT-SPI; otherwise an acknowledged focus/workspace lease must briefly
+  activate that window and restore the user's state afterward.
+- **Plasma** provides true background window capture, but not true background
+  keyboard or pointer input. Seeing an inactive window does not mean Codex can
+  type or click in it without focusing it. An acknowledged focus/desktop lease
+  provides the reliable fallback and restores focus, desktop, and pointer.
+- **X11** provides true background capture and unreliable no-focus shortcuts.
+  Reliable typing and pointer actions still require focus because modern
+  applications often reject targeted synthetic events. An acknowledged XTEST
+  lease focuses the target and restores desktop, focus, pointer, and minimized
+  state. Exact capture requires a mapped window; minimized windows must first
+  be restored.
+- **Niri, COSMIC, and i3** provide window discovery, focus, accessibility, and
+  shared input through the generic engine, without the stronger per-window
+  background-control and recovery guarantees of the companion integrations.
+  Compatible i3/EWMH sessions may instead use the X11 companion.
+
+### Declared targets
+
+- **Hyprland:** the full integration targets Hyprland 0.55.4. Its native
+  extension must be built for the exact running Hyprland ABI.
+- **GNOME:** the full Shell integration targets GNOME Shell 45 on Wayland or
+  Xorg. The shared engine can use more limited Shell or portal paths on other
+  releases, but those releases do not inherit the full integration's support
+  claim.
+- **Plasma:** the full integration targets Plasma 6 on KWin Wayland. The shared
+  engine also provides basic KWin window discovery and focus on Plasma 5 and 6.
+- **Generic X11/EWMH:** intended for Xorg desktops such as Xfce, Cinnamon,
+  MATE, LXQt/Openbox, and legacy GNOME or KDE sessions.
+- **Niri:** requires `NIRI_SOCKET` and working `niri msg` access.
+- **COSMIC Wayland:** uses the bundled `computer-use-linux-cosmic` helper.
+- **i3:** requires `i3-msg`; `xprop` adds process details when available.
 
 Real behavior depends on the portal, accessibility, compositor, and input
 services exposed by the current session. Call `doctor` for the authoritative
@@ -260,11 +326,11 @@ Read the desktop backend's safety section before enabling it:
 
 The repository contains three independently built layers:
 
-| Component | Source | Purpose |
-|---|---|---|
-| Codex | `codex-rs/` | CLI, TUI, app server, agent loop, and plugin host |
-| Linux Computer Use | `computer-use-linux/upstream/` | Linux screenshots, AT-SPI state, window discovery, input, and diagnostics |
-| Codex Linux integration | `computer-use-linux/` | Plugin launch, identity, provenance, update policy, and optional Chrome host |
+| Component               | Source                         | Purpose                                                                      |
+| ----------------------- | ------------------------------ | ---------------------------------------------------------------------------- |
+| Codex                   | `codex-rs/`                    | CLI, TUI, app server, agent loop, and plugin host                            |
+| Linux Computer Use      | `computer-use-linux/upstream/` | Linux screenshots, AT-SPI state, window discovery, input, and diagnostics    |
+| Codex Linux integration | `computer-use-linux/`          | Plugin launch, identity, provenance, update policy, and optional Chrome host |
 
 The Linux backend intentionally remains outside the cross-platform `codex-rs`
 Cargo workspace. Building Codex does not build the backend, and building the
@@ -368,6 +434,19 @@ plugin boundary keeps Linux-only dependencies out of the cross-platform Codex
 workspace while leaving room to move controller policy, approvals, leases, and
 tool registration into Codex later.
 
+## Contributing and support
+
+Pull requests for this fork belong in this repository. Please read
+[CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change. GitHub Issues and
+Discussions are not currently enabled, so the project does not presently offer
+a general support or feature-request channel. Report suspected vulnerabilities
+privately according to [SECURITY.md](SECURITY.md), not in a public pull request.
+
+For a problem that is reproducible in an unmodified OpenAI Codex checkout and
+does not involve this repository's Linux computer-use work, use the upstream
+[OpenAI Codex issue tracker](https://github.com/openai/codex/issues). Maintenance
+of this fork and its releases is provided on a best-effort basis.
+
 ## Credits, upstreams, and licenses
 
 This repository builds on and periodically pulls from:
@@ -387,6 +466,9 @@ This repository builds on and periodically pulls from:
 
 Refer to the [official Codex documentation](https://developers.openai.com/codex)
 for general Codex installation, authentication, IDE, app, and cloud usage. The
-Codex fork and desktop integrations are licensed under the
-[Apache-2.0 License](LICENSE). The imported Linux backend retains its
-[MIT license](computer-use-linux/LICENSE).
+Codex fork and repository-owned desktop integrations are licensed under the
+[Apache-2.0 License](LICENSE), with copyright retained by their respective
+contributors. The imported Linux backend retains its
+[MIT license](computer-use-linux/LICENSE). Codex and OpenAI names and marks
+belong to their respective owners; the Apache license does not grant trademark
+rights.
