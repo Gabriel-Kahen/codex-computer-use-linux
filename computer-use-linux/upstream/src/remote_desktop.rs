@@ -24,7 +24,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const DEVICE_KEYBOARD: u32 = 1;
 const DEVICE_POINTER: u32 = 2;
 const SOURCE_MONITOR: u32 = 1;
-const CURSOR_MODE_HIDDEN: u32 = 1;
 const BUTTON_LEFT: i32 = 272;
 const BUTTON_RIGHT: i32 = 273;
 const BUTTON_MIDDLE: i32 = 274;
@@ -114,7 +113,6 @@ pub enum ScrollDirection {
     Right,
 }
 
-#[derive(Clone, Copy)]
 enum PortalPersistence<'a> {
     Disabled,
     Enabled { restore_token: Option<&'a str> },
@@ -146,7 +144,7 @@ pub async fn start_portal_session(stream_mapping: PortalStreamMapping) -> Result
         None => PortalPersistence::Disabled,
     };
     if stream_mapping.required() {
-        select_monitor_sources(&connection, &session_handle, "rd_sources", persistence).await?;
+        select_monitor_sources(&connection, &session_handle, "rd_sources").await?;
     }
     select_devices(
         &connection,
@@ -266,47 +264,22 @@ pub async fn click(
         .await
         .map_err(PortalActionError::MayHaveDelivered)?;
     for _ in 0..count.clamp(1, 10) {
-        notify_pointer_button(&proxy, &session.session_handle, button, KEY_PRESSED)
-            .await
-            .map_err(PortalActionError::MayHaveDelivered)?;
-        notify_pointer_button(&proxy, &session.session_handle, button, KEY_RELEASED)
-            .await
-            .map_err(PortalActionError::MayHaveDelivered)?;
+        if let Err(error) =
+            notify_pointer_button(&proxy, &session.session_handle, button, KEY_PRESSED).await
+        {
+            let _ =
+                notify_pointer_button(&proxy, &session.session_handle, button, KEY_RELEASED).await;
+            return Err(PortalActionError::MayHaveDelivered(error));
+        }
+        if let Err(error) =
+            notify_pointer_button(&proxy, &session.session_handle, button, KEY_RELEASED).await
+        {
+            let _ =
+                notify_pointer_button(&proxy, &session.session_handle, button, KEY_RELEASED).await;
+            return Err(PortalActionError::MayHaveDelivered(error));
+        }
     }
     Ok(())
-}
-
-pub async fn drag(
-    session: &PortalPointerSession,
-    start: (i32, i32),
-    end: (i32, i32),
-) -> std::result::Result<(), PortalActionError> {
-    let start = session
-        .map_desktop_point(start.0, start.1)
-        .map_err(PortalActionError::PreDispatch)?;
-    let end = session
-        .map_desktop_point(end.0, end.1)
-        .map_err(PortalActionError::PreDispatch)?;
-    if start.0 != end.0 {
-        return Err(PortalActionError::PreDispatch(anyhow::anyhow!(
-            "portal drag endpoints are on different ScreenCast streams"
-        )));
-    }
-    let proxy = remote_desktop_proxy(&session.connection)
-        .await
-        .map_err(PortalActionError::PreDispatch)?;
-    notify_pointer_motion_absolute(&proxy, &session.session_handle, start)
-        .await
-        .map_err(PortalActionError::MayHaveDelivered)?;
-    notify_pointer_button(&proxy, &session.session_handle, BUTTON_LEFT, KEY_PRESSED)
-        .await
-        .map_err(PortalActionError::MayHaveDelivered)?;
-    notify_pointer_motion_absolute(&proxy, &session.session_handle, end)
-        .await
-        .map_err(PortalActionError::MayHaveDelivered)?;
-    notify_pointer_button(&proxy, &session.session_handle, BUTTON_LEFT, KEY_RELEASED)
-        .await
-        .map_err(PortalActionError::MayHaveDelivered)
 }
 
 fn scroll_axis_and_steps(direction: ScrollDirection, steps: i32) -> (u32, i32) {
@@ -465,9 +438,8 @@ async fn select_monitor_sources(
     connection: &Connection,
     session: &OwnedObjectPath,
     request_prefix: &str,
-    persistence: PortalPersistence<'_>,
 ) -> Result<()> {
-    let proxy = screen_cast_proxy(connection).await?;
+    let screen_cast_proxy = screen_cast_proxy(connection).await?;
     let (request_path, mut response_stream) =
         portal_request_stream(connection, request_prefix).await?;
     let mut options: HashMap<&str, Value<'_>> = HashMap::new();
@@ -477,20 +449,7 @@ async fn select_monitor_sources(
     );
     options.insert("types", Value::from(SOURCE_MONITOR));
     options.insert("multiple", Value::from(true));
-    options.insert("cursor_mode", Value::from(CURSOR_MODE_HIDDEN));
-    let portal_version = proxy.get_property::<u32>("version").await.unwrap_or(1);
-    match (portal_version >= 4, persistence) {
-        (true, PortalPersistence::Enabled { restore_token }) => {
-            options.insert("persist_mode", Value::from(PERSIST_MODE_EXPLICITLY_REVOKED));
-            if let Some(token) = restore_token {
-                options.insert("restore_token", Value::from(token));
-            }
-        }
-        (true, PortalPersistence::Disabled)
-        | (false, PortalPersistence::Disabled)
-        | (false, PortalPersistence::Enabled { .. }) => {}
-    }
-    let handle: OwnedObjectPath = proxy
+    let handle: OwnedObjectPath = screen_cast_proxy
         .call("SelectSources", &(session, options))
         .await
         .context("ScreenCast SelectSources call failed")?;
@@ -990,6 +949,11 @@ mod tests {
                 position: (0, 0),
                 size: (1920, 1080),
             },
+            PortalStream {
+                node_id: 33,
+                position: (2048, 256),
+                size: (1024, 768),
+            },
         ];
 
         assert_eq!(
@@ -1004,6 +968,11 @@ mod tests {
             map_desktop_point(&streams, 1919, 1079).unwrap(),
             (22, 1919.0, 1079.0)
         );
+        assert_eq!(
+            map_desktop_point(&streams, 2048, 256).unwrap(),
+            (33, 0.0, 0.0)
+        );
+        assert!(map_desktop_point(&streams, 2000, 256).is_err());
         assert!(map_desktop_point(&streams, 1920, 1080).is_err());
     }
 

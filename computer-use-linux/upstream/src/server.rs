@@ -26,10 +26,10 @@ use crate::pointer_dispatch::{
     PointerDispatchVerification,
 };
 use crate::remote_desktop::{
-    click as portal_click, drag as portal_drag, keysyms_for_text, press_keycode_chord,
-    scroll as portal_scroll, scroll_at as portal_scroll_at, start_portal_session,
-    type_text_with_keysyms, PortalActionError, PortalKeyboardSession, PortalPointerSession,
-    PortalSession, PortalStreamMapping, ScrollDirection,
+    click as portal_click, keysyms_for_text, press_keycode_chord, scroll as portal_scroll,
+    scroll_at as portal_scroll_at, start_portal_session, type_text_with_keysyms, PortalActionError,
+    PortalKeyboardSession, PortalPointerSession, PortalSession, PortalStreamMapping,
+    ScrollDirection,
 };
 use crate::screenshot::{
     capture_screenshot_raw, capture_screenshot_raw_recent, prepare_screenshot_payload,
@@ -1181,7 +1181,7 @@ impl ComputerUseLinux {
         let ClickTarget::Coordinates(x, y) = target else {
             unreachable!("click target must resolve to coordinates");
         };
-        let portal_point_is_logical = element_targeted || coordination_window_id.is_some();
+        let portal_point_is_logical = element_targeted;
         if let Err(message) = self.validate_capture_space_point(x, y).await {
             return Json(ActionOutput {
                 ok: false,
@@ -1613,7 +1613,7 @@ impl ComputerUseLinux {
         };
         // Raise/focus the target window first (parity with click) so wheel
         // events land on the intended app.
-        let (window_target, pointer_verification) = if let Some(target) = &observed_target {
+        let (window_target, mut pointer_verification) = if let Some(target) = &observed_target {
             match target.prepare().await {
                 Ok((window_target, verification)) => (Some(window_target), Some(verification)),
                 Err(message) => return scroll_error(message),
@@ -1630,6 +1630,7 @@ impl ComputerUseLinux {
                 received,
             });
         }
+        let mut portal_point_is_logical = observed_target.is_some();
         if let Some(target) = window_target {
             let focus = match self.focus_target_for_input(&target).await {
                 Ok(focus) => focus,
@@ -1643,6 +1644,10 @@ impl ComputerUseLinux {
                     });
                 }
             };
+            if pointer_verification.is_none() {
+                pointer_verification =
+                    pointer_dispatch_verification(&target, params.relative, focus.as_ref());
+            }
             tokio::time::sleep(Duration::from_millis(120)).await;
             if params.relative == Some(true) {
                 let Some(focus) = focus.as_ref() else {
@@ -1689,6 +1694,7 @@ impl ComputerUseLinux {
                         received,
                     });
                 }
+                portal_point_is_logical = true;
             }
             let point = observed_target
                 .as_ref()
@@ -1703,7 +1709,6 @@ impl ComputerUseLinux {
         let target_point = observed_target
             .as_ref()
             .map_or_else(|| params.x.zip(params.y), |target| Some(target.point()));
-        let portal_point_is_logical = observed_target.is_some() || coordination_window_id.is_some();
         let direction = match params.direction.to_ascii_lowercase().as_str() {
             "up" => ScrollDirection::Up,
             "down" => ScrollDirection::Down,
@@ -1912,39 +1917,6 @@ impl ComputerUseLinux {
                     message: "Action sent through the uinput absolute pointer.".to_string(),
                     received,
                 });
-            }
-        }
-        if coordination_window_id.is_some() {
-            if let Some(session) = self
-                .portal_pointer_session_for_action(PortalStreamMapping::Required)
-                .await
-            {
-                let result = self
-                    .run_portal_pointer_action(async move {
-                        portal_drag(
-                            &session,
-                            (params.start_x, params.start_y),
-                            (params.end_x, params.end_y),
-                        )
-                        .await
-                    })
-                    .await;
-                match result {
-                    Ok(()) => {
-                        return Json(ActionOutput {
-                            ok: true,
-                            implemented: true,
-                            action: "drag".to_string(),
-                            message: "Action sent through the mapped remote desktop portal stream."
-                                .to_string(),
-                            received,
-                        });
-                    }
-                    Err(error) if error.can_fallback_to_ydotool() => {}
-                    Err(error) => {
-                        return Json(portal_action_delivery_failure("drag", &error, received));
-                    }
-                }
             }
         }
         if !self.can_fallback_to_ydotool_for_coordinate_action() {
@@ -2369,7 +2341,7 @@ enum PostActionObservationResult {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.5.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/drag through absolute uinput or ydotool, send targeted scroll through ydotool, map targeted logical pointer coordinates through a shared ScreenCast/RemoteDesktop portal session, send untargeted relative scroll and layout-safe key input through that portal, and send literal type_text through KDE clipboard integration on Plasma Wayland. The portal uses selected monitor stream geometry for logical AT-SPI/window coordinates; it still refuses raw screenshot pixels on ambiguous mixed-scale layouts and cross-monitor drags instead of guessing a transform. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click and scroll, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot results warn when a target window is partially or fully off-screen, and coordinate input outside the captured desktop bounds is rejected; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. Coordinate scrolls accept the same window targeting and relative coordinates as click; element-targeted scrolls require observation_id and use verified absolute element bounds. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/drag through absolute uinput or ydotool, send targeted scroll through ydotool, map targeted logical pointer coordinates through a shared ScreenCast/RemoteDesktop portal session, send untargeted relative scroll and layout-safe key input through that portal, and send literal type_text through KDE clipboard integration on Plasma Wayland. The portal uses selected monitor stream geometry for logical AT-SPI/window coordinates; it still refuses screenshot-derived click, scroll, and drag pixels on ambiguous mixed-scale layouts instead of guessing a transform. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click and scroll, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot results warn when a target window is partially or fully off-screen, and coordinate input outside the captured desktop bounds is rejected; use move_window/resize_window (GNOME Shell extension backend) to bring it fully on-screen before retrying. Coordinate scrolls accept the same window targeting and relative coordinates as click; element-targeted scrolls require observation_id and use verified absolute element bounds. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -4914,7 +4886,7 @@ fn portal_coordinate_input_unavailable(
         implemented: true,
         action: action.to_string(),
         message: format!(
-            "Did not send {action} input: no selected ScreenCast stream safely mapped the logical desktop coordinate for RemoteDesktop absolute input (raw screenshot pixels cannot be inferred across mixed-scale monitors), and an allowed working ydotool backend is unavailable."
+            "Did not send {action} input: the RemoteDesktop portal can only use trusted logical coordinates mapped through selected ScreenCast streams; screenshot-derived pixels (including drag coordinates) cannot be inferred across mixed-scale monitors, and an allowed working ydotool backend is unavailable."
         ),
         received,
     }
@@ -7445,7 +7417,7 @@ mod tests {
                 ok: false,
                 implemented: true,
                 action: "drag".to_string(),
-                message: "Did not send drag input: no selected ScreenCast stream safely mapped the logical desktop coordinate for RemoteDesktop absolute input (raw screenshot pixels cannot be inferred across mixed-scale monitors), and an allowed working ydotool backend is unavailable.".to_string(),
+                message: "Did not send drag input: the RemoteDesktop portal can only use trusted logical coordinates mapped through selected ScreenCast streams; screenshot-derived pixels (including drag coordinates) cannot be inferred across mixed-scale monitors, and an allowed working ydotool backend is unavailable.".to_string(),
                 received,
             }
         );
