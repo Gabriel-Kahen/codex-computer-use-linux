@@ -21,6 +21,17 @@ pub struct BackendDescriptor {
     pub list_note: &'static str,
     pub missing_hint: &'static str,
     pub can_exact_focus: bool,
+    // Keep documentation metadata beside its backend without shipping it in the binary.
+    #[cfg(test)]
+    support: BackendSupport,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct BackendSupport {
+    desktop_session: &'static str,
+    window_backend: &'static str,
+    notes: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +148,12 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         list_note: "Window list came from the computer-use-linux GNOME Shell extension. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On GNOME, run setup_window_targeting to install the optional GNOME Shell extension backend.",
         can_exact_focus: true,
+        #[cfg(test)]
+        support: BackendSupport {
+            desktop_session: "GNOME Wayland",
+            window_backend: "GNOME Shell extension first, `org.gnome.Shell.Introspect` fallback",
+            notes: "Full target. The extension provides exact window activation when GNOME blocks native introspection; Introspect can list windows and focus apps by `app_id` when allowed.",
+        },
     },
     BackendDescriptor {
         id: GNOME_SHELL_INTROSPECT_BACKEND,
@@ -144,6 +161,12 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         list_note: "Window list came from GNOME Shell Introspect. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On GNOME, ensure org.gnome.Shell.Introspect is available on the session bus.",
         can_exact_focus: false,
+        #[cfg(test)]
+        support: BackendSupport {
+            desktop_session: "GNOME X11",
+            window_backend: "`org.gnome.Shell.Introspect` when allowed",
+            notes: "AT-SPI and `ydotool` work; exact per-window focus may be unavailable without the extension backend.",
+        },
     },
     BackendDescriptor {
         id: COSMIC_WAYLAND_BACKEND,
@@ -151,6 +174,12 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         list_note: "Window list came from the COSMIC Wayland helper. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On COSMIC, ensure the bundled COSMIC helper is present and can connect to the session.",
         can_exact_focus: true,
+        #[cfg(test)]
+        support: BackendSupport {
+            desktop_session: "COSMIC Wayland",
+            window_backend: "`computer-use-linux-cosmic` helper",
+            notes: "Installed automatically by `./install.sh`, `cargo install`, and npm. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`.",
+        },
     },
     BackendDescriptor {
         id: KWIN_BACKEND,
@@ -158,6 +187,12 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         list_note: "Window list came from KWin/Plasma DBus scripting. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On KDE/Plasma, ensure KWin exposes org.kde.KWin scripting on the session bus.",
         can_exact_focus: true,
+        #[cfg(test)]
+        support: BackendSupport {
+            desktop_session: "KDE Plasma / KWin",
+            window_backend: "temporary KWin DBus scripting",
+            notes: "Lists and focuses windows through `org.kde.KWin` scripting when the session bus exposes it.",
+        },
     },
     BackendDescriptor {
         id: HYPRLAND_BACKEND,
@@ -165,6 +200,12 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         list_note: "Window list came from Hyprland hyprctl. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On Hyprland, ensure hyprctl is available in the session.",
         can_exact_focus: true,
+        #[cfg(test)]
+        support: BackendSupport {
+            desktop_session: "Hyprland",
+            window_backend: "`hyprctl clients -j` and `hyprctl dispatch focuswindow`",
+            notes: "Requires `hyprctl` in the desktop session.",
+        },
     },
     BackendDescriptor {
         id: NIRI_BACKEND,
@@ -172,6 +213,12 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         list_note: "Window list came from Niri IPC. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On Niri, ensure NIRI_SOCKET is available and niri msg can reach the active compositor.",
         can_exact_focus: true,
+        #[cfg(test)]
+        support: BackendSupport {
+            desktop_session: "Niri",
+            window_backend: "`niri msg --json windows` and `niri msg action focus-window`",
+            notes: "Requires `NIRI_SOCKET` and the `niri` command from the active compositor session.",
+        },
     },
     BackendDescriptor {
         id: I3_BACKEND,
@@ -179,6 +226,12 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         list_note: "Window list came from i3-msg. Terminal windows may include best-effort PTY and active-process context when xprop and the process tree are readable.",
         missing_hint: "On i3, ensure i3-msg can reach the active i3 IPC socket.",
         can_exact_focus: true,
+        #[cfg(test)]
+        support: BackendSupport {
+            desktop_session: "i3",
+            window_backend: "`i3-msg`; optional `xprop` for PID hydration",
+            notes: "Lists and focuses i3 windows over the active i3 IPC socket.",
+        },
     },
     BackendDescriptor {
         id: X11_BACKEND,
@@ -186,6 +239,12 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         list_note: "Window list came from X11/EWMH (wmctrl). Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On other X11 window managers (Cinnamon, MATE, Xfce, Openbox…), ensure wmctrl and xprop are installed.",
         can_exact_focus: true,
+        #[cfg(test)]
+        support: BackendSupport {
+            desktop_session: "Generic X11 / Xfce / other EWMH WMs",
+            window_backend: "`wmctrl`; optional `xprop` for focus verification",
+            notes: "Lists, focuses, moves, and resizes EWMH windows. Without `xprop`, listing still works but focused-window verification is unavailable.",
+        },
     },
 ];
 
@@ -383,6 +442,7 @@ impl BackendKind {
 mod tests {
     use super::*;
     use crate::windowing::types::WindowBounds;
+    use std::fs;
 
     fn window(backend: &str) -> WindowInfo {
         WindowInfo {
@@ -438,6 +498,34 @@ mod tests {
         .is_none());
 
         assert_eq!(errors, vec!["KWin failed: loadScript failed"]);
+    }
+
+    #[test]
+    fn readme_support_matrix_matches_backend_registry() {
+        const START: &str = "<!-- BEGIN GENERATED BACKEND SUPPORT MATRIX -->";
+        const END: &str = "<!-- END GENERATED BACKEND SUPPORT MATRIX -->";
+
+        let readme = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("README should be readable");
+        let documented = readme
+            .split_once(START)
+            .and_then(|(_, remainder)| remainder.split_once(END))
+            .map(|(matrix, _)| matrix.trim())
+            .expect("README should contain generated support matrix markers");
+        let mut expected =
+            String::from("| Desktop/session | Window backend | Notes |\n| --- | --- | --- |");
+        for descriptor in descriptors() {
+            let support = descriptor.support;
+            expected.push_str(&format!(
+                "\n| {} | {} | {} |",
+                support.desktop_session, support.window_backend, support.notes
+            ));
+        }
+
+        assert_eq!(
+            documented, expected,
+            "README support matrix drifted from the backend registry"
+        );
     }
 
     #[test]

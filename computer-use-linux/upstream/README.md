@@ -103,18 +103,22 @@ computer-use-linux windows
 
 ## Support matrix
 
-Validated manually on Ubuntu 25.10 (GNOME Shell 50.1, Wayland). Other compositor backends are implemented and covered by parser / contract tests, but real desktop behavior still depends on each session exposing its expected control API.
+Validated manually on Ubuntu 25.10 (GNOME Shell 50.1, Wayland). Other compositor backends are implemented and covered by parser / contract tests, but real desktop behavior still depends on each session exposing its expected control API. The implemented-backend rows below are checked against the Rust backend registry in CI.
 
+<!-- BEGIN GENERATED BACKEND SUPPORT MATRIX -->
 | Desktop/session | Window backend | Notes |
 | --- | --- | --- |
 | GNOME Wayland | GNOME Shell extension first, `org.gnome.Shell.Introspect` fallback | Full target. The extension provides exact window activation when GNOME blocks native introspection; Introspect can list windows and focus apps by `app_id` when allowed. |
-| GNOME X11 | `org.gnome.Shell.Introspect` when allowed | AT-SPI and `ydotool` work; the bundled GNOME Shell extension is only needed for GNOME Wayland. Exact per-window focus may be unavailable without the extension backend. |
+| GNOME X11 | `org.gnome.Shell.Introspect` when allowed | AT-SPI and `ydotool` work; exact per-window focus may be unavailable without the extension backend. |
+| COSMIC Wayland | `computer-use-linux-cosmic` helper | Installed automatically by `./install.sh`, `cargo install`, and npm. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`. |
 | KDE Plasma / KWin | temporary KWin DBus scripting | Lists and focuses windows through `org.kde.KWin` scripting when the session bus exposes it. |
 | Hyprland | `hyprctl clients -j` and `hyprctl dispatch focuswindow` | Requires `hyprctl` in the desktop session. |
+| Niri | `niri msg --json windows` and `niri msg action focus-window` | Requires `NIRI_SOCKET` and the `niri` command from the active compositor session. |
 | i3 | `i3-msg`; optional `xprop` for PID hydration | Lists and focuses i3 windows over the active i3 IPC socket. |
-| COSMIC Wayland | `computer-use-linux-cosmic` helper | Installed automatically by `./install.sh`, `cargo install`, and npm. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or point `COMPUTER_USE_LINUX_COSMIC_HELPER` at it. |
-| Sway / generic wlroots | no dedicated backend yet | AT-SPI, screenshots, and global `ydotool` input can still work; exact window list/focus is currently unavailable unless another backend applies. |
-| Generic X11 / XFCE / other WMs | no dedicated backend yet | AT-SPI plus `ydotool` global input only, unless running under i3. |
+| Generic X11 / Xfce / other EWMH WMs | `wmctrl`; optional `xprop` for focus verification | Lists, focuses, moves, and resizes EWMH windows. Without `xprop`, listing still works but focused-window verification is unavailable. |
+<!-- END GENERATED BACKEND SUPPORT MATRIX -->
+
+Sway and other unsupported wlroots compositors have no dedicated backend yet. AT-SPI, screenshots, and global `ydotool` input can still work, but exact window listing and focus are unavailable unless another backend applies.
 
 If you run on a desktop not covered above, or a covered backend does not come up cleanly, please open an issue with the output of `computer-use-linux doctor` so we can extend the matrix honestly.
 
