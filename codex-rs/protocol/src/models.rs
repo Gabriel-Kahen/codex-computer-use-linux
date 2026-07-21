@@ -2096,6 +2096,7 @@ impl CallToolResult {
 
 const MAX_STRUCTURED_MEDIA_IMAGES: usize = 4;
 const MAX_STRUCTURED_MEDIA_TEXT_BYTES: usize = 4 * 1024;
+const MAX_STRUCTURED_MEDIA_TEXT_ITEMS: usize = 16;
 const STRUCTURED_MEDIA_OMISSION_MARKER_BYTES: usize = 160;
 
 fn merge_structured_content_with_mcp_content(
@@ -2110,7 +2111,9 @@ fn merge_structured_content_with_mcp_content(
     let mut remaining_text_bytes = MAX_STRUCTURED_MEDIA_TEXT_BYTES
         .saturating_sub(structured_text.len())
         .saturating_sub(STRUCTURED_MEDIA_OMISSION_MARKER_BYTES);
-    let mut merged = Vec::with_capacity(items.len().min(MAX_STRUCTURED_MEDIA_IMAGES) + 2);
+    let mut remaining_text_items = MAX_STRUCTURED_MEDIA_TEXT_ITEMS.saturating_sub(2);
+    let mut merged =
+        Vec::with_capacity(MAX_STRUCTURED_MEDIA_IMAGES + MAX_STRUCTURED_MEDIA_TEXT_ITEMS);
     merged.push(FunctionCallOutputContentItem::InputText {
         text: structured_text,
     });
@@ -2129,9 +2132,10 @@ fn merge_structured_content_with_mcp_content(
                 if equivalent {
                     continue;
                 }
-                if text.len() <= remaining_text_bytes {
+                if text.len() <= remaining_text_bytes && remaining_text_items > 0 {
                     merged.push(FunctionCallOutputContentItem::InputText { text: text.clone() });
                     remaining_text_bytes -= text.len();
+                    remaining_text_items -= 1;
                 } else {
                     omitted_text_items += 1;
                 }
@@ -2140,10 +2144,7 @@ fn merge_structured_content_with_mcp_content(
                 if image_count < MAX_STRUCTURED_MEDIA_IMAGES {
                     merged.push(FunctionCallOutputContentItem::InputImage {
                         image_url: image_url.clone(),
-                        detail: detail.map(|detail| match detail {
-                            ImageDetail::Original => ImageDetail::High,
-                            ImageDetail::Auto | ImageDetail::Low | ImageDetail::High => detail,
-                        }),
+                        detail: *detail,
                     });
                     image_count += 1;
                 } else {
@@ -3203,7 +3204,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_media_downgrades_original_image_detail_only_for_the_merge() {
+    fn structured_media_preserves_original_image_detail_for_core_sanitization() {
         let image = serde_json::json!({
             "type": "image",
             "data": "BASE64",
@@ -3233,7 +3234,7 @@ mod tests {
                 .any(|item| matches!(
                     item,
                     FunctionCallOutputContentItem::InputImage {
-                        detail: Some(ImageDetail::High),
+                        detail: Some(ImageDetail::Original),
                         ..
                     }
                 ))
@@ -3310,6 +3311,60 @@ mod tests {
             FunctionCallOutputContentItem::InputText { text }
                 if text.contains("1 text, 0 image, and 0 audio")
         )));
+    }
+
+    fn assert_structured_media_text_item_bound(text: &str, text_item_count: usize) {
+        let mut content = (0..text_item_count)
+            .map(|_| serde_json::json!({"type":"text","text":text}))
+            .collect::<Vec<_>>();
+        content.push(serde_json::json!({
+            "type": "image",
+            "data": "BASE64",
+            "mimeType": "image/png",
+        }));
+        let call_tool_result = CallToolResult {
+            content,
+            structured_content: Some(serde_json::json!({"caption": "caption"})),
+            is_error: Some(false),
+            meta: None,
+        };
+
+        let retained_passthrough_items = MAX_STRUCTURED_MEDIA_TEXT_ITEMS.saturating_sub(2);
+        let omitted_text_items = text_item_count - retained_passthrough_items;
+        let mut expected_items = vec![FunctionCallOutputContentItem::InputText {
+            text: r#"{"caption":"caption"}"#.into(),
+        }];
+        expected_items.extend(
+            (0..retained_passthrough_items)
+                .map(|_| FunctionCallOutputContentItem::InputText { text: text.into() }),
+        );
+        expected_items.push(FunctionCallOutputContentItem::InputImage {
+            image_url: "data:image/png;base64,BASE64".into(),
+            detail: Some(DEFAULT_IMAGE_DETAIL),
+        });
+        expected_items.push(FunctionCallOutputContentItem::InputText {
+            text: format!(
+                "[omitted {omitted_text_items} text, 0 image, and 0 audio MCP content items to preserve the structured-media limit]"
+            ),
+        });
+
+        assert_eq!(
+            call_tool_result.into_function_call_output_payload(),
+            FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(expected_items),
+                success: Some(true),
+            }
+        );
+    }
+
+    #[test]
+    fn structured_media_bounds_empty_text_item_count() {
+        assert_structured_media_text_item_bound("", MAX_STRUCTURED_MEDIA_TEXT_ITEMS * 2);
+    }
+
+    #[test]
+    fn structured_media_bounds_many_one_byte_text_items() {
+        assert_structured_media_text_item_bound("x", MAX_STRUCTURED_MEDIA_TEXT_BYTES);
     }
 
     #[test]
