@@ -115,7 +115,7 @@ Validated manually on Ubuntu 25.10 (GNOME Shell 50.1, Wayland). Other compositor
 | COSMIC Wayland | `computer-use-linux-cosmic` helper | Installed automatically by `./install.sh`, `cargo install`, and npm. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`. |
 | KDE Plasma / KWin | persistent KWin DBus window bridge | Keeps one event-driven Plasma 5/6 window snapshot bridge loaded for the MCP process and reloads it when the `org.kde.KWin` bus owner changes; focus actions still use short-lived scripts. Exact target capture calls `org.kde.KWin.ScreenShot2` directly from Rust, including inactive windows, without a screenshot helper process. |
 | Hyprland | `hyprctl clients -j` and `hyprctl dispatch focuswindow` | Requires `hyprctl` in the desktop session. |
-| Niri | `niri msg --json windows` and `niri msg action focus-window` | Requires `NIRI_SOCKET` and the `niri` command from the active compositor session. |
+| Niri | direct `NIRI_SOCKET` event stream and actions; `niri msg` fallback | Uses Niri's complete event-stream snapshot and incremental updates without polling. The `niri` command is only required for compatibility fallback. |
 | i3 | `i3-msg`; optional `xprop` for PID hydration | Lists and focuses i3 windows over the active i3 IPC socket. |
 | Generic X11 / Xfce / other EWMH WMs | native X11/EWMH connection; `wmctrl`/`xprop` fallback | Lists and focuses through one persistent X11 connection, with event-invalidated snapshots. `wmctrl` remains the move/resize and compatibility fallback. |
 <!-- END GENERATED BACKEND SUPPORT MATRIX -->

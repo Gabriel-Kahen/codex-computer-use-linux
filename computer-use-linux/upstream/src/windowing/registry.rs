@@ -211,13 +211,13 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         id: NIRI_BACKEND,
         failure_label: "Niri",
         list_note: "Window list came from Niri IPC. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
-        missing_hint: "On Niri, ensure NIRI_SOCKET is available and niri msg can reach the active compositor.",
+        missing_hint: "On Niri, ensure NIRI_SOCKET points to the active compositor IPC socket. The niri command provides a compatibility fallback for older IPC implementations.",
         can_exact_focus: true,
         #[cfg(test)]
         support: BackendSupport {
             desktop_session: "Niri",
-            window_backend: "`niri msg --json windows` and `niri msg action focus-window`",
-            notes: "Requires `NIRI_SOCKET` and the `niri` command from the active compositor session.",
+            window_backend: "direct `NIRI_SOCKET` event stream and actions; `niri msg` fallback",
+            notes: "Uses Niri's complete event-stream snapshot and incremental updates without polling. The `niri` command is only required for compatibility fallback.",
         },
     },
     BackendDescriptor {
