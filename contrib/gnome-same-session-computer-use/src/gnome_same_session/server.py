@@ -55,6 +55,8 @@ CLAIMED_LEASE_PROTOCOL_VERSION = 2
 CLAIMED_LEASE_CAPABILITY = "claimed_focus_leases"
 WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION = 3
 WINDOW_ACTOR_CAPTURE_CAPABILITY = "window_actor_capture"
+ACT_AND_CAPTURE_PROTOCOL_VERSION = 4
+ACT_AND_CAPTURE_CAPABILITY = "act_and_capture"
 BUS_NAME = "org.gnome.Shell.Extensions.BackgroundComputerUse"
 OBJECT_PATH = "/org/gnome/Shell/Extensions/BackgroundComputerUse"
 INTERFACE = BUS_NAME
@@ -93,6 +95,50 @@ TOKEN = {"type": "string", "minLength": 64, "maxLength": 256, "description": "To
 CLAIM_TOKEN = {"type": "string", "minLength": 64, "maxLength": 256, "description": "Opaque token returned by claim_session_window."}
 CURSOR = {"type": ["string", "null"], "maxLength": 20}
 POINT = {"type": "number", "minimum": 0}
+TRANSACTION_ACTION = {
+    "oneOf": [
+        {
+            "type": "object",
+            "properties": {
+                "type": {"const": "click"}, "x": POINT, "y": POINT,
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
+                "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1},
+            },
+            "required": ["type", "x", "y"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "type": {"const": "scroll"}, "x": POINT, "y": POINT,
+                "steps": {"type": "integer", "minimum": -20, "maximum": 20},
+            },
+            "required": ["type", "x", "y", "steps"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "type": {"const": "drag"},
+                "start_x": POINT, "start_y": POINT, "end_x": POINT, "end_y": POINT,
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
+                "motion_steps": {"type": "integer", "minimum": 2, "maximum": 32, "default": 8},
+            },
+            "required": ["type", "start_x", "start_y", "end_x", "end_y"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "type": {"const": "shortcut"},
+                "key": {"type": "string", "minLength": 1, "maxLength": 64},
+                "modifiers": {"type": "array", "maxItems": 4, "uniqueItems": True, "items": {"type": "string", "enum": ["CTRL", "SHIFT", "ALT", "SUPER"]}, "default": []},
+            },
+            "required": ["type", "key"],
+            "additionalProperties": False,
+        },
+    ]
+}
 TOOLS = [
     tool("session_status", "Report GNOME/Mutter integration health and exact capability boundaries.", {}, [], read_only=True, idempotent=True),
     tool("list_session_windows", "List one bounded page of windows in the user's real GNOME Shell session.", {"cursor": CURSOR, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_WINDOWS_PER_PAGE}}, [], read_only=True, idempotent=True),
@@ -102,6 +148,7 @@ TOOLS = [
     tool("capture_session_window", "Deprecated compatibility tool. Capture an exact GNOME window and optionally write save_path. Prefer get_session_window_capture for inline capture or save_session_window_capture for writes.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}, "claim_token": CLAIM_TOKEN}, ["window"], idempotent=True),
     tool("get_session_window_capture", "Return an inline exact-window PNG from Mutter's compositor actor without changing focus. Older extension versions require an acknowledged focus lease for unfocused windows.", {"window": WINDOW, "claim_token": CLAIM_TOKEN}, ["window"], read_only=True, idempotent=True),
     tool("save_session_window_capture", "Capture an exact GNOME window without changing focus and atomically create or replace an absolute PNG path. Also returns the PNG inline.", {"window": WINDOW, "save_path": {"type": "string", "minLength": 1, "maxLength": 4096}, "claim_token": CLAIM_TOKEN}, ["window", "save_path"], open_world=False),
+    tool("act_and_observe_window", "Briefly focus a GNOME window, perform one pointer or shortcut action, capture the resulting compositor frame, and restore the original desktop before returning.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}, "action": TRANSACTION_ACTION, "claim_token": CLAIM_TOKEN}, ["window", "acknowledge_interference", "action"]),
     tool("begin_focus_lease", "Journal desktop state, switch to and focus an existing window, and authorize brief global-seat contention until restored.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}, "claim_token": CLAIM_TOKEN}, ["window", "acknowledge_interference"]),
     tool("lease_pointer_click", "Click a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
     tool("lease_pointer_scroll", "Scroll in a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
@@ -147,7 +194,7 @@ def dbus_call(method: str, *arguments: str) -> Any:
         raise RuntimeError(f"GNOME integration method {method} failed: {exc}") from exc
 
 
-def dbus_capture_window(window_id: str) -> tuple[bytes, dict[str, Any]]:
+def dbus_png_call(method: str, *arguments: str) -> tuple[bytes, dict[str, Any]]:
     global _DBUS_CONNECTION
     ensure_session_environment()
     if Gio is None or GLib is None:
@@ -160,8 +207,8 @@ def dbus_capture_window(window_id: str) -> tuple[bytes, dict[str, Any]]:
                 BUS_NAME,
                 OBJECT_PATH,
                 INTERFACE,
-                "CaptureWindow",
-                GLib.Variant("(s)", (window_id,)),
+                method,
+                GLib.Variant(f"({'s' * len(arguments)})", arguments),
                 GLib.VariantType.new("(ays)"),
                 Gio.DBusCallFlags.NONE,
                 20_000,
@@ -173,7 +220,17 @@ def dbus_capture_window(window_id: str) -> tuple[bytes, dict[str, Any]]:
             raise RuntimeError("GNOME integration returned invalid capture metadata")
         return bytes(raw), metadata
     except Exception as exc:
-        raise RuntimeError(f"GNOME integration window capture failed: {exc}") from exc
+        raise RuntimeError(f"GNOME integration method {method} failed: {exc}") from exc
+
+
+def dbus_capture_window(window_id: str) -> tuple[bytes, dict[str, Any]]:
+    return dbus_png_call("CaptureWindow", window_id)
+
+
+def dbus_act_and_capture(capability: str, request: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+    return dbus_png_call(
+        "ActAndCapture", capability, json.dumps(request, separators=(",", ":"))
+    )
 
 
 def bounded_text(value: Any, limit: int = MAX_WINDOW_TEXT_CHARS) -> str:
@@ -351,6 +408,16 @@ def shell_supports_window_actor_capture(integration: dict[str, Any]) -> bool:
         and integration["protocol_version"] >= WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION
         and isinstance(capabilities, list)
         and WINDOW_ACTOR_CAPTURE_CAPABILITY in capabilities
+    )
+
+
+def shell_supports_act_and_capture(integration: dict[str, Any]) -> bool:
+    capabilities = integration.get("capabilities")
+    return (
+        type(integration.get("protocol_version")) is int
+        and integration["protocol_version"] >= ACT_AND_CAPTURE_PROTOCOL_VERSION
+        and isinstance(capabilities, list)
+        and ACT_AND_CAPTURE_CAPABILITY in capabilities
     )
 
 
@@ -821,13 +888,7 @@ def bounded_integer(value: Any, name: str, minimum: int, maximum: int, *, exclud
     return value
 
 
-def pointer_action(
-    arguments: dict[str, Any],
-    action: str,
-    owner: str | None = None,
-    claim: dict[str, Any] | None = None,
-    expected_target: str | None = None,
-) -> dict[str, Any]:
+def pointer_request(arguments: dict[str, Any], action: str) -> dict[str, Any]:
     if action not in {"click", "scroll", "drag"}:
         raise ValueError(f"unknown pointer action {action}")
     button = arguments.get("button", "left")
@@ -846,6 +907,28 @@ def pointer_action(
             request["count"] = bounded_integer(arguments.get("count", 1), "count", 1, 3)
         else:
             request["steps"] = bounded_integer(arguments["steps"], "steps", -20, 20, exclude_zero=True)
+    return request
+
+
+def shortcut_request(arguments: dict[str, Any]) -> dict[str, Any]:
+    modifiers = arguments.get("modifiers", [])
+    allowed = {"CTRL", "SHIFT", "ALT", "SUPER"}
+    if not isinstance(modifiers, list) or len(modifiers) > 4 or any(type(value) is not str or value not in allowed for value in modifiers) or len(set(modifiers)) != len(modifiers):
+        raise ValueError("modifiers must be a unique array containing at most CTRL, SHIFT, ALT, and SUPER")
+    key = arguments.get("key")
+    if not isinstance(key, str) or not key or len(key) > 64:
+        raise ValueError("key must contain between 1 and 64 characters")
+    return {"key": key, "modifiers": modifiers}
+
+
+def pointer_action(
+    arguments: dict[str, Any],
+    action: str,
+    owner: str | None = None,
+    claim: dict[str, Any] | None = None,
+    expected_target: str | None = None,
+) -> dict[str, Any]:
+    request = pointer_request(arguments, action)
     with file_guard(LOCK_FILE):
         state = require_lease(arguments.get("lease_token"), owner)
         if expected_target is not None and lease_window_id(state) != expected_target:
@@ -867,14 +950,7 @@ def send_shortcut(
     claim: dict[str, Any] | None = None,
     expected_target: str | None = None,
 ) -> dict[str, Any]:
-    modifiers = arguments.get("modifiers", [])
-    allowed = {"CTRL", "SHIFT", "ALT", "SUPER"}
-    if not isinstance(modifiers, list) or len(modifiers) > 4 or any(type(value) is not str or value not in allowed for value in modifiers) or len(set(modifiers)) != len(modifiers):
-        raise ValueError("modifiers must be a unique array containing at most CTRL, SHIFT, ALT, and SUPER")
-    key = arguments.get("key")
-    if not isinstance(key, str) or not key or len(key) > 64:
-        raise ValueError("key must contain between 1 and 64 characters")
-    request = {"key": key, "modifiers": modifiers}
+    request = shortcut_request(arguments)
     with file_guard(LOCK_FILE):
         state = require_lease(arguments.get("lease_token"), owner)
         if expected_target is not None and lease_window_id(state) != expected_target:
@@ -886,6 +962,90 @@ def send_shortcut(
         "window": window_summary(state["target"]),
         "transaction": bounded_json_value(result),
         "global_seat_used": True,
+    }
+
+
+def act_and_observe(
+    arguments: dict[str, Any],
+    owner: str | None,
+    selected: dict[str, Any],
+    claim: dict[str, Any] | None,
+    expected_shell_instance: str,
+) -> dict[str, Any]:
+    integration = require_shell_instance(expected_shell_instance)
+    if not shell_supports_act_and_capture(integration):
+        raise RuntimeError(
+            "the installed GNOME Shell extension does not support short act-and-observe "
+            "transactions; run install-gnome-integration and reload the GNOME session"
+        )
+    action = arguments.get("action")
+    if not isinstance(action, dict):
+        raise ValueError("action must be an object")
+    action_type = action.get("type")
+    if action_type in {"click", "scroll", "drag"}:
+        request = {"kind": "pointer", "action": pointer_request(action, action_type)}
+    elif action_type == "shortcut":
+        request = {"kind": "keys", "action": shortcut_request(action)}
+    else:
+        raise ValueError("action.type must be click, scroll, drag, or shortcut")
+
+    state: dict[str, Any] | None = None
+    try:
+        begin_lease(
+            arguments,
+            owner,
+            selected,
+            claim,
+            expected_shell_instance=expected_shell_instance,
+        )
+        state = load_lease()
+        if not state or state.get("phase") != "active":
+            raise RuntimeError("GNOME focus transaction did not create an active recovery journal")
+        require_bound_claim(state, claim)
+        raw, capture_metadata = dbus_act_and_capture(state["token"], request)
+        if len(raw) > MAX_CAPTURE_PNG_BYTES:
+            raise RuntimeError(f"captured PNG exceeds the {MAX_CAPTURE_PNG_BYTES}-byte MCP transport limit")
+        if not valid_png(raw):
+            raise RuntimeError("act-and-observe returned an invalid PNG")
+        if capture_metadata.get("shell_instance") != expected_shell_instance:
+            raise RuntimeError("GNOME Shell restarted during act-and-observe")
+        current = capture_metadata.get("window")
+        if not isinstance(current, dict) or str(current.get("id")) != str(selected["id"]):
+            raise RuntimeError("GNOME integration observed a different window after the action")
+        transaction = capture_metadata.get("transaction")
+        restoration = transaction.get("restoration") if isinstance(transaction, dict) else None
+        if not isinstance(restoration, dict) or restoration.get("recovery_complete") is not True:
+            raise RuntimeError("GNOME act-and-observe did not prove complete desktop restoration")
+        shell = require_shell_instance(expected_shell_instance)
+        if shell.get("lease_phase") is not None:
+            raise RuntimeError("GNOME Shell still reports an active lease after act-and-observe")
+        LEASE_FILE.unlink(missing_ok=True)
+    except Exception as exc:
+        pending = state or load_lease()
+        if pending:
+            recovery = restore_lease(pending, recovery=True)
+            if not recovery["recovery_complete"]:
+                raise RuntimeError(
+                    f"{exc}; automatic focus restoration also failed: {recovery['errors']}"
+                ) from exc
+        raise
+
+    summary = window_summary(current)
+    metadata = {
+        "window": summary,
+        "coordinate_space": coordinate_space(summary["frame"], raw),
+        "capture_source": "meta-window-actor",
+        "focus_changed_by_capture": False,
+        "global_seat_used": True,
+        "desktop_restored_before_return": True,
+        "transaction": bounded_json_value(transaction),
+    }
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps(metadata, indent=2)},
+            {"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mimeType": "image/png"},
+        ],
+        "isError": False,
     }
 
 
@@ -1027,6 +1187,7 @@ def status() -> dict[str, Any]:
     ready = integration is not None
     claimed_leases_ready = ready and shell_supports_claimed_leases(integration)
     actor_capture_ready = ready and shell_supports_window_actor_capture(integration)
+    act_and_capture_ready = ready and shell_supports_act_and_capture(integration)
     claim_count: int | None = None
     claim_error: str | None = None
     if integration:
@@ -1050,12 +1211,14 @@ def status() -> dict[str, Any]:
             "lease_pointer_restoration": ready,
             "parallel_window_claims": claimed_leases_ready,
             "serialized_global_seat": ready,
+            "short_act_and_observe": act_and_capture_ready,
         },
         "requirements": {
             **checks,
             "gnome_shell_extension": ready,
             "claimed_focus_lease_protocol": claimed_leases_ready,
             "window_actor_capture_protocol": actor_capture_ready,
+            "act_and_capture_protocol": act_and_capture_ready,
             "background_semantic_actions": "provided by the separate computer-use-linux@codex-computer-use-linux AT-SPI plugin; broker claims are policy coordination there, not a mechanical fence",
         },
         "active_lease": load_lease() is not None,
@@ -1158,6 +1321,22 @@ def call_tool(name: str, arguments: dict[str, Any], owner: str | None = None) ->
             "next_cursor": str(end) if end < len(listed) else None,
             "truncated": end < len(listed),
         })
+    if name == "act_and_observe_window":
+        selected, shell_instance = resolve_window_for_shell(arguments.get("window"))
+        with CLAIMS.authorize(
+            str(selected["id"]),
+            owner,
+            arguments.get("claim_token"),
+            shell_instance,
+            on_complete=renew_focus_lease_for_claim,
+        ) as claim:
+            if claim:
+                require_claimed_lease_support(require_shell_instance(shell_instance))
+            with file_guard(LOCK_FILE):
+                with INPUT_LOCK, file_guard(INPUT_FILE):
+                    return act_and_observe(
+                        arguments, owner, selected, claim, shell_instance
+                    )
     if name in {"capture_session_window", "get_session_window_capture", "save_session_window_capture"}:
         if name == "get_session_window_capture" and arguments.get("save_path") not in (None, ""):
             raise ValueError(
