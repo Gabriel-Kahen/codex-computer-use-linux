@@ -38,6 +38,7 @@ use crate::screenshot::{
     RawScreenshotCapture, ScreenshotCapture, ScreenshotOutputFormat, ScreenshotPayloadOptions,
 };
 use crate::scroll_target::{resolve_observed_scroll_target, ScrollTargetRequest};
+use crate::windowing::backends::hyprland;
 use crate::windowing::capture_window_exact;
 use crate::windowing::registry;
 use crate::windows::{
@@ -3243,6 +3244,12 @@ impl ComputerUseLinux {
             return None;
         }
         let bounds = window.bounds.as_ref()?;
+        let scale_window = window.clone();
+        let (scale_x, scale_y) =
+            tokio::task::spawn_blocking(move || hyprland::native_coordinate_scales(&scale_window))
+                .await
+                .ok()?
+                .ok()?;
         let (local_x, local_y) = if click.relative == Some(true) {
             (x, y)
         } else {
@@ -3258,8 +3265,8 @@ impl ComputerUseLinux {
         Some(NativePointerBatch {
             window_id: params.window_id,
             actions: vec![NativePointerAction::Click {
-                x: f64::from(local_x),
-                y: f64::from(local_y),
+                x: f64::from(local_x) / scale_x,
+                y: f64::from(local_y) / scale_y,
                 button,
                 count,
             }],

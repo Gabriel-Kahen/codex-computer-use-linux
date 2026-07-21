@@ -1,5 +1,7 @@
 use super::*;
+use std::os::unix::fs::symlink;
 use std::os::unix::process::ExitStatusExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn identity() -> PluginIdentity {
     PluginIdentity {
@@ -106,4 +108,26 @@ fn validates_status_protocol_token_and_abi_together() {
         identity_token: identity_token(&identity),
     };
     assert!(validate_plugin_status(incompatible).is_err());
+}
+
+#[test]
+fn accepts_only_regular_non_symlink_shared_objects() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = env::temp_dir().join(format!("computer-use-plugin-path-{nonce}"));
+    fs::create_dir(&directory).unwrap();
+    let plugin = directory.join("target-pointer.so");
+    fs::write(&plugin, b"plugin").unwrap();
+    let wrong_extension = directory.join("target-pointer.dylib");
+    fs::write(&wrong_extension, b"plugin").unwrap();
+    let link = directory.join("linked.so");
+    symlink(&plugin, &link).unwrap();
+
+    assert_eq!(validate_plugin_path(&plugin), Ok(()));
+    assert!(validate_plugin_path(&wrong_extension).is_err());
+    assert!(validate_plugin_path(&link).is_err());
+
+    fs::remove_dir_all(directory).unwrap();
 }

@@ -76,6 +76,56 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
     }
 }
 
+pub(crate) fn native_coordinate_scales(window: &WindowInfo) -> Result<(f64, f64)> {
+    let output = hyprctl_output(&["clients", "-j"])
+        .context("failed to re-resolve Hyprland window scale before native input")?;
+    if !output.status.success() {
+        bail!(
+            "hyprctl clients -j failed before native input: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let clients: Vec<HyprlandClient> = serde_json::from_slice(&output.stdout)
+        .context("failed to parse hyprctl clients -j before native input")?;
+    exact_capture_id_from_clients(window, &clients)
+        .context("Hyprland window identity changed before native input")?
+        .context("Hyprland window has no stable identity for native input")?;
+    let client = clients
+        .iter()
+        .find(|client| parse_hyprland_address(&client.address).ok() == Some(window.window_id))
+        .context("Hyprland window disappeared before native input")?;
+    if !client.mapped.unwrap_or(true) || client.xwayland.unwrap_or(false) {
+        bail!("Hyprland window is not an eligible mapped Wayland target");
+    }
+    native_coordinate_scales_for_size(
+        window
+            .bounds
+            .as_ref()
+            .context("Hyprland window has no bounds")?,
+        client.size.context("Hyprland window has no size")?,
+    )
+    .context("Hyprland window scale changed before native input")
+}
+
+fn native_coordinate_scales_for_size(
+    bounds: &WindowBounds,
+    [logical_width, logical_height]: [u32; 2],
+) -> Option<(f64, f64)> {
+    if logical_width == 0 || logical_height == 0 {
+        return None;
+    }
+    let x = f64::from(bounds.width) / f64::from(logical_width);
+    let y = f64::from(bounds.height) / f64::from(logical_height);
+    let rounding_tolerance =
+        0.5 / f64::from(logical_width) + 0.5 / f64::from(logical_height) + f64::EPSILON;
+    (x.is_finite()
+        && y.is_finite()
+        && (0.25..=8.0).contains(&x)
+        && (0.25..=8.0).contains(&y)
+        && (x - y).abs() <= rounding_tolerance)
+        .then_some((x, y))
+}
+
 fn parse_hyprland_clients_with_monitors(
     clients_json: &str,
     monitors_json: &[u8],
@@ -472,6 +522,24 @@ mod tests {
         let bounds = windows[0].bounds.as_ref().unwrap();
         assert_eq!((bounds.x, bounds.y), (Some(1741), Some(97)));
         assert_eq!((bounds.width, bounds.height), (1676, 2023));
+        let scales = native_coordinate_scales_for_size(bounds, [931, 1124]).unwrap();
+        assert!((scales.0 - 1.8).abs() < 0.001);
+        assert!((scales.1 - 1.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn rejects_stale_native_coordinate_dimensions() {
+        let bounds = WindowBounds {
+            x: Some(0),
+            y: Some(0),
+            width: 1500,
+            height: 900,
+        };
+
+        assert_eq!(
+            native_coordinate_scales_for_size(&bounds, [1000, 500]),
+            None
+        );
     }
 
     #[test]

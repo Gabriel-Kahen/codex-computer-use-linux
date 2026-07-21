@@ -307,6 +307,34 @@ def main() -> int:
             assert_event(target_events, "click")
 
             plugin_status = hypr_json(inner, "cutargetstatus")
+            clicks_before_rejection = target_events.read_text().splitlines().count("click")
+            rejected_batch = hypr_json(
+                inner,
+                "cutargetbatch",
+                "v1",
+                plugin_status["identity_token"],
+                target["address"],
+                "2",
+                "click",
+                str(size[0] / 2),
+                str(size[1] / 2),
+                "left",
+                "1",
+                "click",
+                str(size[0] + 1),
+                str(size[1] / 2),
+                "left",
+                "1",
+            )
+            time.sleep(0.2)
+            if rejected_batch.get("ok") is not False or (
+                target_events.read_text().splitlines().count("click")
+                != clicks_before_rejection
+            ):
+                raise RuntimeError(
+                    f"native pointer batch was not prevalidated atomically: {rejected_batch}"
+                )
+
             batch_result = hypr_json(
                 inner,
                 "cutargetbatch",

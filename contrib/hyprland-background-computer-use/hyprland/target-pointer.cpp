@@ -339,6 +339,8 @@ void ensureSafeToInject(PHLWINDOW window) {
     if (g_pSessionLockManager && g_pSessionLockManager->isSessionLocked()) throw std::runtime_error("session is locked");
     if (g_pInputManager->hasHeldButtons()) throw std::runtime_error("physical pointer button is currently held");
     if (g_pInputManager->isConstrained() || g_pInputManager->isLocked()) throw std::runtime_error("physical pointer is constrained or locked");
+    if (g_pSeatManager->m_seatGrab && g_pSeatManager->m_seatGrab->m_pointer)
+        throw std::runtime_error("a pointer seat grab is active");
     if (PROTO::data && PROTO::data->dndActive()) throw std::runtime_error("a drag-and-drop operation is active");
 }
 
@@ -386,12 +388,15 @@ std::string handleStatus(eHyprCtlOutputFormat, std::string) {
     const bool heldButtons = inputManager && g_pInputManager->hasHeldButtons();
     const bool pointerConstrained = inputManager && g_pInputManager->isConstrained();
     const bool pointerLocked = inputManager && g_pInputManager->isLocked();
+    const bool pointerGrab = g_pSeatManager && g_pSeatManager->m_seatGrab && g_pSeatManager->m_seatGrab->m_pointer;
     const bool dndActive = PROTO::data && PROTO::data->dndActive();
-    const bool safe = pointerSeat && inputManager && !sessionLocked && !heldButtons && !pointerConstrained && !pointerLocked && !dndActive;
+    const bool safe =
+        pointerSeat && inputManager && !sessionLocked && !heldButtons && !pointerConstrained && !pointerLocked && !pointerGrab && !dndActive;
     return std::format(
-        "{{\"ok\":true,\"plugin_version\":\"{}\",\"source_sha256\":\"{}\",\"hyprland_build_sha256\":\"{}\",\"hyprland_build_abi\":\"{}\",\"hyprland_runtime_abi\":\"{}\",\"batch_protocol_version\":{},\"identity_token\":\"{}\",\"safe_to_inject\":{},\"pointer_seat\":{},\"session_locked\":{},\"held_buttons\":{},\"pointer_constrained\":{},\"pointer_locked\":{},\"dnd_active\":{}}}",
+        "{{\"ok\":true,\"plugin_version\":\"{}\",\"source_sha256\":\"{}\",\"hyprland_build_sha256\":\"{}\",\"hyprland_build_abi\":\"{}\",\"hyprland_runtime_abi\":\"{}\",\"batch_protocol_version\":{},\"identity_token\":\"{}\",\"safe_to_inject\":{},\"pointer_seat\":{},\"session_locked\":{},\"held_buttons\":{},\"pointer_constrained\":{},\"pointer_locked\":{},\"pointer_grab\":{},\"dnd_active\":{}}}",
         CU_PLUGIN_VERSION, CU_SOURCE_SHA256, CU_HYPRLAND_BUILD_SHA256, __hyprland_api_get_client_hash(), __hyprland_api_get_hash(),
-        BATCH_PROTOCOL_VERSION, identityToken(), safe, pointerSeat, sessionLocked, heldButtons, pointerConstrained, pointerLocked, dndActive);
+        BATCH_PROTOCOL_VERSION, identityToken(), safe, pointerSeat, sessionLocked, heldButtons, pointerConstrained, pointerLocked, pointerGrab,
+        dndActive);
 }
 
 std::string handleRequest(eHyprCtlOutputFormat, std::string request) {

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -198,6 +199,9 @@ fn validate_plugin_path(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot inspect explicit Hyprland plugin path: {error}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("explicit Hyprland plugin path must be a regular non-symlink file".to_string());
+    }
+    if path.extension() != Some(OsStr::new("so")) {
+        return Err("explicit Hyprland plugin path must have a .so extension".to_string());
     }
     Ok(())
 }
