@@ -3,5 +3,5 @@
   "name": "Background Computer Use Bridge",
   "description": "Local D-Bus bridge for expiring, explicitly acknowledged Codex focus leases.",
   "shell-version": ["45"],
-  "version": 2
+  "version": 3
 }

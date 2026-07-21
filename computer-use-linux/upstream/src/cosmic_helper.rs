@@ -1,11 +1,12 @@
 use crate::cosmic_helper_protocol::{
-    CosmicServiceCommand, CosmicServiceRequest, CosmicServiceResponse,
+    read_cosmic_service_message, CosmicServiceCommand, CosmicServiceRequest, CosmicServiceResponse,
+    COSMIC_SERVICE_PROTOCOL_VERSION,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -319,13 +320,12 @@ impl PersistentHelper {
         let reader = thread::spawn(move || {
             let mut stdout = BufReader::new(stdout);
             loop {
-                let mut line = String::new();
-                match stdout.read_line(&mut line) {
-                    Ok(0) => {
+                match read_cosmic_service_message(&mut stdout) {
+                    Ok(None) => {
                         let _ = response_tx.send(HelperOutput::Eof);
                         break;
                     }
-                    Ok(_) => {
+                    Ok(Some(line)) => {
                         if response_tx.send(HelperOutput::Line(line)).is_err() {
                             break;
                         }
@@ -350,7 +350,11 @@ impl PersistentHelper {
     fn request(&mut self, command: CosmicServiceCommand) -> Result<Value> {
         let id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
-        let request = CosmicServiceRequest { id, command };
+        let request = CosmicServiceRequest {
+            version: COSMIC_SERVICE_PROTOCOL_VERSION,
+            id,
+            command,
+        };
         serde_json::to_writer(&mut self.stdin, &request)
             .context("failed to encode persistent COSMIC helper request")?;
         self.stdin
@@ -373,23 +377,35 @@ impl PersistentHelper {
         };
         let response: CosmicServiceResponse = serde_json::from_str(&line)
             .context("persistent COSMIC helper returned invalid response JSON")?;
+        if response.version != COSMIC_SERVICE_PROTOCOL_VERSION {
+            bail!(
+                "persistent COSMIC helper protocol version mismatch: expected {COSMIC_SERVICE_PROTOCOL_VERSION}, received {}",
+                response.version
+            );
+        }
         if response.id != id {
             bail!(
                 "persistent COSMIC helper response id mismatch: expected {id}, received {}",
                 response.id
             );
         }
-        if !response.ok {
-            return Err(HelperRejected(
-                response
-                    .error
-                    .unwrap_or_else(|| "unspecified helper error".to_string()),
-            )
-            .into());
+        if response.ok {
+            if response.error.is_some() {
+                bail!("persistent COSMIC helper success response included an error");
+            }
+            return response
+                .result
+                .ok_or_else(|| anyhow!("persistent COSMIC helper response omitted its result"));
         }
-        response
-            .result
-            .ok_or_else(|| anyhow!("persistent COSMIC helper response omitted its result"))
+        if response.result.is_some() {
+            bail!("persistent COSMIC helper error response included a result");
+        }
+        Err(HelperRejected(
+            response
+                .error
+                .unwrap_or_else(|| "unspecified helper error".to_string()),
+        )
+        .into())
     }
 }
 

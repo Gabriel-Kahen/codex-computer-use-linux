@@ -6,6 +6,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,10 @@ ROOT = Path(__file__).resolve().parents[2]
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")).expanduser() / "same-session-computer-use"
 PLUGIN_LOCK_FILE = STATE_DIR / "plugin-build-load.lock"
 PLUGIN_PACKAGES = ("pixman-1", "libdrm", "hyprland", "libinput", "libudev", "wayland-server", "xkbcommon")
-NATIVE_PLUGIN_VERSION = "0.1.2"
+NATIVE_PLUGIN_VERSION = "0.1.3"
+_IDENTITY_CACHE_LOCK = threading.Lock()
+_IDENTITY_INIT_LOCK = threading.Lock()
+_IDENTITY_CACHE: dict[tuple[str, str], dict[str, str]] = {}
 
 
 def run(args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
@@ -63,6 +67,56 @@ def plugin_identity(version: str, source: bytes) -> dict[str, str]:
         "source_sha256": hashlib.sha256(source).hexdigest(),
         "hyprland_build_sha256": hashlib.sha256(version.encode()).hexdigest(),
     }
+
+
+def plugin_session_key() -> tuple[str, str]:
+    instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", ""))
+    wayland = os.environ.get("WAYLAND_DISPLAY", "")
+    return instance, str(runtime / wayland)
+
+
+def _cache_plugin_identity(identity: dict[str, str]) -> None:
+    immutable = {
+        name: identity[name]
+        for name in ("plugin_version", "source_sha256", "hyprland_build_sha256")
+    }
+    with _IDENTITY_CACHE_LOCK:
+        _IDENTITY_CACHE[plugin_session_key()] = immutable
+
+
+def invalidate_plugin_identity() -> None:
+    with _IDENTITY_CACHE_LOCK:
+        _IDENTITY_CACHE.pop(plugin_session_key(), None)
+
+
+def native_action_identity() -> dict[str, str]:
+    with _IDENTITY_CACHE_LOCK:
+        cached = _IDENTITY_CACHE.get(plugin_session_key())
+        if cached is not None:
+            return dict(cached)
+    with _IDENTITY_INIT_LOCK:
+        with _IDENTITY_CACHE_LOCK:
+            cached = _IDENTITY_CACHE.get(plugin_session_key())
+            if cached is not None:
+                return dict(cached)
+        status = ensure_target_pointer_plugin()
+        identity = {
+            name: str(status[name])
+            for name in (
+                "plugin_version",
+                "source_sha256",
+                "hyprland_build_sha256",
+            )
+        }
+        _cache_plugin_identity(identity)
+        return identity
+
+
+def plugin_identity_token(identity: dict[str, str]) -> str:
+    return "v1.{plugin_version}.{source_sha256}.{hyprland_build_sha256}".format(
+        **identity
+    )
 
 
 def build_target_pointer_plugin(version: str) -> Path:
@@ -145,6 +199,7 @@ def ensure_target_pointer_plugin() -> dict[str, Any]:
         if listed.returncode == 0 and "same-session-target-pointer" in listed.stdout:
             status = _native_input_status()
             _validate_plugin_identity(status, expected)
+            _cache_plugin_identity(expected)
             return status
         library = build_target_pointer_plugin(version.stdout)
         loaded = run(["hyprctl", "plugin", "load", str(library)], timeout=20)
@@ -152,6 +207,7 @@ def ensure_target_pointer_plugin() -> dict[str, Any]:
             raise RuntimeError(loaded.stderr.strip() or loaded.stdout.strip() or "failed to load targeted-pointer plugin")
         status = _native_input_status()
         _validate_plugin_identity(status, expected)
+        _cache_plugin_identity(expected)
         return status
 
 
@@ -164,7 +220,14 @@ def ensure_native_input_safe() -> dict[str, Any]:
     if status.get("safe_to_inject") is not True:
         blocked = [
             name
-            for name in ("session_locked", "held_buttons", "pointer_constrained", "pointer_locked", "dnd_active")
+            for name in (
+                "session_locked",
+                "held_buttons",
+                "pointer_constrained",
+                "pointer_locked",
+                "pointer_grab",
+                "dnd_active",
+            )
             if status.get(name) is True
         ]
         if status.get("pointer_seat") is not True:
@@ -172,3 +235,59 @@ def ensure_native_input_safe() -> dict[str, Any]:
         reason = ", ".join(blocked) or "unknown safety condition"
         raise RuntimeError(f"native input safety probe refused input: {reason}")
     return status
+
+
+def run_target_pointer_action(action: str, arguments: list[str]) -> dict[str, Any]:
+    identity = native_action_identity()
+
+    def dispatch() -> subprocess.CompletedProcess[str]:
+        return run(
+            [
+                "hyprctl",
+                "-j",
+                "cutarget",
+                action,
+                plugin_identity_token(identity),
+                *arguments,
+            ],
+            timeout=20,
+        )
+
+    proc = dispatch()
+    unavailable = "unknown request" in f"{proc.stdout}\n{proc.stderr}".lower()
+    if unavailable:
+        invalidate_plugin_identity()
+        status = ensure_target_pointer_plugin()
+        identity = {
+            name: str(status[name])
+            for name in (
+                "plugin_version",
+                "source_sha256",
+                "hyprland_build_sha256",
+            )
+        }
+        proc = dispatch()
+    if proc.returncode:
+        raise RuntimeError(
+            proc.stderr.strip()
+            or proc.stdout.strip()
+            or f"Wayland targeted {action} failed"
+        )
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Wayland targeted {action} returned invalid transaction JSON"
+        ) from exc
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Wayland targeted {action} returned a non-object transaction")
+    if result.get("ok") is not True:
+        error = str(result.get("error") or f"Wayland targeted {action} failed")
+        if "identity" in error.lower() or "abi" in error.lower():
+            invalidate_plugin_identity()
+        raise RuntimeError(error)
+    actual_identity = result.get("identity")
+    if not isinstance(actual_identity, dict):
+        raise RuntimeError("native input transaction omitted its plugin identity")
+    _validate_plugin_identity(actual_identity, identity)
+    return result

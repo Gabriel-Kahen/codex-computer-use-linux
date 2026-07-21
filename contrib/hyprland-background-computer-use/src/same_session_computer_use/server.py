@@ -18,10 +18,10 @@ from . import coordination
 from .native_plugin import STATE_DIR
 from .native_plugin import NATIVE_PLUGIN_VERSION
 from .native_plugin import ensure_native_input_safe
-from .native_plugin import ensure_target_pointer_plugin
 from .native_plugin import file_guard
 from .native_plugin import plugin_build_requirements
 from .native_plugin import plugin_identity
+from .native_plugin import run_target_pointer_action
 
 
 SERVER_INFO = {"name": "same-session-computer-use", "version": "0.2.0"}
@@ -1089,42 +1089,73 @@ def _targeted_pointer(
 
     if window.get("xwayland"):
         ensure_native_input_safe()
-    else:
-        ensure_target_pointer_plugin()
-    before = physical_snapshot()
+        before = physical_snapshot()
 
     if action == "click":
         if window.get("xwayland"):
             xid = resolve_xwindow_id(window)
             result = xdotool_target(window, ["mousemove", "--window", xid, str(round(x)), str(round(y)), "click", "--repeat", str(count), "--delay", "40", button_number])
         else:
-            proc = run(["hyprctl", "-j", "cutarget", "click", str(window["address"]), str(x), str(y), button, str(count)])
-            if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted click failed")
-            result = json.loads(proc.stdout)
+            result = run_target_pointer_action(
+                "click", [str(window["address"]), str(x), str(y), button, str(count)]
+            )
     elif action == "scroll":
         if window.get("xwayland"):
             xid = resolve_xwindow_id(window); wheel = "5" if steps > 0 else "4"
             result = xdotool_target(window, ["mousemove", "--window", xid, str(round(x)), str(round(y)), "click", "--repeat", str(abs(steps)), "--delay", "20", wheel])
         else:
-            proc = run(["hyprctl", "-j", "cutarget", "scroll", str(window["address"]), str(x), str(y), str(steps)])
-            if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted scroll failed")
-            result = json.loads(proc.stdout)
+            result = run_target_pointer_action(
+                "scroll", [str(window["address"]), str(x), str(y), str(steps)]
+            )
     else:
         if window.get("xwayland"):
             xid = resolve_xwindow_id(window)
             result = xdotool_target(window, ["mousemove", "--window", xid, str(round(sx)), str(round(sy)), "mousedown", button_number, "mousemove", "--window", xid, str(round(ex)), str(round(ey)), "mouseup", button_number])
         else:
-            proc = run(["hyprctl", "-j", "cutarget", "drag", str(window["address"]), str(sx), str(sy), str(ex), str(ey), button, str(motion_steps)])
-            if proc.returncode: raise RuntimeError(proc.stderr.strip() or "Wayland targeted drag failed")
-            result = json.loads(proc.stdout)
+            result = run_target_pointer_action(
+                "drag",
+                [
+                    str(window["address"]),
+                    str(sx),
+                    str(sy),
+                    str(ex),
+                    str(ey),
+                    button,
+                    str(motion_steps),
+                ],
+            )
 
-    if isinstance(result, dict) and result.get("ok") is False: raise RuntimeError(str(result.get("error") or "targeted pointer action failed"))
-    after = physical_snapshot()
+    if window.get("xwayland"):
+        after = physical_snapshot()
+        physical_state = verified_physical_state(
+            f"targeted pointer {action}", before, after
+        )
+    else:
+        before = result.get("physical_state_before")
+        after = result.get("physical_state_after")
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise RuntimeError("native input transaction omitted physical state")
+        physical_state = verified_physical_state(
+            f"targeted pointer {action}", before, after
+        )
+        result = {
+            key: value
+            for key, value in result.items()
+            if key
+            not in {
+                "observed_physical_state_unchanged",
+                "physical_state_before",
+                "physical_state_after",
+                "cursor_moved_by_backend",
+                "keyboard_focus_changed_by_backend",
+                "workspace_changed_by_backend",
+            }
+        }
     return {
         "action": action,
         "window": bounded_window(window),
         "result": result,
-        **verified_physical_state(f"targeted pointer {action}", before, after),
+        **physical_state,
     }
 
 

@@ -1,5 +1,7 @@
 use super::*;
+use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn accepts_cosmic_eight_bit_shm_formats_in_preference_order() {
@@ -68,15 +70,7 @@ fn abgr_png_preserves_alpha() {
             .unwrap()
             .as_nanos()
     ));
-    let packed = u32::from_le_bytes([12, 34, 56, 78]);
-    write_png(
-        &path,
-        1,
-        1,
-        wl_shm::Format::Abgr8888,
-        packed.to_ne_bytes().to_vec(),
-    )
-    .unwrap();
+    write_png(&path, 1, 1, wl_shm::Format::Abgr8888, vec![12, 34, 56, 78]).unwrap();
     let decoded = image::open(&path).unwrap().into_rgba8();
     fs::remove_file(&path).unwrap();
 

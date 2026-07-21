@@ -1152,6 +1152,26 @@ class McpErrorTests(TestCase):
         self.assertEqual(result, expected)
         capture_window.assert_called_once_with(window, None)
 
+    def test_capture_rechecks_identity_before_renewing_claim(self) -> None:
+        window = {"xid": "0x20"}
+        identity = {"xid": "0x20", "pid": 20}
+        store = Mock(unsafe=True)
+        store.window_guard.return_value = contextlib.nullcontext()
+        store.assert_access.return_value = {"claim_token": "claim-token"}
+        with patch.object(server, "ensure_session", return_value={"session": "same"}), patch.object(server, "_resolve_target", return_value=(window, identity)), patch.object(server, "_identity_matches", side_effect=[server.IdentityMatch.MATCH, server.IdentityMatch.CHANGED]), patch.object(server, "_claim_store", return_value=store), patch.object(server, "capture_window", return_value={"content": [], "isError": False}):
+            with self.assertRaisesRegex(RuntimeError, "changed during capture"):
+                server.call_tool(
+                    "get_session_window_capture",
+                    {"window": "App", "claim_token": "claim-token"},
+                )
+
+        store.finish_access.assert_called_once_with(
+            f"mcp-process:{os.getpid()}",
+            identity,
+            "claim-token",
+            renew=False,
+        )
+
     def test_window_listing_is_paginated(self) -> None:
         windows = [{"xid": f"0x{index:08x}"} for index in range(3)]
         with patch.object(server, "list_windows", return_value=windows):
