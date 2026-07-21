@@ -66,6 +66,7 @@ class RepositorySmokeTests(TestCase):
         self.assertFalse(annotations["get_session_window_capture"]["destructiveHint"])
         self.assertTrue(annotations["save_session_window_capture"]["destructiveHint"])
         self.assertFalse(annotations["save_session_window_capture"]["readOnlyHint"])
+        self.assertFalse(annotations["save_session_window_capture"]["idempotentHint"])
         self.assertTrue(annotations["send_window_shortcut"]["destructiveHint"])
         self.assertTrue(annotations["send_window_shortcut"]["openWorldHint"])
         self.assertTrue(annotations["begin_coordinate_lease"]["destructiveHint"])

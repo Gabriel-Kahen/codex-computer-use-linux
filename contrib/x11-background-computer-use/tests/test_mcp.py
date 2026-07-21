@@ -98,6 +98,9 @@ class McpSmokeTests(TestCase):
         self.assertTrue(
             by_name["save_session_window_capture"]["annotations"]["destructiveHint"]
         )
+        self.assertFalse(
+            by_name["save_session_window_capture"]["annotations"]["idempotentHint"]
+        )
         self.assertEqual(responses[3]["result"], {})
         for tool in tools:
             self.assertEqual(tool["inputSchema"]["type"], "object")

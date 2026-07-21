@@ -1282,7 +1282,7 @@ class McpTests(TestCase):
             {
                 "readOnlyHint": False,
                 "destructiveHint": True,
-                "idempotentHint": True,
+                "idempotentHint": False,
                 "openWorldHint": False,
             },
         )

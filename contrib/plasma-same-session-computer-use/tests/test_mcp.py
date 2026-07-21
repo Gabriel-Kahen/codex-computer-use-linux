@@ -73,6 +73,9 @@ class McpSmokeTests(TestCase):
         self.assertTrue(
             by_name["save_plasma_window_capture"]["annotations"]["destructiveHint"]
         )
+        self.assertFalse(
+            by_name["save_plasma_window_capture"]["annotations"]["idempotentHint"]
+        )
         for tool in tools:
             self.assertEqual(tool["inputSchema"]["type"], "object")
             self.assertLessEqual(set(tool["inputSchema"].get("required", [])), set(tool["inputSchema"].get("properties", {})))

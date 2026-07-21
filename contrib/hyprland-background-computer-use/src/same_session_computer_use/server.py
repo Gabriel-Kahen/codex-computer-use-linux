@@ -136,7 +136,7 @@ TOOLS = [
             },
             "required": ["window", "save_path"],
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
     },
     {
         "name": "send_window_shortcut",
