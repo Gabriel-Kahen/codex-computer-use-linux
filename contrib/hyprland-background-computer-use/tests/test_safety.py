@@ -331,6 +331,63 @@ class StatusTests(TestCase):
                 "native_identity_matches": True,
             },
         )
+        self.assertEqual(
+            result["capabilities"],
+            {
+                "exact_background_window_capture": False,
+                "targeted_background_shortcuts": True,
+                "background_semantic_actions": False,
+                "targeted_wayland_pointer": True,
+                "targeted_xwayland_pointer": True,
+                "cross_process_window_claims": True,
+                "parallel_native_wayland_windows": True,
+                "broker_global_input_lane_serialized": True,
+                "native_input_currently_safe": True,
+                "physical_pointer_seat_is_independent": False,
+            },
+        )
+
+    def test_stale_loaded_plugin_is_not_reported_as_available_or_safe(self) -> None:
+        native_status = {
+            "ok": True,
+            "plugin_version": "stale",
+            "safe_to_inject": True,
+        }
+        responses = iter(
+            (
+                completed([], "same-session-target-pointer"),
+                completed([], json.dumps(native_status)),
+                completed([], "Hyprland version"),
+            )
+        )
+        with (
+            patch.object(server.shutil, "which", return_value="/bin/tool"),
+            patch.object(server, "plugin_build_requirements", return_value={}),
+            patch.object(server, "combine_windows", return_value=[]),
+            patch.object(
+                server,
+                "run",
+                side_effect=lambda *_args, **_kwargs: next(responses),
+            ),
+        ):
+            result = server.status()
+
+        self.assertEqual(
+            result["capabilities"],
+            {
+                "exact_background_window_capture": False,
+                "targeted_background_shortcuts": False,
+                "background_semantic_actions": False,
+                "targeted_wayland_pointer": False,
+                "targeted_xwayland_pointer": False,
+                "cross_process_window_claims": True,
+                "parallel_native_wayland_windows": True,
+                "broker_global_input_lane_serialized": True,
+                "native_input_currently_safe": False,
+                "physical_pointer_seat_is_independent": False,
+            },
+        )
+        self.assertFalse(result["versions"]["native_identity_matches"])
 
     def test_reports_buildable_native_capabilities_without_claiming_at_spi(self) -> None:
         requirements = {"compiler": True, "headers": True}

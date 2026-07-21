@@ -1181,7 +1181,9 @@ def status() -> dict[str, Any]:
             ) and safety_status.get("hyprland_build_abi") == safety_status.get(
                 "hyprland_runtime_abi"
             )
-    native_available = checks["hyprctl"] and (plugin_loaded or native_buildable)
+    native_available = checks["hyprctl"] and (
+        identity_matches is True if plugin_loaded else native_buildable
+    )
     return {
         "session": "real-current-login",
         "wayland_display": os.environ.get("WAYLAND_DISPLAY"),
@@ -1195,7 +1197,11 @@ def status() -> dict[str, Any]:
             "cross_process_window_claims": True,
             "parallel_native_wayland_windows": True,
             "broker_global_input_lane_serialized": True,
-            "native_input_currently_safe": bool(safety_status and safety_status.get("safe_to_inject") is True),
+            "native_input_currently_safe": bool(
+                identity_matches is True
+                and safety_status
+                and safety_status.get("safe_to_inject") is True
+            ),
             "physical_pointer_seat_is_independent": False,
         },
         "semantic_actions": {
