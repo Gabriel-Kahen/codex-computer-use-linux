@@ -223,14 +223,14 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
     BackendDescriptor {
         id: I3_BACKEND,
         failure_label: "i3",
-        list_note: "Window list came from i3-msg. Terminal windows may include best-effort PTY and active-process context when xprop and the process tree are readable.",
-        missing_hint: "On i3, ensure i3-msg can reach the active i3 IPC socket.",
+        list_note: "Window list came from i3 IPC (persistent native transport with i3-msg fallback). Terminal windows may include best-effort PTY and active-process context when xprop and the process tree are readable.",
+        missing_hint: "On i3, expose I3SOCK or the active i3 IPC socket; i3-msg is retained as a compatibility fallback.",
         can_exact_focus: true,
         #[cfg(test)]
         support: BackendSupport {
             desktop_session: "i3",
-            window_backend: "`i3-msg`; optional `xprop` for PID hydration",
-            notes: "Lists and focuses i3 windows over the active i3 IPC socket.",
+            window_backend: "persistent native i3 IPC; `i3-msg` fallback; optional `xprop` PID hydration",
+            notes: "Lists and focuses over one event-subscribed IPC connection, reconnecting when the socket is replaced.",
         },
     },
     BackendDescriptor {
@@ -404,6 +404,7 @@ pub fn focused_window_override() -> Option<WindowInfo> {
     cosmic::focused_window()
         .ok()
         .flatten()
+        .or_else(i3::focused_window)
         .or_else(x11::focused_window)
 }
 
