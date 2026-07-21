@@ -15,6 +15,12 @@ const METADATA_JSON: &str =
     include_str!("../gnome-shell-extension/computer-use-linux@avifenesh.dev/metadata.json");
 const EXTENSION_JS: &str =
     include_str!("../gnome-shell-extension/computer-use-linux@avifenesh.dev/extension.js");
+const BRIDGE_CONTRACT_JS: &str = include_str!(
+    "../gnome-shell-extension/computer-use-linux@avifenesh.dev/gnome_shell_bridge_contract.js"
+);
+const BRIDGE_CONTRACT_JSON: &str = include_str!(
+    "../gnome-shell-extension/computer-use-linux@avifenesh.dev/gnome_shell_bridge_contract.json"
+);
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct WindowTargetingSetupReport {
@@ -109,7 +115,15 @@ fn write_extension_files(extension_dir: &Path) -> Result<ExtensionWriteReport, S
     let metadata_json = render_extension_asset(METADATA_JSON);
     let extension_js = render_extension_asset(EXTENSION_JS);
     let changed_files = file_content_changed(&extension_dir.join("metadata.json"), &metadata_json)
-        || file_content_changed(&extension_dir.join("extension.js"), &extension_js);
+        || file_content_changed(&extension_dir.join("extension.js"), &extension_js)
+        || file_content_changed(
+            &extension_dir.join("gnome_shell_bridge_contract.js"),
+            BRIDGE_CONTRACT_JS,
+        )
+        || file_content_changed(
+            &extension_dir.join("gnome_shell_bridge_contract.json"),
+            BRIDGE_CONTRACT_JSON,
+        );
 
     fs::write(extension_dir.join("metadata.json"), metadata_json).map_err(|error| {
         format!(
@@ -121,6 +135,30 @@ fn write_extension_files(extension_dir: &Path) -> Result<ExtensionWriteReport, S
         format!(
             "failed to write {}: {error}",
             extension_dir.join("extension.js").display()
+        )
+    })?;
+    fs::write(
+        extension_dir.join("gnome_shell_bridge_contract.js"),
+        BRIDGE_CONTRACT_JS,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to write {}: {error}",
+            extension_dir
+                .join("gnome_shell_bridge_contract.js")
+                .display()
+        )
+    })?;
+    fs::write(
+        extension_dir.join("gnome_shell_bridge_contract.json"),
+        BRIDGE_CONTRACT_JSON,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to write {}: {error}",
+            extension_dir
+                .join("gnome_shell_bridge_contract.json")
+                .display()
         )
     })?;
     Ok(ExtensionWriteReport {
@@ -408,5 +446,15 @@ mod tests {
         assert!(rendered.contains("CaptureScreenshotAsync"));
         assert!(rendered.contains("GLib.canonicalize_filename(path, null)"));
         assert!(rendered.contains("basename.startsWith('computer-use-linux-gnome-extension-')"));
+    }
+
+    #[test]
+    fn generated_extension_exposes_the_shared_bridge_identity() {
+        let rendered = render_extension_asset(EXTENSION_JS);
+
+        assert!(rendered.contains("<method name=\"GetBridgeInfo\">"));
+        assert!(rendered.contains("stable_window_id: stableWindowId(window)"));
+        assert!(BRIDGE_CONTRACT_JSON.contains("meta-stable-sequence-v1"));
+        assert!(BRIDGE_CONTRACT_JS.contains("export function operationIdentity"));
     }
 }

@@ -723,6 +723,27 @@ class InputTests(TestCase):
 
 
 class StatusTests(TestCase):
+    def test_protocol_five_requires_the_shared_bridge_contract(self) -> None:
+        invalid = {
+            "shell_instance": "shell-1",
+            "protocol_version": server.BRIDGE_CONTRACT_PROTOCOL_VERSION,
+            "capabilities": [server.BRIDGE_CONTRACT_CAPABILITY],
+        }
+        with patch.object(server, "dbus_call", return_value=invalid):
+            with self.assertRaisesRegex(RuntimeError, "incompatible Shell bridge identity"):
+                server.shell_status()
+
+        valid = {
+            **invalid,
+            "bridge_contract": {
+                **server.BRIDGE_CONTRACT,
+                "role": "background-computer-use",
+                "features": [],
+            },
+        }
+        with patch.object(server, "dbus_call", return_value=valid):
+            self.assertEqual(server.shell_status(), valid)
+
     def test_does_not_claim_background_capture_or_targeted_input(self) -> None:
         with (
             patch.dict(server.os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}),

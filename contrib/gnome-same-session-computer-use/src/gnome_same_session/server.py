@@ -57,6 +57,10 @@ WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION = 3
 WINDOW_ACTOR_CAPTURE_CAPABILITY = "window_actor_capture"
 ACT_AND_CAPTURE_PROTOCOL_VERSION = 4
 ACT_AND_CAPTURE_CAPABILITY = "act_and_capture"
+BRIDGE_CONTRACT_PROTOCOL_VERSION = 5
+BRIDGE_CONTRACT_CAPABILITY = "bridge_contract_v1"
+BRIDGE_CONTRACT_PATH = Path(__file__).parents[2] / "gnome_shell_bridge_contract.json"
+BRIDGE_CONTRACT = json.loads(BRIDGE_CONTRACT_PATH.read_text())
 BUS_NAME = "org.gnome.Shell.Extensions.BackgroundComputerUse"
 OBJECT_PATH = "/org/gnome/Shell/Extensions/BackgroundComputerUse"
 INTERFACE = BUS_NAME
@@ -380,6 +384,24 @@ def save_lease(state: dict[str, Any]) -> None:
     atomic_write_json(LEASE_FILE, state)
 
 
+def shell_contract_valid(integration: dict[str, Any]) -> bool:
+    actual = integration.get("bridge_contract")
+    return (
+        isinstance(actual, dict)
+        and actual.get("role") == "background-computer-use"
+        and all(actual.get(key) == value for key, value in BRIDGE_CONTRACT.items())
+        and isinstance(actual.get("features"), list)
+        and BRIDGE_CONTRACT_CAPABILITY in integration.get("capabilities", [])
+    )
+
+
+def shell_protocol_identity_compatible(integration: dict[str, Any]) -> bool:
+    version = integration.get("protocol_version")
+    return type(version) is int and (
+        version < BRIDGE_CONTRACT_PROTOCOL_VERSION or shell_contract_valid(integration)
+    )
+
+
 def shell_status() -> dict[str, Any]:
     value = dbus_call("Status")
     if (
@@ -388,6 +410,15 @@ def shell_status() -> dict[str, Any]:
         or not 1 <= len(value["shell_instance"]) <= 256
     ):
         raise RuntimeError("GNOME integration returned an invalid Shell session identity")
+    if (
+        type(value.get("protocol_version")) is int
+        and value["protocol_version"] >= BRIDGE_CONTRACT_PROTOCOL_VERSION
+        and not shell_contract_valid(value)
+    ):
+        raise RuntimeError(
+            "GNOME integration returned an incompatible Shell bridge identity; "
+            "run install-gnome-integration and reload the GNOME session"
+        )
     return value
 
 
@@ -396,6 +427,7 @@ def shell_supports_claimed_leases(integration: dict[str, Any]) -> bool:
     return (
         type(integration.get("protocol_version")) is int
         and integration["protocol_version"] >= CLAIMED_LEASE_PROTOCOL_VERSION
+        and shell_protocol_identity_compatible(integration)
         and isinstance(capabilities, list)
         and CLAIMED_LEASE_CAPABILITY in capabilities
     )
@@ -406,6 +438,7 @@ def shell_supports_window_actor_capture(integration: dict[str, Any]) -> bool:
     return (
         type(integration.get("protocol_version")) is int
         and integration["protocol_version"] >= WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION
+        and shell_protocol_identity_compatible(integration)
         and isinstance(capabilities, list)
         and WINDOW_ACTOR_CAPTURE_CAPABILITY in capabilities
     )
@@ -416,9 +449,36 @@ def shell_supports_act_and_capture(integration: dict[str, Any]) -> bool:
     return (
         type(integration.get("protocol_version")) is int
         and integration["protocol_version"] >= ACT_AND_CAPTURE_PROTOCOL_VERSION
+        and shell_protocol_identity_compatible(integration)
         and isinstance(capabilities, list)
         and ACT_AND_CAPTURE_CAPABILITY in capabilities
     )
+
+
+def require_operation_identity(
+    metadata: dict[str, Any],
+    integration: dict[str, Any],
+    *,
+    shell_instance: str,
+    window_id: str,
+    kind: str,
+    generation: str | None,
+) -> None:
+    if integration.get("protocol_version", 0) < BRIDGE_CONTRACT_PROTOCOL_VERSION:
+        return
+    identity = metadata.get("operation_identity")
+    expected = {
+        "contract_version": BRIDGE_CONTRACT["contract_version"],
+        "shell_instance": shell_instance,
+        "window": {
+            "scheme": BRIDGE_CONTRACT["window_identity"],
+            "id": window_id,
+        },
+        "kind": kind,
+        "generation": generation,
+    }
+    if identity != expected:
+        raise RuntimeError("GNOME integration returned a mismatched operation identity")
 
 
 def require_claimed_lease_support(integration: dict[str, Any]) -> None:
@@ -509,6 +569,11 @@ def begin_lease(
     capability = prepared.get("capability")
     if not isinstance(capability, str) or not 64 <= len(capability) <= 256:
         raise RuntimeError("GNOME integration returned an invalid lease capability")
+    lease_generation = prepared.get("lease_generation")
+    if lease_generation is not None and (
+        not isinstance(lease_generation, str) or not 32 <= len(lease_generation) <= 256
+    ):
+        raise RuntimeError("GNOME integration returned an invalid lease generation")
     state = {
         "version": 3,
         "token": capability,
@@ -519,6 +584,7 @@ def begin_lease(
         "owner_thread_id": owner,
         "broker": BROKER_IDENTITY,
         "claim_token": claim.get("claim_token") if claim else None,
+        "lease_generation": lease_generation,
     }
     try:
         save_lease(state)
@@ -785,6 +851,11 @@ def capture_window(
     )
     if not permitted and not actor_capture:
         raise RuntimeError("stock Mutter can only capture the focused window exactly; begin_focus_lease first")
+    if actor_capture and selected.get("minimized"):
+        raise RuntimeError(
+            "minimized GNOME windows may expose stale compositor buffers; unminimize the window "
+            "or use act_and_observe_window, which leases and maps it temporarily"
+        )
     destination_value = arguments.get("save_path")
     destination = Path(str(destination_value)).expanduser() if destination_value else None
     if destination and not destination.is_absolute():
@@ -806,6 +877,16 @@ def capture_window(
         current = capture_metadata.get("window")
         if not isinstance(current, dict) or str(current.get("id")) != str(selected["id"]):
             raise RuntimeError("GNOME integration returned capture data for a different window")
+        if capture_metadata.get("potentially_stale") is not False or current.get("minimized"):
+            raise RuntimeError("GNOME integration could not prove the window capture is fresh")
+        require_operation_identity(
+            capture_metadata,
+            integration,
+            shell_instance=expected_shell_instance,
+            window_id=str(selected["id"]),
+            kind="capture",
+            generation=None,
+        )
         require_shell_instance(expected_shell_instance)
         selected = current
         capture_source = "meta-window-actor"
@@ -1011,6 +1092,16 @@ def act_and_observe(
         current = capture_metadata.get("window")
         if not isinstance(current, dict) or str(current.get("id")) != str(selected["id"]):
             raise RuntimeError("GNOME integration observed a different window after the action")
+        if capture_metadata.get("potentially_stale") is True or current.get("minimized") is True:
+            raise RuntimeError("GNOME act-and-observe could not prove the captured buffer is fresh")
+        require_operation_identity(
+            capture_metadata,
+            integration,
+            shell_instance=expected_shell_instance,
+            window_id=str(selected["id"]),
+            kind="act-and-capture",
+            generation=state.get("lease_generation"),
+        )
         transaction = capture_metadata.get("transaction")
         restoration = transaction.get("restoration") if isinstance(transaction, dict) else None
         if not isinstance(restoration, dict) or restoration.get("recovery_complete") is not True:
@@ -1171,6 +1262,13 @@ def status() -> dict[str, Any]:
     if checks["pygobject"]:
         try:
             raw_integration = dbus_call("Status")
+            if (
+                isinstance(raw_integration, dict)
+                and type(raw_integration.get("protocol_version")) is int
+                and raw_integration["protocol_version"] >= BRIDGE_CONTRACT_PROTOCOL_VERSION
+                and not shell_contract_valid(raw_integration)
+            ):
+                raise RuntimeError("GNOME integration returned an incompatible Shell bridge identity")
             integration = bounded_json_value(raw_integration) if isinstance(raw_integration, dict) else None
         except Exception as exc:
             error = bounded_text(exc, MAX_ERROR_TEXT_CHARS)

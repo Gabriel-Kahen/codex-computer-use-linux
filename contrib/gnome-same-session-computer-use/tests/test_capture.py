@@ -32,24 +32,42 @@ class CaptureBoundaryTests(TestCase):
             with self.assertRaisesRegex(RuntimeError, "begin_focus_lease"):
                 server.capture_window({"window": "11"})
 
-    def test_window_actor_capture_observes_inactive_window_without_focus(self) -> None:
+    def test_window_actor_capture_observes_mapped_inactive_window_without_focus(self) -> None:
         window = {
             "id": "11",
             "title": "Editor",
             "focused": False,
-            "minimized": True,
+            "minimized": False,
             "frame": {"width": 400, "height": 300},
         }
         integration = {
             "shell_instance": "shell-a",
-            "protocol_version": server.WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION,
-            "capabilities": [server.WINDOW_ACTOR_CAPTURE_CAPABILITY],
+            "protocol_version": server.BRIDGE_CONTRACT_PROTOCOL_VERSION,
+            "capabilities": [
+                server.WINDOW_ACTOR_CAPTURE_CAPABILITY,
+                server.BRIDGE_CONTRACT_CAPABILITY,
+            ],
+            "bridge_contract": {
+                **server.BRIDGE_CONTRACT,
+                "role": "background-computer-use",
+                "features": ["window-actor-capture"],
+            },
         }
         captured = {
             "window": window,
             "shell_instance": "shell-a",
             "source": "meta-window-actor",
-            "potentially_stale": True,
+            "potentially_stale": False,
+            "operation_identity": {
+                "contract_version": server.BRIDGE_CONTRACT["contract_version"],
+                "shell_instance": "shell-a",
+                "window": {
+                    "scheme": server.BRIDGE_CONTRACT["window_identity"],
+                    "id": "11",
+                },
+                "kind": "capture",
+                "generation": None,
+            },
         }
         with (
             patch.object(server, "load_lease", return_value=None),
@@ -68,8 +86,60 @@ class CaptureBoundaryTests(TestCase):
         metadata = json.loads(result["content"][0]["text"])
         self.assertFalse(metadata["capture_requires_focus"])
         self.assertEqual(metadata["capture_source"], "meta-window-actor")
-        self.assertTrue(metadata["potentially_stale"])
+        self.assertFalse(metadata["potentially_stale"])
         self.assertEqual(metadata["coordinate_space"]["pixel_to_window_scale"], {"x": 0.5, "y": 0.5})
+
+    def test_window_actor_capture_rejects_minimized_buffers_before_dbus(self) -> None:
+        window = {"id": "11", "focused": False, "minimized": True}
+        integration = {
+            "shell_instance": "shell-a",
+            "protocol_version": server.WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION,
+            "capabilities": [server.WINDOW_ACTOR_CAPTURE_CAPABILITY],
+        }
+        with (
+            patch.object(server, "load_lease", return_value=None),
+            patch.object(server, "shell_status", return_value=integration),
+            patch.object(server, "dbus_capture_window") as capture,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stale compositor buffers"):
+                server.capture_window(
+                    {"window": "11"},
+                    selected=window,
+                    expected_shell_instance="shell-a",
+                )
+
+        capture.assert_not_called()
+
+    def test_protocol_three_mapped_capture_keeps_legacy_metadata_compatibility(self) -> None:
+        window = {
+            "id": "11",
+            "focused": False,
+            "minimized": False,
+            "frame": {"width": 1, "height": 1},
+        }
+        integration = {
+            "shell_instance": "shell-a",
+            "protocol_version": server.WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION,
+            "capabilities": [server.WINDOW_ACTOR_CAPTURE_CAPABILITY],
+        }
+        captured = {
+            "window": window,
+            "shell_instance": "shell-a",
+            "potentially_stale": False,
+        }
+        with (
+            patch.object(server, "load_lease", return_value=None),
+            patch.object(server, "shell_status", return_value=integration),
+            patch.object(server, "dbus_capture_window", return_value=(png(1, 1), captured)),
+        ):
+            result = server.capture_window(
+                {"window": "11"},
+                selected=window,
+                expected_shell_instance="shell-a",
+            )
+
+        metadata = json.loads(result["content"][0]["text"])
+        self.assertEqual(metadata["capture_source"], "meta-window-actor")
 
     def test_window_actor_capture_rejects_shell_restart(self) -> None:
         window = {"id": "11", "focused": False, "frame": {"width": 1, "height": 1}}
@@ -100,8 +170,16 @@ class CaptureBoundaryTests(TestCase):
         }
         integration = {
             "shell_instance": "shell-a",
-            "protocol_version": server.ACT_AND_CAPTURE_PROTOCOL_VERSION,
-            "capabilities": [server.ACT_AND_CAPTURE_CAPABILITY],
+            "protocol_version": server.BRIDGE_CONTRACT_PROTOCOL_VERSION,
+            "capabilities": [
+                server.ACT_AND_CAPTURE_CAPABILITY,
+                server.BRIDGE_CONTRACT_CAPABILITY,
+            ],
+            "bridge_contract": {
+                **server.BRIDGE_CONTRACT,
+                "role": "background-computer-use",
+                "features": ["act-and-capture"],
+            },
             "lease_phase": None,
         }
         state = {
@@ -109,6 +187,7 @@ class CaptureBoundaryTests(TestCase):
             "phase": "active",
             "target": window,
             "shell_instance": "shell-a",
+            "lease_generation": "g" * 64,
         }
         transaction = {
             "settle": {"reason": "damaged-and-painted"},
@@ -119,6 +198,16 @@ class CaptureBoundaryTests(TestCase):
             "window": {**window, "focused": True},
             "shell_instance": "shell-a",
             "transaction": transaction,
+            "operation_identity": {
+                "contract_version": server.BRIDGE_CONTRACT["contract_version"],
+                "shell_instance": "shell-a",
+                "window": {
+                    "scheme": server.BRIDGE_CONTRACT["window_identity"],
+                    "id": "11",
+                },
+                "kind": "act-and-capture",
+                "generation": "g" * 64,
+            },
         }
         arguments = {
             "window": "11",
