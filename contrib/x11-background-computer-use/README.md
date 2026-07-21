@@ -5,7 +5,7 @@ This experimental Codex plugin operates existing applications in the user's curr
 ## Capabilities
 
 - Paginated EWMH discovery with XRes-authenticated PID ownership, XID, desktop, geometry, bounded title and WM_CLASS, and AT-SPI correlation hints.
-- Exact unobscured capture of mapped windows through the compositor's XComposite named pixmap, without focus, desktop, stacking, or pointer changes.
+- Exact unobscured capture of mapped windows through the compositor's XComposite named pixmap over one persistent native transport, without focus, desktop, stacking, or pointer changes.
 - Best-effort no-focus shortcuts with an explicit unconfirmed-delivery result.
 - Reliable keyboard, click, scroll, and drag input through an explicitly acknowledged XTEST focus/pointer lease.
 - Cross-process, session-bound window claims keyed to Codex's host-supplied agent identity. Different windows can be captured or receive targeted shortcuts concurrently, while the same window is fenced to one agent for its observe-act-verify cycle.
@@ -18,8 +18,10 @@ Generic X11 cannot provide both reliable input and zero interference. Many appli
 
 - A local Xorg session with an EWMH-compatible window manager.
 - `python3`, `xprop`, `wmctrl`, `xdotool`, `xinput`, logind, and XRes 1.2.
-- For the capture and XRes ownership helper: a C compiler, `pkg-config`, and development packages for X11, XComposite, XRes, and libpng. Exact capture additionally requires an enabled X11 compositing manager and a direct-color visual, as used by normal modern Xorg desktops.
-- The repository-owned Computer Use plugin for preferred AT-SPI semantic actions.
+- The repository-owned Computer Use plugin. Its shipped Rust binary provides the normal persistent XRes identity and XComposite capture transport as well as preferred AT-SPI semantic actions.
+- Exact capture additionally requires an enabled X11 compositing manager and a direct-color visual, as used by normal modern Xorg desktops.
+
+The source-built C helper is now compatibility fallback only, used when the shipped native worker cannot be found or started. That fallback requires a C compiler, `pkg-config`, and development packages for X11, XComposite, XRes, and libpng. The package commands below include those optional fallback dependencies.
 
 On Debian/Ubuntu:
 
@@ -40,6 +42,8 @@ sudo pacman -S python wmctrl xdotool xorg-xinput gcc pkgconf libx11 libxcomposit
 ```
 
 Enable your desktop's compositor if `session_status` reports `compositing_manager_active: false`. Minimized windows must be restored before exact capture. Capture is limited to 33,177,600 pixels (equivalent to 7680 × 4320), and PNGs larger than 5 MiB are rejected before transport.
+
+The broker keeps the native worker and its X11 connection alive across PID lookups and captures. It rechecks the XRes PID and window dimensions around each capture. A capture or identity rejection is never retried through the compatibility path; fallback occurs only when the native transport itself is disabled, missing, or broken. Set `CODEX_X11_NATIVE_CAPTURE=0` to force compatibility mode for diagnosis.
 
 `get_session_window_capture` is read-only and returns its PNG inline. Use the separately destructive `save_session_window_capture` tool only when an absolute-path PNG artifact is needed; it atomically replaces the destination after validation. The original `capture_session_window` tool remains as a deprecated compatibility route with its optional `save_path` behavior and destructive annotation.
 

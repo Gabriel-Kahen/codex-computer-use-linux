@@ -5,4 +5,7 @@ pub mod i3;
 mod i3_ipc;
 pub mod kwin;
 pub mod niri;
+pub(crate) mod niri_capture;
+mod niri_ipc;
 pub mod x11;
+pub(crate) mod x11_native;

@@ -171,27 +171,27 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
     BackendDescriptor {
         id: COSMIC_WAYLAND_BACKEND,
         failure_label: "COSMIC helper",
-        list_note: "Window list came from the COSMIC Wayland helper. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
+        list_note: "Window list came from the persistent COSMIC Wayland helper. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On COSMIC, ensure the bundled COSMIC helper is present and can connect to the session.",
         can_exact_focus: true,
         #[cfg(test)]
         support: BackendSupport {
             desktop_session: "COSMIC Wayland",
-            window_backend: "`computer-use-linux-cosmic` helper",
-            notes: "Installed automatically by `./install.sh`, `cargo install`, and npm. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`.",
+            window_backend: "persistent `computer-use-linux-cosmic` helper",
+            notes: "Installed automatically by `./install.sh`, `cargo install`, and npm. Normal operations reuse one helper and Wayland connection, with automatic restart and a one-shot fallback. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`.",
         },
     },
     BackendDescriptor {
         id: KWIN_BACKEND,
         failure_label: "KWin",
-        list_note: "Window list came from KWin/Plasma DBus scripting. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
+        list_note: "Window list came from the process-lifetime KWin/Plasma DBus bridge. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On KDE/Plasma, ensure KWin exposes org.kde.KWin scripting on the session bus.",
         can_exact_focus: true,
         #[cfg(test)]
         support: BackendSupport {
             desktop_session: "KDE Plasma / KWin",
-            window_backend: "temporary KWin DBus scripting",
-            notes: "Lists and focuses windows through `org.kde.KWin` scripting when the session bus exposes it.",
+            window_backend: "persistent KWin DBus window bridge",
+            notes: "Keeps one event-driven Plasma 5/6 window snapshot bridge loaded for the MCP process and reloads it when the `org.kde.KWin` bus owner changes; focus actions still use short-lived scripts. Exact target capture calls `org.kde.KWin.ScreenShot2` directly from Rust, including inactive windows, without a screenshot helper process.",
         },
     },
     BackendDescriptor {
@@ -210,14 +210,14 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
     BackendDescriptor {
         id: NIRI_BACKEND,
         failure_label: "Niri",
-        list_note: "Window list came from Niri IPC. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
-        missing_hint: "On Niri, ensure NIRI_SOCKET is available and niri msg can reach the active compositor.",
+        list_note: "Window list came from Niri IPC. Exact inactive capture uses Niri's stable window-ID ScreenCast interface when the required GStreamer plugins are installed. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
+        missing_hint: "On Niri, ensure NIRI_SOCKET points to the active compositor IPC socket. The niri command provides a compatibility fallback for older IPC implementations. Exact inactive capture additionally needs Niri's org.gnome.Mutter.ScreenCast service plus the GStreamer pipewiresrc, videoconvert, and pngenc plugins.",
         can_exact_focus: true,
         #[cfg(test)]
         support: BackendSupport {
             desktop_session: "Niri",
-            window_backend: "`niri msg --json windows` and `niri msg action focus-window`",
-            notes: "Requires `NIRI_SOCKET` and the `niri` command from the active compositor session.",
+            window_backend: "direct `NIRI_SOCKET` event stream and actions; `niri msg` fallback",
+            notes: "Uses Niri's complete event-stream snapshot and incremental updates without polling. Exact inactive capture binds the compositor ScreenCast stream to the same stable window ID and requires GStreamer PipeWire, base, and good plugins; it never substitutes monitor or desktop pixels. The `niri` command is only required for compatibility fallback.",
         },
     },
     BackendDescriptor {
@@ -242,8 +242,8 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         #[cfg(test)]
         support: BackendSupport {
             desktop_session: "Generic X11 / Xfce / other EWMH WMs",
-            window_backend: "`wmctrl`; optional `xprop` for focus verification",
-            notes: "Lists, focuses, moves, and resizes EWMH windows. Without `xprop`, listing still works but focused-window verification is unavailable.",
+            window_backend: "native X11/EWMH connection; `wmctrl`/`xprop` fallback",
+            notes: "Lists and focuses through one persistent X11 connection, with event-invalidated snapshots. `wmctrl` remains the move/resize and compatibility fallback.",
         },
     },
 ];
@@ -405,6 +405,7 @@ pub fn focused_window_override() -> Option<WindowInfo> {
         .ok()
         .flatten()
         .or_else(i3::focused_window)
+        .or_else(x11::focused_window)
 }
 
 pub fn probe_backends() -> Vec<BackendProbe> {

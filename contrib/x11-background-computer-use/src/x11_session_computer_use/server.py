@@ -18,7 +18,8 @@ from typing import Any
 
 from .capture import build_requirements
 from .capture import capture_window
-from .capture import ensure_capture_helper
+from .capture import authenticated_pid
+from .capture import native_transport_available
 from .coordination import DEFAULT_LEASE_SECONDS
 from .coordination import MAX_CLAIM_TOKEN_LENGTH
 from .coordination import MAX_INFLIGHT_SECONDS
@@ -196,8 +197,7 @@ def _process_start_time(pid: int) -> str | None:
 
 
 def _authenticated_pid(xid: str) -> int | None:
-    proc = run([str(ensure_capture_helper()), "--pid", xid])
-    return int(proc.stdout.strip()) if proc.returncode == 0 and proc.stdout.strip().isdigit() else None
+    return authenticated_pid(xid)
 
 
 def _local_display_socket(display: str) -> Path:
@@ -1071,6 +1071,8 @@ def status() -> dict[str, Any]:
     except Exception as exc:
         session_error = _bounded_error_text(exc)
     build = build_requirements()
+    native_capture_worker = native_transport_available()
+    capture_transport = native_capture_worker or all(build.values())
     session_ok = session_error is None
     compositor = _compositor_active() if not session_error else False
     lock_state = _lock_state() if session_ok else None
@@ -1086,17 +1088,18 @@ def status() -> dict[str, Any]:
         "display": os.environ.get("DISPLAY"),
         "session_error": session_error,
         "capabilities": {
-            "exact_background_window_capture": compositor and all(build.values()) and any(window["mapped"] and not window["minimized"] and window["same_uid"] for window in windows),
+            "exact_background_window_capture": compositor and capture_transport and any(window["mapped"] and not window["minimized"] and window["same_uid"] for window in windows),
             "best_effort_no_focus_shortcuts": session_ok and checks["xdotool"],
             "reliable_journaled_focus_pointer_lease": session_ok and checks["xdotool"] and checks["xinput"] and lock_state is not None,
             "targeted_background_pointer_without_interference": False,
             "background_semantic_actions": False,
             "parallel_distinct_window_claims": session_ok and claim_error is None,
-            "parallel_exact_capture_for_distinct_windows": compositor and all(build.values()),
+            "parallel_exact_capture_for_distinct_windows": compositor and capture_transport,
             "parallel_reliable_global_input": False,
         },
         "checks": checks,
         "capture_build_requirements": build,
+        "native_capture_worker_available": native_capture_worker,
         "compositing_manager_active": compositor,
         "locked_hint_verified": lock_state is not None,
         "same_uid_window_count": sum(window["same_uid"] for window in windows),
@@ -1241,6 +1244,8 @@ def call_tool(
             succeeded = False
             try:
                 result = capture_window(window, arguments.get("save_path"))
+                if _identity_matches(identity) is not IdentityMatch.MATCH:
+                    raise RuntimeError("the target X11 window identity changed during capture")
                 succeeded = True
                 return result
             finally:

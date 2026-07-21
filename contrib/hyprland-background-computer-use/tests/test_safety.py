@@ -15,6 +15,17 @@ def completed(args: list[str], stdout: str = "", returncode: int = 0) -> subproc
     return subprocess.CompletedProcess(args, returncode, stdout, "")
 
 
+def native_transaction(
+    before: dict[str, object], after: dict[str, object] | None = None
+) -> dict[str, object]:
+    return {
+        "ok": True,
+        "action": "click",
+        "physical_state_before": before,
+        "physical_state_after": before if after is None else after,
+    }
+
+
 class FileGuardTests(TestCase):
     def test_file_guard_excludes_another_process(self) -> None:
         with TemporaryDirectory() as directory:
@@ -165,12 +176,154 @@ class PluginBuildTests(TestCase):
         with self.assertRaisesRegex(RuntimeError, "ABI does not match"):
             native_plugin._validate_plugin_identity(status, expected)
 
+    def test_native_action_identity_is_cached_per_instance_socket(self) -> None:
+        identity = native_plugin.plugin_identity("version", b"source")
+        status = {
+            **identity,
+            "hyprland_build_abi": "abi",
+            "hyprland_runtime_abi": "abi",
+        }
+        with (
+            patch.object(native_plugin, "_IDENTITY_CACHE", {}),
+            patch.object(
+                native_plugin,
+                "ensure_target_pointer_plugin",
+                return_value=status,
+            ) as ensure,
+            patch.dict(
+                os.environ,
+                {
+                    "HYPRLAND_INSTANCE_SIGNATURE": "instance-a",
+                    "XDG_RUNTIME_DIR": "/run/user/1000",
+                    "WAYLAND_DISPLAY": "wayland-1",
+                },
+            ),
+        ):
+            self.assertEqual(native_plugin.native_action_identity(), identity)
+            self.assertEqual(native_plugin.native_action_identity(), identity)
+            os.environ["WAYLAND_DISPLAY"] = "wayland-2"
+            self.assertEqual(native_plugin.native_action_identity(), identity)
+
+        self.assertEqual(ensure.call_count, 2)
+
+    def test_native_action_sends_identity_and_accepts_atomic_state(self) -> None:
+        identity = native_plugin.plugin_identity("version", b"source")
+        state = {
+            "active_address": "0x2",
+            "workspace": 1,
+            "cursor": {"x": 3, "y": 4},
+        }
+        response = {
+            "ok": True,
+            "identity": {
+                **identity,
+                "hyprland_build_abi": "abi",
+                "hyprland_runtime_abi": "abi",
+            },
+            "physical_state_before": state,
+            "physical_state_after": state,
+        }
+        with (
+            patch.object(native_plugin, "native_action_identity", return_value=identity),
+            patch.object(
+                native_plugin,
+                "run",
+                return_value=completed([], json.dumps(response)),
+            ) as dispatch,
+        ):
+            result = native_plugin.run_target_pointer_action(
+                "click", ["0x1", "10", "20", "left", "1"]
+            )
+
+        self.assertEqual(result, response)
+        self.assertEqual(
+            dispatch.call_args.args[0],
+            [
+                "hyprctl",
+                "-j",
+                "cutarget",
+                "click",
+                native_plugin.plugin_identity_token(identity),
+                "0x1",
+                "10",
+                "20",
+                "left",
+                "1",
+            ],
+        )
+
+    def test_native_action_reloads_once_after_explicit_unknown_request(self) -> None:
+        identity = native_plugin.plugin_identity("version", b"source")
+        status = {
+            **identity,
+            "hyprland_build_abi": "abi",
+            "hyprland_runtime_abi": "abi",
+        }
+        response = {
+            "ok": True,
+            "identity": status,
+            "physical_state_before": {},
+            "physical_state_after": {},
+        }
+        with (
+            patch.object(native_plugin, "native_action_identity", return_value=identity),
+            patch.object(native_plugin, "invalidate_plugin_identity") as invalidate,
+            patch.object(
+                native_plugin,
+                "ensure_target_pointer_plugin",
+                return_value=status,
+            ) as ensure,
+            patch.object(
+                native_plugin,
+                "run",
+                side_effect=(
+                    completed([], "unknown request"),
+                    completed([], json.dumps(response)),
+                ),
+            ) as dispatch,
+        ):
+            result = native_plugin.run_target_pointer_action(
+                "click", ["0x1", "10", "20", "left", "1"]
+            )
+
+        self.assertEqual(result, response)
+        invalidate.assert_called_once_with()
+        ensure.assert_called_once_with()
+        self.assertEqual(dispatch.call_count, 2)
+
+    def test_native_action_does_not_replay_an_ambiguous_transport_failure(self) -> None:
+        identity = native_plugin.plugin_identity("version", b"source")
+        with (
+            patch.object(native_plugin, "native_action_identity", return_value=identity),
+            patch.object(native_plugin, "ensure_target_pointer_plugin") as ensure,
+            patch.object(
+                native_plugin,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    [], 1, "", "connection closed after dispatch"
+                ),
+            ) as dispatch,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "connection closed"):
+                native_plugin.run_target_pointer_action(
+                    "click", ["0x1", "10", "20", "left", "1"]
+                )
+
+        ensure.assert_not_called()
+        dispatch.assert_called_once()
+
 
 class SafetyProbeTests(TestCase):
     def test_rejects_an_unsafe_native_status(self) -> None:
-        status = {"ok": True, "safe_to_inject": False, "pointer_seat": True, "held_buttons": True}
+        status = {"safe_to_inject": False, "pointer_seat": True, "held_buttons": True}
         with patch.object(native_plugin, "native_input_status", return_value=status):
             with self.assertRaisesRegex(RuntimeError, "held_buttons"):
+                native_plugin.ensure_native_input_safe()
+
+    def test_rejects_an_active_pointer_grab(self) -> None:
+        status = {"safe_to_inject": False, "pointer_seat": True, "pointer_grab": True}
+        with patch.object(native_plugin, "native_input_status", return_value=status):
+            with self.assertRaisesRegex(RuntimeError, "pointer_grab"):
                 native_plugin.ensure_native_input_safe()
 
     def test_xwayland_pointer_checks_safety_before_snapshot(self) -> None:
@@ -196,40 +349,38 @@ class SafetyProbeTests(TestCase):
 
         self.assertEqual(events, ["safe", "snapshot", "snapshot"])
 
-    def test_wayland_pointer_prepares_action_before_snapshot(self) -> None:
+    def test_wayland_pointer_uses_one_native_transaction(self) -> None:
         events: list[str] = []
         window = {"address": "0x1", "size": [100, 100], "xwayland": False}
+        state = {
+            "active_address": "0x2",
+            "workspace": 1,
+            "cursor": {"x": 3, "y": 4},
+        }
 
         def record(event: str):
             return lambda *_args, **_kwargs: events.append(event)
-
-        def snapshot() -> dict[str, object]:
-            events.append("snapshot")
-            return {}
 
         with (
             patch.object(server, "validate_point", side_effect=record("validate")),
             patch.object(
                 server,
-                "ensure_target_pointer_plugin",
-                side_effect=record("plugin"),
+                "run_target_pointer_action",
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("transaction") or native_transaction(state)
+                ),
             ),
-            patch.object(server, "physical_snapshot", side_effect=snapshot),
             patch.object(
                 server,
-                "run",
-                side_effect=lambda *_args, **_kwargs: (
-                    events.append("dispatch") or completed([], '{"ok":true}')
-                ),
+                "physical_snapshot",
+                side_effect=AssertionError("native action used external snapshots"),
             ),
         ):
             server._targeted_pointer(
                 {"window": "0x1", "x": 10, "y": 10}, "click", window=window
             )
 
-        self.assertEqual(
-            events, ["validate", "plugin", "snapshot", "dispatch", "snapshot"]
-        )
+        self.assertEqual(events, ["validate", "transaction"])
 
     def test_targeted_pointer_rejects_changed_physical_state(self) -> None:
         window = {"address": "0x1", "size": [100, 100], "xwayland": False}
@@ -242,9 +393,11 @@ class SafetyProbeTests(TestCase):
 
         with (
             patch.object(server, "resolve_window", return_value=window),
-            patch.object(server, "ensure_target_pointer_plugin"),
-            patch.object(server, "physical_snapshot", side_effect=(before, after)),
-            patch.object(server, "run", return_value=completed([], '{"ok":true}')),
+            patch.object(
+                server,
+                "run_target_pointer_action",
+                return_value=native_transaction(before, after),
+            ),
         ):
             with self.assertRaisesRegex(
                 RuntimeError, "workspace_changed_by_backend"
@@ -263,9 +416,11 @@ class SafetyProbeTests(TestCase):
 
         with (
             patch.object(server, "resolve_window", return_value=window),
-            patch.object(server, "ensure_target_pointer_plugin"),
-            patch.object(server, "physical_snapshot", return_value=snapshot),
-            patch.object(server, "run", return_value=completed([], '{"ok":true}')),
+            patch.object(
+                server,
+                "run_target_pointer_action",
+                return_value=native_transaction(snapshot),
+            ),
         ):
             result = server._targeted_pointer(
                 {"window": "0x1", "x": 10, "y": 10}, "click"

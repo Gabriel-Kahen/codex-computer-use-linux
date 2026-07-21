@@ -16,6 +16,10 @@ X11/EWMH window discovery. It prefers semantic AT-SPI actions, validates modern
 and input paths. Targeted Hyprland observations use compositor-native exact
 window capture when the running compositor exposes a stable capture ID;
 targeted capture failures return an error instead of unrelated desktop pixels.
+Generic X11 uses its persistent native EWMH connection for XRes-authenticated
+XComposite window capture, with pixel and PNG payload limits. The hidden
+`x11-capture-worker` subcommand exposes that same engine as a persistent framed
+transport for the X11 companion plugin, avoiding per-capture process startup.
 
 ## Build and test
 

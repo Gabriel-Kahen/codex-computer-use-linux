@@ -53,6 +53,16 @@ MAX_RESPONSE_COLLECTION_ITEMS = 8
 MAX_RESPONSE_DEPTH = 4
 CLAIMED_LEASE_PROTOCOL_VERSION = 2
 CLAIMED_LEASE_CAPABILITY = "claimed_focus_leases"
+WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION = 3
+WINDOW_ACTOR_CAPTURE_CAPABILITY = "window_actor_capture"
+ACT_AND_CAPTURE_PROTOCOL_VERSION = 4
+ACT_AND_CAPTURE_CAPABILITY = "act_and_capture"
+BRIDGE_CONTRACT_PROTOCOL_VERSION = 5
+BRIDGE_CONTRACT_CAPABILITY = "bridge_contract_v1"
+FRESH_MINIMIZED_CAPTURE_PROTOCOL_VERSION = 6
+FRESH_MINIMIZED_CAPTURE_CAPABILITY = "fresh_minimized_capture"
+BRIDGE_CONTRACT_PATH = Path(__file__).parents[2] / "gnome_shell_bridge_contract.json"
+BRIDGE_CONTRACT = json.loads(BRIDGE_CONTRACT_PATH.read_text())
 BUS_NAME = "org.gnome.Shell.Extensions.BackgroundComputerUse"
 OBJECT_PATH = "/org/gnome/Shell/Extensions/BackgroundComputerUse"
 INTERFACE = BUS_NAME
@@ -91,15 +101,61 @@ TOKEN = {"type": "string", "minLength": 64, "maxLength": 256, "description": "To
 CLAIM_TOKEN = {"type": "string", "minLength": 64, "maxLength": 256, "description": "Opaque token returned by claim_session_window."}
 CURSOR = {"type": ["string", "null"], "maxLength": 20}
 POINT = {"type": "number", "minimum": 0}
+TRANSACTION_ACTION = {
+    "oneOf": [
+        {
+            "type": "object",
+            "properties": {
+                "type": {"const": "click"}, "x": POINT, "y": POINT,
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
+                "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1},
+            },
+            "required": ["type", "x", "y"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "type": {"const": "scroll"}, "x": POINT, "y": POINT,
+                "steps": {"type": "integer", "minimum": -20, "maximum": 20},
+            },
+            "required": ["type", "x", "y", "steps"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "type": {"const": "drag"},
+                "start_x": POINT, "start_y": POINT, "end_x": POINT, "end_y": POINT,
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
+                "motion_steps": {"type": "integer", "minimum": 2, "maximum": 32, "default": 8},
+            },
+            "required": ["type", "start_x", "start_y", "end_x", "end_y"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "type": {"const": "shortcut"},
+                "key": {"type": "string", "minLength": 1, "maxLength": 64},
+                "modifiers": {"type": "array", "maxItems": 4, "uniqueItems": True, "items": {"type": "string", "enum": ["CTRL", "SHIFT", "ALT", "SUPER"]}, "default": []},
+            },
+            "required": ["type", "key"],
+            "additionalProperties": False,
+        },
+    ]
+}
 TOOLS = [
     tool("session_status", "Report GNOME/Mutter integration health and exact capability boundaries.", {}, [], read_only=True, idempotent=True),
     tool("list_session_windows", "List one bounded page of windows in the user's real GNOME Shell session.", {"cursor": CURSOR, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_WINDOWS_PER_PAGE}}, [], read_only=True, idempotent=True),
     tool("claim_session_window", "Exclusively claim one window for this Codex thread while allowing other threads to claim different windows concurrently.", {"window": WINDOW, "lease_seconds": {"type": "integer", "minimum": MIN_LEASE_SECONDS, "maximum": MAX_LEASE_SECONDS, "default": DEFAULT_LEASE_SECONDS}}, ["window"]),
     tool("release_session_window", "Release a window claim owned by this Codex thread.", {"claim_token": CLAIM_TOKEN}, ["claim_token"], idempotent=True),
     tool("list_window_claims", "List one bounded page of live window claims without exposing their capability tokens.", {"cursor": CURSOR, "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_CLAIMS_PER_PAGE}}, [], read_only=True, idempotent=True),
-    tool("capture_session_window", "Deprecated compatibility tool. Capture an exact focused window and optionally write save_path. Prefer get_session_window_capture for inline capture or save_session_window_capture for writes.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}, "claim_token": CLAIM_TOKEN}, ["window"], idempotent=True),
-    tool("get_session_window_capture", "Return an inline PNG of an exact focused window without creating a caller-selected file. An unfocused window must first be placed under an acknowledged focus lease.", {"window": WINDOW, "claim_token": CLAIM_TOKEN}, ["window"], read_only=True, idempotent=True),
-    tool("save_session_window_capture", "Capture an exact focused window and atomically create or replace an absolute PNG path. Also returns the PNG inline.", {"window": WINDOW, "save_path": {"type": "string", "minLength": 1, "maxLength": 4096}, "claim_token": CLAIM_TOKEN}, ["window", "save_path"], open_world=False),
+    tool("capture_session_window", "Deprecated compatibility tool. Capture an exact GNOME window and optionally write save_path. Prefer get_session_window_capture for inline capture or save_session_window_capture for writes.", {"window": WINDOW, "save_path": {"type": ["string", "null"]}, "claim_token": CLAIM_TOKEN}, ["window"], idempotent=True),
+    tool("get_session_window_capture", "Return an inline exact-window PNG from Mutter's compositor actor without changing focus. Minimized windows fail closed; use capture_minimized_session_window with explicit interference acknowledgement to freshen one temporarily.", {"window": WINDOW, "claim_token": CLAIM_TOKEN}, ["window"], read_only=True, idempotent=True),
+    tool("capture_minimized_session_window", "Briefly activate and unminimize one minimized GNOME window under a recovery lease, require a client-damaged frame, capture it exactly, then restore minimized state plus the original workspace and focus before returning. The workspace and window may appear briefly.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}, "claim_token": CLAIM_TOKEN}, ["window", "acknowledge_interference"]),
+    tool("save_session_window_capture", "Capture an exact GNOME window without changing focus and atomically create or replace an absolute PNG path. Also returns the PNG inline.", {"window": WINDOW, "save_path": {"type": "string", "minLength": 1, "maxLength": 4096}, "claim_token": CLAIM_TOKEN}, ["window", "save_path"], open_world=False),
+    tool("act_and_observe_window", "Briefly focus a GNOME window, perform one pointer or shortcut action, capture the resulting compositor frame, and restore the original desktop before returning.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}, "action": TRANSACTION_ACTION, "claim_token": CLAIM_TOKEN}, ["window", "acknowledge_interference", "action"]),
     tool("begin_focus_lease", "Journal desktop state, switch to and focus an existing window, and authorize brief global-seat contention until restored.", {"window": WINDOW, "acknowledge_interference": {"type": "boolean"}, "claim_token": CLAIM_TOKEN}, ["window", "acknowledge_interference"]),
     tool("lease_pointer_click", "Click a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}, "count": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1}}, ["lease_token", "x", "y"]),
     tool("lease_pointer_scroll", "Scroll in a leased window using Mutter's global virtual seat, restoring the pointer immediately afterward.", {"lease_token": TOKEN, "claim_token": CLAIM_TOKEN, "x": POINT, "y": POINT, "steps": {"type": "integer", "minimum": -20, "maximum": 20}}, ["lease_token", "x", "y", "steps"]),
@@ -143,6 +199,49 @@ def dbus_call(method: str, *arguments: str) -> Any:
         return json.loads(response.unpack()[0])
     except Exception as exc:
         raise RuntimeError(f"GNOME integration method {method} failed: {exc}") from exc
+
+
+def dbus_png_call(method: str, *arguments: str) -> tuple[bytes, dict[str, Any]]:
+    global _DBUS_CONNECTION
+    ensure_session_environment()
+    if Gio is None or GLib is None:
+        raise RuntimeError("PyGObject (python3-gobject) is required for GNOME window capture")
+    try:
+        with DBUS_LOCK:
+            if _DBUS_CONNECTION is None or _DBUS_CONNECTION.is_closed():
+                _DBUS_CONNECTION = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            response = _DBUS_CONNECTION.call_sync(
+                BUS_NAME,
+                OBJECT_PATH,
+                INTERFACE,
+                method,
+                GLib.Variant(f"({'s' * len(arguments)})", arguments),
+                GLib.VariantType.new("(ays)"),
+                Gio.DBusCallFlags.NONE,
+                20_000,
+                None,
+            )
+        raw, serialized = response.unpack()
+        metadata = json.loads(serialized)
+        if not isinstance(metadata, dict):
+            raise RuntimeError("GNOME integration returned invalid capture metadata")
+        return bytes(raw), metadata
+    except Exception as exc:
+        raise RuntimeError(f"GNOME integration method {method} failed: {exc}") from exc
+
+
+def dbus_capture_window(window_id: str) -> tuple[bytes, dict[str, Any]]:
+    return dbus_png_call("CaptureWindow", window_id)
+
+
+def dbus_capture_minimized_window(capability: str) -> tuple[bytes, dict[str, Any]]:
+    return dbus_png_call("CaptureMinimizedWindow", capability)
+
+
+def dbus_act_and_capture(capability: str, request: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+    return dbus_png_call(
+        "ActAndCapture", capability, json.dumps(request, separators=(",", ":"))
+    )
 
 
 def bounded_text(value: Any, limit: int = MAX_WINDOW_TEXT_CHARS) -> str:
@@ -292,6 +391,26 @@ def save_lease(state: dict[str, Any]) -> None:
     atomic_write_json(LEASE_FILE, state)
 
 
+def shell_contract_valid(integration: dict[str, Any]) -> bool:
+    actual = integration.get("bridge_contract")
+    capabilities = integration.get("capabilities")
+    return (
+        isinstance(actual, dict)
+        and actual.get("role") == "background-computer-use"
+        and all(actual.get(key) == value for key, value in BRIDGE_CONTRACT.items())
+        and isinstance(actual.get("features"), list)
+        and isinstance(capabilities, list)
+        and BRIDGE_CONTRACT_CAPABILITY in capabilities
+    )
+
+
+def shell_protocol_identity_compatible(integration: dict[str, Any]) -> bool:
+    version = integration.get("protocol_version")
+    return type(version) is int and (
+        version < BRIDGE_CONTRACT_PROTOCOL_VERSION or shell_contract_valid(integration)
+    )
+
+
 def shell_status() -> dict[str, Any]:
     value = dbus_call("Status")
     if (
@@ -300,6 +419,15 @@ def shell_status() -> dict[str, Any]:
         or not 1 <= len(value["shell_instance"]) <= 256
     ):
         raise RuntimeError("GNOME integration returned an invalid Shell session identity")
+    if (
+        type(value.get("protocol_version")) is int
+        and value["protocol_version"] >= BRIDGE_CONTRACT_PROTOCOL_VERSION
+        and not shell_contract_valid(value)
+    ):
+        raise RuntimeError(
+            "GNOME integration returned an incompatible Shell bridge identity; "
+            "run install-gnome-integration and reload the GNOME session"
+        )
     return value
 
 
@@ -308,9 +436,69 @@ def shell_supports_claimed_leases(integration: dict[str, Any]) -> bool:
     return (
         type(integration.get("protocol_version")) is int
         and integration["protocol_version"] >= CLAIMED_LEASE_PROTOCOL_VERSION
+        and shell_protocol_identity_compatible(integration)
         and isinstance(capabilities, list)
         and CLAIMED_LEASE_CAPABILITY in capabilities
     )
+
+
+def shell_supports_window_actor_capture(integration: dict[str, Any]) -> bool:
+    capabilities = integration.get("capabilities")
+    return (
+        type(integration.get("protocol_version")) is int
+        and integration["protocol_version"] >= WINDOW_ACTOR_CAPTURE_PROTOCOL_VERSION
+        and shell_protocol_identity_compatible(integration)
+        and isinstance(capabilities, list)
+        and WINDOW_ACTOR_CAPTURE_CAPABILITY in capabilities
+    )
+
+
+def shell_supports_act_and_capture(integration: dict[str, Any]) -> bool:
+    capabilities = integration.get("capabilities")
+    return (
+        type(integration.get("protocol_version")) is int
+        and integration["protocol_version"] >= ACT_AND_CAPTURE_PROTOCOL_VERSION
+        and shell_protocol_identity_compatible(integration)
+        and isinstance(capabilities, list)
+        and ACT_AND_CAPTURE_CAPABILITY in capabilities
+    )
+
+
+def shell_supports_fresh_minimized_capture(integration: dict[str, Any]) -> bool:
+    capabilities = integration.get("capabilities")
+    return (
+        type(integration.get("protocol_version")) is int
+        and integration["protocol_version"] >= FRESH_MINIMIZED_CAPTURE_PROTOCOL_VERSION
+        and shell_protocol_identity_compatible(integration)
+        and isinstance(capabilities, list)
+        and FRESH_MINIMIZED_CAPTURE_CAPABILITY in capabilities
+    )
+
+
+def require_operation_identity(
+    metadata: dict[str, Any],
+    integration: dict[str, Any],
+    *,
+    shell_instance: str,
+    window_id: str,
+    kind: str,
+    generation: str | None,
+) -> None:
+    if integration.get("protocol_version", 0) < BRIDGE_CONTRACT_PROTOCOL_VERSION:
+        return
+    identity = metadata.get("operation_identity")
+    expected = {
+        "contract_version": BRIDGE_CONTRACT["contract_version"],
+        "shell_instance": shell_instance,
+        "window": {
+            "scheme": BRIDGE_CONTRACT["window_identity"],
+            "id": window_id,
+        },
+        "kind": kind,
+        "generation": generation,
+    }
+    if identity != expected:
+        raise RuntimeError("GNOME integration returned a mismatched operation identity")
 
 
 def require_claimed_lease_support(integration: dict[str, Any]) -> None:
@@ -382,14 +570,18 @@ def begin_lease(
     claim: dict[str, Any] | None = None,
     *,
     expected_shell_instance: str | None = None,
+    activate: bool = True,
 ) -> dict[str, Any]:
     if arguments.get("acknowledge_interference") is not True:
         raise ValueError("acknowledge_interference must be true because GNOME uses one global input seat")
     if load_lease():
         raise RuntimeError("a focus lease is already active; end or recover it first")
     selected = selected or resolve_window(arguments.get("window"))
-    if expected_shell_instance is not None:
+    integration = (
         require_shell_instance(expected_shell_instance)
+        if expected_shell_instance is not None
+        else None
+    )
     if claim:
         prepared = dbus_call(
             "BeginClaimedLease", str(selected["id"]), claim_recovery_seconds(claim)
@@ -401,6 +593,17 @@ def begin_lease(
     capability = prepared.get("capability")
     if not isinstance(capability, str) or not 64 <= len(capability) <= 256:
         raise RuntimeError("GNOME integration returned an invalid lease capability")
+    lease_generation = prepared.get("lease_generation")
+    protocol_version = integration.get("protocol_version") if integration else None
+    generation_required = (
+        type(protocol_version) is int
+        and protocol_version >= BRIDGE_CONTRACT_PROTOCOL_VERSION
+    )
+    if (generation_required and lease_generation is None) or (
+        lease_generation is not None
+        and (not isinstance(lease_generation, str) or not 32 <= len(lease_generation) <= 256)
+    ):
+        raise RuntimeError("GNOME integration returned an invalid lease generation")
     state = {
         "version": 3,
         "token": capability,
@@ -411,6 +614,7 @@ def begin_lease(
         "owner_thread_id": owner,
         "broker": BROKER_IDENTITY,
         "claim_token": claim.get("claim_token") if claim else None,
+        "lease_generation": lease_generation,
     }
     try:
         save_lease(state)
@@ -427,19 +631,28 @@ def begin_lease(
             )
         if expected_shell_instance is not None:
             require_shell_instance(expected_shell_instance)
-        focused = dbus_call("ActivateLease", capability)
-        if str((focused.get("state") or {}).get("focused_window")) != str(selected["id"]):
-            raise RuntimeError("GNOME did not grant focus to the requested lease window")
-        state["phase"] = "active"
-        save_lease(state)
+        if activate:
+            focused = dbus_call("ActivateLease", capability)
+            if str((focused.get("state") or {}).get("focused_window")) != str(selected["id"]):
+                raise RuntimeError("GNOME did not grant focus to the requested lease window")
+            state["phase"] = "active"
+            save_lease(state)
     except Exception:
         restore_lease(state)
         raise
     return {
         "lease_token": state["token"],
         "window": window_summary(selected),
-        "interference_boundary": "workspace and keyboard focus remain leased; pointer is briefly moved and restored per pointer action",
-        "capture": "capture_session_window is exact while this lease remains active",
+        "interference_boundary": (
+            "workspace and keyboard focus remain leased; pointer is briefly moved and restored per pointer action"
+            if activate
+            else "focus mutation is prepared but has not started"
+        ),
+        "capture": (
+            "capture_session_window is exact while this lease remains active"
+            if activate
+            else "prepared for one Shell-owned minimized capture transaction"
+        ),
     }
 
 
@@ -660,17 +873,30 @@ def capture_window(
     expected_shell_instance: str | None = None,
 ) -> dict[str, Any]:
     selected = selected or resolve_window(arguments.get("window"))
-    active_lease = load_lease()
-    if active_lease and active_lease.get("owner_thread_id") is not None:
-        if active_lease["owner_thread_id"] != owner:
-            raise RuntimeError("capture cannot use another computer-use agent's focus lease")
-        require_bound_claim(active_lease, claim)
-    permitted = selected.get("focused") or (
-        active_lease and active_lease.get("phase") == "active" and
-        lease_window_id(active_lease) == str(selected.get("id"))
+    integration = (
+        require_shell_instance(expected_shell_instance)
+        if expected_shell_instance is not None
+        else None
     )
-    if not permitted:
-        raise RuntimeError("stock Mutter can only capture the focused window exactly; begin_focus_lease first")
+    actor_capture = bool(integration and shell_supports_window_actor_capture(integration))
+    if not actor_capture:
+        active_lease = load_lease()
+        if active_lease and active_lease.get("owner_thread_id") is not None:
+            if active_lease["owner_thread_id"] != owner:
+                raise RuntimeError("capture cannot use another computer-use agent's focus lease")
+            require_bound_claim(active_lease, claim)
+        permitted = selected.get("focused") or (
+            active_lease and active_lease.get("phase") == "active" and
+            lease_window_id(active_lease) == str(selected.get("id"))
+        )
+        if not permitted:
+            raise RuntimeError("stock Mutter can only capture the focused window exactly; begin_focus_lease first")
+    if actor_capture and selected.get("minimized"):
+        raise RuntimeError(
+            "minimized GNOME windows may expose stale compositor buffers; use "
+            "capture_minimized_session_window with acknowledge_interference=true to require "
+            "a fresh client-damaged frame and automatic desktop restoration"
+        )
     destination_value = arguments.get("save_path")
     destination = Path(str(destination_value)).expanduser() if destination_value else None
     if destination and not destination.is_absolute():
@@ -678,51 +904,215 @@ def capture_window(
     directory = destination.parent if destination else None
     if directory:
         directory.mkdir(parents=True, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}." if destination else "gnome-window-", suffix=".png", dir=directory)
-    os.close(descriptor)
-    temporary = Path(name)
-    temporary.unlink(missing_ok=True)
-    try:
-        if expected_shell_instance is not None:
-            require_shell_instance(expected_shell_instance)
-        proc = run([
-            "gdbus", "call", "--session", "--dest", "org.gnome.Shell.Screenshot",
-            "--object-path", "/org/gnome/Shell/Screenshot", "--method",
-            "org.gnome.Shell.Screenshot.ScreenshotWindow", "true", "false", "false", str(temporary),
-        ], timeout=20)
-        if proc.returncode or not temporary.is_file():
-            if not shutil.which("gnome-screenshot"):
-                raise RuntimeError(proc.stderr.strip() or "GNOME focused-window screenshot service failed")
-            fallback = run(["gnome-screenshot", "-w", "-f", str(temporary)], timeout=20)
-            if fallback.returncode or not temporary.is_file():
-                raise RuntimeError(fallback.stderr.strip() or "focused-window capture failed")
-        if expected_shell_instance is None:
-            current = resolve_window(str(selected["id"]))
-        else:
-            current, _ = resolve_window_for_shell(
-                str(selected["id"]), expected_shell_instance
-            )
-        if not current.get("focused"):
-            raise RuntimeError("the leased window lost focus during capture; screenshot discarded")
-        raw = read_bounded_png(temporary)
-        temporary.chmod(0o600)
+    capture_source = "focused-window-screenshot"
+    capture_requires_focus = True
+    potentially_stale = False
+    if actor_capture:
+        raw, capture_metadata = dbus_capture_window(str(selected["id"]))
+        if len(raw) > MAX_CAPTURE_PNG_BYTES:
+            raise RuntimeError(f"captured PNG exceeds the {MAX_CAPTURE_PNG_BYTES}-byte MCP transport limit")
+        if not valid_png(raw):
+            raise RuntimeError("window actor capture returned an invalid PNG")
+        if capture_metadata.get("shell_instance") != expected_shell_instance:
+            raise RuntimeError("GNOME Shell restarted during window actor capture")
+        current = capture_metadata.get("window")
+        if not isinstance(current, dict) or str(current.get("id")) != str(selected["id"]):
+            raise RuntimeError("GNOME integration returned capture data for a different window")
+        if capture_metadata.get("potentially_stale") is not False or current.get("minimized"):
+            raise RuntimeError("GNOME integration could not prove the window capture is fresh")
+        require_operation_identity(
+            capture_metadata,
+            integration,
+            shell_instance=expected_shell_instance,
+            window_id=str(selected["id"]),
+            kind="capture",
+            generation=None,
+        )
+        require_shell_instance(expected_shell_instance)
+        selected = current
+        capture_source = "meta-window-actor"
+        capture_requires_focus = False
+        potentially_stale = capture_metadata.get("potentially_stale") is True
         if destination:
-            temporary.replace(destination)
-    finally:
+            descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".png", dir=directory)
+            temporary = Path(name)
+            try:
+                with os.fdopen(descriptor, "wb") as image:
+                    image.write(raw)
+                    image.flush()
+                    os.fsync(image.fileno())
+                temporary.chmod(0o600)
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+    else:
+        descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}." if destination else "gnome-window-", suffix=".png", dir=directory)
+        os.close(descriptor)
+        temporary = Path(name)
         temporary.unlink(missing_ok=True)
+        try:
+            proc = run([
+                "gdbus", "call", "--session", "--dest", "org.gnome.Shell.Screenshot",
+                "--object-path", "/org/gnome/Shell/Screenshot", "--method",
+                "org.gnome.Shell.Screenshot.ScreenshotWindow", "true", "false", "false", str(temporary),
+            ], timeout=20)
+            if proc.returncode or not temporary.is_file():
+                if not shutil.which("gnome-screenshot"):
+                    raise RuntimeError(proc.stderr.strip() or "GNOME focused-window screenshot service failed")
+                fallback = run(["gnome-screenshot", "-w", "-f", str(temporary)], timeout=20)
+                if fallback.returncode or not temporary.is_file():
+                    raise RuntimeError(fallback.stderr.strip() or "focused-window capture failed")
+            if expected_shell_instance is None:
+                current = resolve_window(str(selected["id"]))
+            else:
+                current, _ = resolve_window_for_shell(
+                    str(selected["id"]), expected_shell_instance
+                )
+            if not current.get("focused"):
+                raise RuntimeError("the leased window lost focus during capture; screenshot discarded")
+            raw = read_bounded_png(temporary)
+            temporary.chmod(0o600)
+            if destination:
+                temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
     summary = window_summary(selected)
     frame = summary["frame"]
     metadata = {
         "window": summary,
         "saved_to": str(destination) if destination else None,
         "coordinate_space": coordinate_space(frame, raw),
-        "capture_requires_focus": True,
+        "capture_requires_focus": capture_requires_focus,
         "focus_changed_by_capture": False,
+        "capture_source": capture_source,
+        "potentially_stale": potentially_stale,
     }
     return {
         "content": [
             {"type": "text", "text": json.dumps(metadata, indent=2)},
             {"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mimeType": "image/png"},
+        ],
+        "isError": False,
+    }
+
+
+def capture_minimized_window(
+    arguments: dict[str, Any],
+    selected: dict[str, Any],
+    expected_shell_instance: str,
+    owner: str | None = None,
+    claim: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if arguments.get("acknowledge_interference") is not True:
+        raise ValueError(
+            "acknowledge_interference must be true because the minimized window may appear briefly"
+        )
+    if selected.get("minimized") is not True:
+        raise ValueError(
+            "capture_minimized_session_window requires a currently minimized target; "
+            "use get_session_window_capture for mapped windows"
+        )
+    integration = require_shell_instance(expected_shell_instance)
+    if not shell_supports_fresh_minimized_capture(integration):
+        raise RuntimeError(
+            "the installed GNOME Shell extension does not support fresh minimized capture; "
+            "run install-gnome-integration and reload the GNOME session"
+        )
+
+    state: dict[str, Any] | None = None
+    try:
+        begin_lease(
+            arguments,
+            owner,
+            selected=selected,
+            claim=claim,
+            expected_shell_instance=expected_shell_instance,
+            activate=False,
+        )
+        state = load_lease()
+        if not state or state.get("phase") != "prepared":
+            raise RuntimeError(
+                "GNOME minimized capture did not create a prepared recovery journal"
+            )
+        raw, capture_metadata = dbus_capture_minimized_window(state["token"])
+        if len(raw) > MAX_CAPTURE_PNG_BYTES:
+            raise RuntimeError(
+                f"captured PNG exceeds the {MAX_CAPTURE_PNG_BYTES}-byte MCP transport limit"
+            )
+        if not valid_png(raw):
+            raise RuntimeError("fresh minimized capture returned an invalid PNG")
+        if capture_metadata.get("shell_instance") != expected_shell_instance:
+            raise RuntimeError("GNOME Shell restarted during fresh minimized capture")
+        current = capture_metadata.get("window")
+        if not isinstance(current, dict) or str(current.get("id")) != str(selected["id"]):
+            raise RuntimeError("GNOME integration captured a different minimized window")
+        if (
+            current.get("minimized") is not True
+            or capture_metadata.get("potentially_stale") is not False
+            or capture_metadata.get("freshness") != "client-damage-after-unminimize"
+        ):
+            raise RuntimeError(
+                "GNOME integration could not prove a fresh buffer and restored minimized state"
+            )
+        require_operation_identity(
+            capture_metadata,
+            integration,
+            shell_instance=expected_shell_instance,
+            window_id=str(selected["id"]),
+            kind="fresh-minimized-capture",
+            generation=state.get("lease_generation"),
+        )
+        transaction = capture_metadata.get("transaction")
+        settle = transaction.get("settle") if isinstance(transaction, dict) else None
+        restoration = (
+            transaction.get("restoration") if isinstance(transaction, dict) else None
+        )
+        if not isinstance(settle, dict) or settle.get("reason") != "damaged-and-painted":
+            raise RuntimeError("GNOME integration did not prove a client-damaged painted frame")
+        if (
+            not isinstance(restoration, dict)
+            or restoration.get("recovery_complete") is not True
+            or restoration.get("errors") not in ([], None)
+        ):
+            raise RuntimeError("GNOME integration did not prove complete desktop restoration")
+        shell = require_shell_instance(expected_shell_instance)
+        if shell.get("lease_phase") is not None:
+            raise RuntimeError(
+                "GNOME Shell still reports an active lease after minimized capture"
+            )
+        LEASE_FILE.unlink(missing_ok=True)
+    except Exception as exc:
+        pending = state or load_lease()
+        if pending:
+            recovery = restore_lease(pending, recovery=True)
+            if not recovery["recovery_complete"]:
+                raise RuntimeError(
+                    f"{exc}; automatic minimized-capture restoration also failed: "
+                    f"{recovery['errors']}"
+                ) from exc
+        raise
+
+    summary = window_summary(current)
+    metadata = {
+        "window": summary,
+        "saved_to": None,
+        "coordinate_space": coordinate_space(summary["frame"], raw),
+        "capture_requires_focus": True,
+        "focus_changed_by_capture": True,
+        "capture_source": "meta-window-actor-freshened",
+        "potentially_stale": False,
+        "desktop_restored_before_return": True,
+        "global_focus_lane_used": True,
+        "transaction": bounded_json_value(transaction),
+    }
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps(metadata, indent=2)},
+            {
+                "type": "image",
+                "data": base64.b64encode(raw).decode("ascii"),
+                "mimeType": "image/png",
+            },
         ],
         "isError": False,
     }
@@ -741,13 +1131,7 @@ def bounded_integer(value: Any, name: str, minimum: int, maximum: int, *, exclud
     return value
 
 
-def pointer_action(
-    arguments: dict[str, Any],
-    action: str,
-    owner: str | None = None,
-    claim: dict[str, Any] | None = None,
-    expected_target: str | None = None,
-) -> dict[str, Any]:
+def pointer_request(arguments: dict[str, Any], action: str) -> dict[str, Any]:
     if action not in {"click", "scroll", "drag"}:
         raise ValueError(f"unknown pointer action {action}")
     button = arguments.get("button", "left")
@@ -766,6 +1150,28 @@ def pointer_action(
             request["count"] = bounded_integer(arguments.get("count", 1), "count", 1, 3)
         else:
             request["steps"] = bounded_integer(arguments["steps"], "steps", -20, 20, exclude_zero=True)
+    return request
+
+
+def shortcut_request(arguments: dict[str, Any]) -> dict[str, Any]:
+    modifiers = arguments.get("modifiers", [])
+    allowed = {"CTRL", "SHIFT", "ALT", "SUPER"}
+    if not isinstance(modifiers, list) or len(modifiers) > 4 or any(type(value) is not str or value not in allowed for value in modifiers) or len(set(modifiers)) != len(modifiers):
+        raise ValueError("modifiers must be a unique array containing at most CTRL, SHIFT, ALT, and SUPER")
+    key = arguments.get("key")
+    if not isinstance(key, str) or not key or len(key) > 64:
+        raise ValueError("key must contain between 1 and 64 characters")
+    return {"key": key, "modifiers": modifiers}
+
+
+def pointer_action(
+    arguments: dict[str, Any],
+    action: str,
+    owner: str | None = None,
+    claim: dict[str, Any] | None = None,
+    expected_target: str | None = None,
+) -> dict[str, Any]:
+    request = pointer_request(arguments, action)
     with file_guard(LOCK_FILE):
         state = require_lease(arguments.get("lease_token"), owner)
         if expected_target is not None and lease_window_id(state) != expected_target:
@@ -787,14 +1193,7 @@ def send_shortcut(
     claim: dict[str, Any] | None = None,
     expected_target: str | None = None,
 ) -> dict[str, Any]:
-    modifiers = arguments.get("modifiers", [])
-    allowed = {"CTRL", "SHIFT", "ALT", "SUPER"}
-    if not isinstance(modifiers, list) or len(modifiers) > 4 or any(type(value) is not str or value not in allowed for value in modifiers) or len(set(modifiers)) != len(modifiers):
-        raise ValueError("modifiers must be a unique array containing at most CTRL, SHIFT, ALT, and SUPER")
-    key = arguments.get("key")
-    if not isinstance(key, str) or not key or len(key) > 64:
-        raise ValueError("key must contain between 1 and 64 characters")
-    request = {"key": key, "modifiers": modifiers}
+    request = shortcut_request(arguments)
     with file_guard(LOCK_FILE):
         state = require_lease(arguments.get("lease_token"), owner)
         if expected_target is not None and lease_window_id(state) != expected_target:
@@ -806,6 +1205,108 @@ def send_shortcut(
         "window": window_summary(state["target"]),
         "transaction": bounded_json_value(result),
         "global_seat_used": True,
+    }
+
+
+def act_and_observe(
+    arguments: dict[str, Any],
+    owner: str | None,
+    selected: dict[str, Any],
+    claim: dict[str, Any] | None,
+    expected_shell_instance: str,
+) -> dict[str, Any]:
+    integration = require_shell_instance(expected_shell_instance)
+    if not shell_supports_act_and_capture(integration):
+        raise RuntimeError(
+            "the installed GNOME Shell extension does not support short act-and-observe "
+            "transactions; run install-gnome-integration and reload the GNOME session"
+        )
+    action = arguments.get("action")
+    if not isinstance(action, dict):
+        raise ValueError("action must be an object")
+    action_type = action.get("type")
+    if action_type in {"click", "scroll", "drag"}:
+        request = {"kind": "pointer", "action": pointer_request(action, action_type)}
+    elif action_type == "shortcut":
+        request = {"kind": "keys", "action": shortcut_request(action)}
+    else:
+        raise ValueError("action.type must be click, scroll, drag, or shortcut")
+
+    state: dict[str, Any] | None = None
+    try:
+        begin_lease(
+            arguments,
+            owner,
+            selected,
+            claim,
+            expected_shell_instance=expected_shell_instance,
+        )
+        state = load_lease()
+        if not state or state.get("phase") != "active":
+            raise RuntimeError("GNOME focus transaction did not create an active recovery journal")
+        require_bound_claim(state, claim)
+        raw, capture_metadata = dbus_act_and_capture(state["token"], request)
+        if len(raw) > MAX_CAPTURE_PNG_BYTES:
+            raise RuntimeError(f"captured PNG exceeds the {MAX_CAPTURE_PNG_BYTES}-byte MCP transport limit")
+        if not valid_png(raw):
+            raise RuntimeError("act-and-observe returned an invalid PNG")
+        if capture_metadata.get("shell_instance") != expected_shell_instance:
+            raise RuntimeError("GNOME Shell restarted during act-and-observe")
+        current = capture_metadata.get("window")
+        if not isinstance(current, dict) or str(current.get("id")) != str(selected["id"]):
+            raise RuntimeError("GNOME integration observed a different window after the action")
+        potentially_stale = capture_metadata.get("potentially_stale")
+        if (
+            potentially_stale is True
+            or current.get("minimized") is True
+            or (
+                integration.get("protocol_version", 0) >= BRIDGE_CONTRACT_PROTOCOL_VERSION
+                and potentially_stale is not False
+            )
+        ):
+            raise RuntimeError("GNOME act-and-observe could not prove the captured buffer is fresh")
+        require_operation_identity(
+            capture_metadata,
+            integration,
+            shell_instance=expected_shell_instance,
+            window_id=str(selected["id"]),
+            kind="act-and-capture",
+            generation=state.get("lease_generation"),
+        )
+        transaction = capture_metadata.get("transaction")
+        restoration = transaction.get("restoration") if isinstance(transaction, dict) else None
+        if not isinstance(restoration, dict) or restoration.get("recovery_complete") is not True:
+            raise RuntimeError("GNOME act-and-observe did not prove complete desktop restoration")
+        shell = require_shell_instance(expected_shell_instance)
+        if shell.get("lease_phase") is not None:
+            raise RuntimeError("GNOME Shell still reports an active lease after act-and-observe")
+        LEASE_FILE.unlink(missing_ok=True)
+    except Exception as exc:
+        pending = state or load_lease()
+        if pending:
+            recovery = restore_lease(pending, recovery=True)
+            if not recovery["recovery_complete"]:
+                raise RuntimeError(
+                    f"{exc}; automatic focus restoration also failed: {recovery['errors']}"
+                ) from exc
+        raise
+
+    summary = window_summary(current)
+    metadata = {
+        "window": summary,
+        "coordinate_space": coordinate_space(summary["frame"], raw),
+        "capture_source": "meta-window-actor",
+        "focus_changed_by_capture": False,
+        "global_seat_used": True,
+        "desktop_restored_before_return": True,
+        "transaction": bounded_json_value(transaction),
+    }
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps(metadata, indent=2)},
+            {"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mimeType": "image/png"},
+        ],
+        "isError": False,
     }
 
 
@@ -932,6 +1433,13 @@ def status() -> dict[str, Any]:
     if checks["pygobject"]:
         try:
             raw_integration = dbus_call("Status")
+            if (
+                isinstance(raw_integration, dict)
+                and type(raw_integration.get("protocol_version")) is int
+                and raw_integration["protocol_version"] >= BRIDGE_CONTRACT_PROTOCOL_VERSION
+                and not shell_contract_valid(raw_integration)
+            ):
+                raise RuntimeError("GNOME integration returned an incompatible Shell bridge identity")
             integration = bounded_json_value(raw_integration) if isinstance(raw_integration, dict) else None
         except Exception as exc:
             error = bounded_text(exc, MAX_ERROR_TEXT_CHARS)
@@ -946,6 +1454,9 @@ def status() -> dict[str, Any]:
     checks["focused_window_screenshot"] = screenshot_service or shutil.which("gnome-screenshot") is not None
     ready = integration is not None
     claimed_leases_ready = ready and shell_supports_claimed_leases(integration)
+    actor_capture_ready = ready and shell_supports_window_actor_capture(integration)
+    act_and_capture_ready = ready and shell_supports_act_and_capture(integration)
+    minimized_capture_ready = ready and shell_supports_fresh_minimized_capture(integration)
     claim_count: int | None = None
     claim_error: str | None = None
     if integration:
@@ -960,8 +1471,8 @@ def status() -> dict[str, Any]:
         "capabilities": {
             "window_enumeration": ready,
             "stable_window_ids": ready,
-            "exact_background_window_capture": False,
-            "exact_focused_window_capture": ready and checks["focused_window_screenshot"],
+            "exact_background_window_capture": actor_capture_ready,
+            "exact_focused_window_capture": actor_capture_ready or (ready and checks["focused_window_screenshot"]),
             "background_semantic_actions": False,
             "targeted_background_pointer": False,
             "targeted_background_keyboard": False,
@@ -969,18 +1480,23 @@ def status() -> dict[str, Any]:
             "lease_pointer_restoration": ready,
             "parallel_window_claims": claimed_leases_ready,
             "serialized_global_seat": ready,
+            "short_act_and_observe": act_and_capture_ready,
+            "fresh_minimized_window_capture": minimized_capture_ready,
         },
         "requirements": {
             **checks,
             "gnome_shell_extension": ready,
             "claimed_focus_lease_protocol": claimed_leases_ready,
+            "window_actor_capture_protocol": actor_capture_ready,
+            "act_and_capture_protocol": act_and_capture_ready,
+            "fresh_minimized_capture_protocol": minimized_capture_ready,
             "background_semantic_actions": "provided by the separate computer-use-linux@codex-computer-use-linux AT-SPI plugin; broker claims are policy coordination there, not a mechanical fence",
         },
         "active_lease": load_lease() is not None,
         "active_window_claims": claim_count,
         "claim_journal_error": claim_error,
         "session_identity": SESSION_IDENTITY,
-        "safety_note": "Mutter exposes one global seat; lease input can visibly contend with physical input and cannot detect every held hardware button.",
+        "safety_note": "Mapped window-actor capture does not change focus. Minimized buffers are never returned directly; the explicit minimized-capture transaction briefly activates and unminimizes the target under a recovery lease, requires client damage plus a compositor paint before capture, then restores minimized state, workspace, focus, and pointer. Mutter still exposes one global seat; lease input can visibly contend with physical input and cannot detect every held hardware button.",
     }
 
 
@@ -1076,6 +1592,38 @@ def call_tool(name: str, arguments: dict[str, Any], owner: str | None = None) ->
             "next_cursor": str(end) if end < len(listed) else None,
             "truncated": end < len(listed),
         })
+    if name == "act_and_observe_window":
+        selected, shell_instance = resolve_window_for_shell(arguments.get("window"))
+        with CLAIMS.authorize(
+            str(selected["id"]),
+            owner,
+            arguments.get("claim_token"),
+            shell_instance,
+            on_complete=renew_focus_lease_for_claim,
+        ) as claim:
+            if claim:
+                require_claimed_lease_support(require_shell_instance(shell_instance))
+            with file_guard(LOCK_FILE):
+                with INPUT_LOCK, file_guard(INPUT_FILE):
+                    return act_and_observe(
+                        arguments, owner, selected, claim, shell_instance
+                    )
+    if name == "capture_minimized_session_window":
+        selected, shell_instance = resolve_window_for_shell(arguments.get("window"))
+        with CLAIMS.authorize(
+            str(selected["id"]),
+            owner,
+            arguments.get("claim_token"),
+            shell_instance,
+            on_complete=renew_focus_lease_for_claim,
+        ) as claim:
+            if claim:
+                require_claimed_lease_support(require_shell_instance(shell_instance))
+            with file_guard(LOCK_FILE):
+                with INPUT_LOCK, file_guard(INPUT_FILE):
+                    return capture_minimized_window(
+                        arguments, selected, shell_instance, owner, claim
+                    )
     if name in {"capture_session_window", "get_session_window_capture", "save_session_window_capture"}:
         if name == "get_session_window_capture" and arguments.get("save_path") not in (None, ""):
             raise ValueError(
@@ -1184,7 +1732,7 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": SERVER_INFO,
-                "instructions": "Operate the real GNOME session. Claim one window per parallel agent, treat claims as cooperative policy for the separate AT-SPI process, and use this broker's serialized acknowledged focus-lease lane for capture or global-seat input.",
+                "instructions": "Operate the real GNOME session. Claim one window per parallel agent, capture claimed windows without changing focus when window_actor_capture_protocol is available, and use an acknowledged focus lease only for global-seat input or the legacy focused-window capture fallback.",
             }
         elif method == "tools/list":
             result = {"tools": TOOLS}
