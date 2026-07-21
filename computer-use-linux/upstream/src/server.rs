@@ -26,9 +26,10 @@ use crate::pointer_dispatch::{
     PointerDispatchVerification,
 };
 use crate::remote_desktop::{
-    keysyms_for_text, press_keycode_chord, scroll as portal_scroll, start_portal_session,
+    click as portal_click, drag as portal_drag, keysyms_for_text, press_keycode_chord,
+    scroll as portal_scroll, scroll_at as portal_scroll_at, start_portal_session,
     type_text_with_keysyms, PortalActionError, PortalKeyboardSession, PortalPointerSession,
-    PortalSession, ScrollDirection,
+    PortalSession, PortalStreamMapping, ScrollDirection,
 };
 use crate::screenshot::{
     capture_screenshot_raw, capture_screenshot_raw_recent, prepare_screenshot_payload,
@@ -1180,6 +1181,7 @@ impl ComputerUseLinux {
         let ClickTarget::Coordinates(x, y) = target else {
             unreachable!("click target must resolve to coordinates");
         };
+        let portal_point_is_logical = element_targeted || coordination_window_id.is_some();
         if let Err(message) = self.validate_capture_space_point(x, y).await {
             return Json(ActionOutput {
                 ok: false,
@@ -1193,9 +1195,9 @@ impl ComputerUseLinux {
         let click_count = params.click_count.unwrap_or(1).clamp(1, 10).to_string();
         // Preferred backend: the uinput absolute pointer. Unlike ydotool's
         // relative-only device (faked `--absolute` via pin-to-corner + relative
-        // move, which acceleration + fractional scaling distort) and unlike the
-        // portal (per-monitor coordinate scaling + an approval dialog), the
-        // absolute pointer lands exactly at the screenshot pixel.
+        // move, which acceleration + fractional scaling distort), the absolute
+        // pointer lands exactly at a raw screenshot pixel without a portal
+        // dialog. The mapped portal path below is safe for logical targets.
         match self
             .try_abs_click(
                 x,
@@ -1217,6 +1219,49 @@ impl ComputerUseLinux {
             }
             Err(message) => return click_error(message),
             Ok(Some(false) | None) => {}
+        }
+        if portal_point_is_logical {
+            if let Some(session) = self
+                .portal_pointer_session_for_action(PortalStreamMapping::Required)
+                .await
+            {
+                if let Err(message) = verify_pointer_dispatch(
+                    pointer_verification.as_ref(),
+                    &self.accessibility_snapshots,
+                )
+                .await
+                {
+                    return click_error(message);
+                }
+                let result = self
+                    .run_portal_pointer_action(async move {
+                        portal_click(
+                            &session,
+                            x,
+                            y,
+                            params.button.as_deref(),
+                            params.click_count.unwrap_or(1),
+                        )
+                        .await
+                    })
+                    .await;
+                match result {
+                    Ok(()) => {
+                        return Json(ActionOutput {
+                            ok: true,
+                            implemented: true,
+                            action: "click".to_string(),
+                            message: "Action sent through the mapped remote desktop portal stream."
+                                .to_string(),
+                            received,
+                        });
+                    }
+                    Err(error) if error.can_fallback_to_ydotool() => {}
+                    Err(error) => {
+                        return Json(portal_action_delivery_failure("click", &error, received));
+                    }
+                }
+            }
         }
         if !self.can_fallback_to_ydotool_for_coordinate_action() {
             return Json(portal_coordinate_input_unavailable("click", received));
@@ -1658,6 +1703,7 @@ impl ComputerUseLinux {
         let target_point = observed_target
             .as_ref()
             .map_or_else(|| params.x.zip(params.y), |target| Some(target.point()));
+        let portal_point_is_logical = observed_target.is_some() || coordination_window_id.is_some();
         let direction = match params.direction.to_ascii_lowercase().as_str() {
             "up" => ScrollDirection::Up,
             "down" => ScrollDirection::Down,
@@ -1688,19 +1734,32 @@ impl ComputerUseLinux {
             });
         }
 
-        if target_point.is_some() && !self.can_fallback_to_ydotool_for_coordinate_action() {
-            return Json(portal_coordinate_input_unavailable("scroll", received));
-        }
-        let portal_session = if target_point.is_none() {
-            self.portal_pointer_session_for_action().await
+        let portal_session = if target_point.is_none() || portal_point_is_logical {
+            let stream_mapping = if target_point.is_some() {
+                PortalStreamMapping::Required
+            } else {
+                PortalStreamMapping::NotRequired
+            };
+            self.portal_pointer_session_for_action(stream_mapping).await
         } else {
             None
         };
         if let Some(session) = portal_session {
-            let session = session.clone();
+            if let Err(message) = verify_pointer_dispatch(
+                pointer_verification.as_ref(),
+                &self.accessibility_snapshots,
+            )
+            .await
+            {
+                return scroll_error(message);
+            }
             let result = self
                 .run_portal_pointer_action(async move {
-                    portal_scroll(&session, direction, units).await
+                    if let Some((x, y)) = target_point {
+                        portal_scroll_at(&session, x, y, direction, units).await
+                    } else {
+                        portal_scroll(&session, direction, units).await
+                    }
                 })
                 .await;
             match result {
@@ -1718,6 +1777,9 @@ impl ComputerUseLinux {
                     return Json(portal_action_delivery_failure("scroll", &error, received));
                 }
             }
+        }
+        if target_point.is_some() && !self.can_fallback_to_ydotool_for_coordinate_action() {
+            return Json(portal_coordinate_input_unavailable("scroll", received));
         }
         let (dx, dy) = match params.direction.to_ascii_lowercase().as_str() {
             "up" => (0, units),
@@ -1850,6 +1912,39 @@ impl ComputerUseLinux {
                     message: "Action sent through the uinput absolute pointer.".to_string(),
                     received,
                 });
+            }
+        }
+        if coordination_window_id.is_some() {
+            if let Some(session) = self
+                .portal_pointer_session_for_action(PortalStreamMapping::Required)
+                .await
+            {
+                let result = self
+                    .run_portal_pointer_action(async move {
+                        portal_drag(
+                            &session,
+                            (params.start_x, params.start_y),
+                            (params.end_x, params.end_y),
+                        )
+                        .await
+                    })
+                    .await;
+                match result {
+                    Ok(()) => {
+                        return Json(ActionOutput {
+                            ok: true,
+                            implemented: true,
+                            action: "drag".to_string(),
+                            message: "Action sent through the mapped remote desktop portal stream."
+                                .to_string(),
+                            received,
+                        });
+                    }
+                    Err(error) if error.can_fallback_to_ydotool() => {}
+                    Err(error) => {
+                        return Json(portal_action_delivery_failure("drag", &error, received));
+                    }
+                }
             }
         }
         if !self.can_fallback_to_ydotool_for_coordinate_action() {
@@ -2274,7 +2369,7 @@ enum PostActionObservationResult {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.5.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/drag through absolute uinput or ydotool, send targeted scroll through ydotool, send untargeted relative scroll and layout-safe key input through the Wayland remote desktop portal, and send literal type_text through KDE clipboard integration on Plasma Wayland. The portal is never used for screenshot-pixel coordinates because its API defines no safe screenshot-to-pointer transform; click/drag are refused when neither absolute uinput nor an allowed working ydotool backend is available, and targeted scroll is refused without allowed ydotool. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click and scroll, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot results warn when a target window is partially or fully off-screen, and coordinate input outside the captured desktop bounds is rejected; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. Coordinate scrolls accept the same window targeting and relative coordinates as click; element-targeted scrolls require observation_id and use verified absolute element bounds. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/drag through absolute uinput or ydotool, send targeted scroll through ydotool, map targeted logical pointer coordinates through a shared ScreenCast/RemoteDesktop portal session, send untargeted relative scroll and layout-safe key input through that portal, and send literal type_text through KDE clipboard integration on Plasma Wayland. The portal uses selected monitor stream geometry for logical AT-SPI/window coordinates; it still refuses raw screenshot pixels on ambiguous mixed-scale layouts and cross-monitor drags instead of guessing a transform. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click and scroll, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot results warn when a target window is partially or fully off-screen, and coordinate input outside the captured desktop bounds is rejected; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. Coordinate scrolls accept the same window targeting and relative coordinates as click; element-targeted scrolls require observation_id and use verified absolute element bounds. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -3213,10 +3308,9 @@ impl ComputerUseLinux {
 
     // The Wayland remote-desktop portal is now a *fallback* for input: when a
     // compatible ydotool CLI and working `ydotoold` socket are present we prefer
-    // ydotool, because it injects input without a permission prompt. GNOME
-    // refuses to persist remote-desktop
-    // grants (`org.freedesktop.portal.Error: Remote desktop sessions cannot
-    // persist`), so the portal would otherwise re-prompt on every new session.
+    // ydotool, because it injects input without a permission prompt. Portal
+    // restore tokens reduce repeated prompts where the desktop supports them,
+    // but first use and revoked grants remain interactive.
     // A ydotool force overrides a portal force; absolute uinput still remains
     // preferred for click/drag unless explicitly disabled.
     fn should_prefer_portal_pointer_backend(&self) -> bool {
@@ -3270,14 +3364,23 @@ impl ComputerUseLinux {
             .filter(PortalSession::has_pointer)
     }
 
-    async fn portal_pointer_session_for_action(&self) -> Option<PortalPointerSession> {
-        if let Some(session) = self.cached_portal_pointer_session() {
+    async fn portal_pointer_session_for_action(
+        &self,
+        stream_mapping: PortalStreamMapping,
+    ) -> Option<PortalPointerSession> {
+        if let Some(session) = self.cached_portal_pointer_session().filter(|session| {
+            stream_mapping == PortalStreamMapping::NotRequired
+                || session.has_absolute_pointer_mapping()
+        }) {
             return Some(session);
         }
         if !self.should_prefer_portal_pointer_backend() {
             return None;
         }
-        self.ensure_portal_pointer_session().await.ok().flatten()
+        self.ensure_portal_pointer_session(stream_mapping)
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn run_portal_pointer_action<F>(
@@ -3328,12 +3431,19 @@ impl ComputerUseLinux {
         }
     }
 
-    async fn ensure_portal_session(&self) -> Result<PortalSession> {
+    async fn ensure_portal_session(
+        &self,
+        stream_mapping: PortalStreamMapping,
+    ) -> Result<PortalSession> {
         if let Some(session) = self
             .portal_session
             .lock()
             .ok()
             .and_then(|cached| cached.clone())
+            .filter(|session| {
+                stream_mapping == PortalStreamMapping::NotRequired
+                    || session.has_absolute_pointer_mapping()
+            })
         {
             return Ok(session);
         }
@@ -3344,26 +3454,36 @@ impl ComputerUseLinux {
             .lock()
             .ok()
             .and_then(|cached| cached.clone())
+            .filter(|session| {
+                stream_mapping == PortalStreamMapping::NotRequired
+                    || session.has_absolute_pointer_mapping()
+            })
         {
             return Ok(session);
         }
 
-        let session = start_portal_session().await?;
+        let session = start_portal_session(stream_mapping).await?;
         if let Ok(mut cached) = self.portal_session.lock() {
             *cached = Some(session.clone());
         }
         Ok(session)
     }
 
-    async fn ensure_portal_pointer_session(&self) -> Result<Option<PortalPointerSession>> {
+    async fn ensure_portal_pointer_session(
+        &self,
+        stream_mapping: PortalStreamMapping,
+    ) -> Result<Option<PortalPointerSession>> {
         if !self.should_prefer_portal_pointer_backend() {
             return Ok(None);
         }
-        if let Some(session) = self.cached_portal_pointer_session() {
+        if let Some(session) = self.cached_portal_pointer_session().filter(|session| {
+            stream_mapping == PortalStreamMapping::NotRequired
+                || session.has_absolute_pointer_mapping()
+        }) {
             return Ok(Some(session));
         }
 
-        let session = self.ensure_portal_session().await?;
+        let session = self.ensure_portal_session(stream_mapping).await?;
         Ok(session.has_pointer().then_some(session))
     }
 
@@ -3377,7 +3497,9 @@ impl ComputerUseLinux {
             return Ok(Some(session));
         }
 
-        let session = self.ensure_portal_session().await?;
+        let session = self
+            .ensure_portal_session(PortalStreamMapping::NotRequired)
+            .await?;
         Ok(session.has_keyboard().then_some(session))
     }
 
@@ -4792,7 +4914,7 @@ fn portal_coordinate_input_unavailable(
         implemented: true,
         action: action.to_string(),
         message: format!(
-            "Did not send {action} input: the RemoteDesktop portal exposes no spec-defined transform from screenshot pixels to absolute pointer coordinates, and an allowed working ydotool backend is unavailable."
+            "Did not send {action} input: no selected ScreenCast stream safely mapped the logical desktop coordinate for RemoteDesktop absolute input (raw screenshot pixels cannot be inferred across mixed-scale monitors), and an allowed working ydotool backend is unavailable."
         ),
         received,
     }
@@ -7323,7 +7445,7 @@ mod tests {
                 ok: false,
                 implemented: true,
                 action: "drag".to_string(),
-                message: "Did not send drag input: the RemoteDesktop portal exposes no spec-defined transform from screenshot pixels to absolute pointer coordinates, and an allowed working ydotool backend is unavailable.".to_string(),
+                message: "Did not send drag input: no selected ScreenCast stream safely mapped the logical desktop coordinate for RemoteDesktop absolute input (raw screenshot pixels cannot be inferred across mixed-scale monitors), and an allowed working ydotool backend is unavailable.".to_string(),
                 received,
             }
         );
