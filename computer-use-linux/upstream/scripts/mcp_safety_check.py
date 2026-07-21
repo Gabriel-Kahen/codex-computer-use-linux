@@ -304,12 +304,14 @@ def main() -> int:
                 raise AssertionError(f"{name} is missing focus target selectors: {sorted(FOCUS_SELECTORS - props)}")
             if name == "click" and not SEMANTIC_SELECTORS <= props:
                 raise AssertionError(f"{name} is missing semantic element selectors: {sorted(SEMANTIC_SELECTORS - props)}")
-            if name == "run_action_batch" and props != {"window_id", "actions"}:
+            if name == "run_action_batch" and props != {"window_id", "actions", "owner_thread_id", "claim_token"}:
                 raise AssertionError(f"{name} exposes unexpected parameters: {sorted(props)}")
             if name == "run_action_batch_and_observe" and props != {
                 "window_id",
                 "actions",
                 "observation",
+                "owner_thread_id",
+                "claim_token",
             }:
                 raise AssertionError(f"{name} exposes unexpected parameters: {sorted(props)}")
             if name in {"perform_action", "set_value"} and not OBJECT_REF_SELECTORS <= props:

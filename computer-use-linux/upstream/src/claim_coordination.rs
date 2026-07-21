@@ -15,9 +15,9 @@ const MAX_CLAIM_TOKEN_LENGTH: usize = 128;
 /// Credentials returned by the Hyprland companion's `claim_session_window` tool.
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct ClaimContext {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub(crate) owner_thread_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub(crate) claim_token: Option<String>,
 }
 
@@ -166,8 +166,7 @@ impl Coordinator {
             .map_err(|error| format!("failed to read window claims: {error}"))?;
         if !self.live_claims()?.is_empty() {
             return Err(
-                "window_id is required for capture while this session has active window claims"
-                    .to_string(),
+                "window_id is required while this session has active window claims".to_string(),
             );
         }
         Ok(ClaimGuard { _lock: lock })
@@ -235,21 +234,6 @@ impl Coordinator {
         }
         Ok(session)
     }
-}
-
-pub(crate) async fn acquire_claim_guard(
-    coordinator: Option<Coordinator>,
-    window_id: Option<u64>,
-    context: &ClaimContext,
-) -> Result<Option<ClaimGuard>, String> {
-    let Some(coordinator) = coordinator else {
-        return Ok(None);
-    };
-    let context = context.clone();
-    let guard = tokio::task::spawn_blocking(move || coordinator.acquire(window_id, &context))
-        .await
-        .map_err(|error| format!("window claim check failed: {error}"))??;
-    Ok(Some(guard))
 }
 
 pub(crate) async fn acquire_mutation_guards(
