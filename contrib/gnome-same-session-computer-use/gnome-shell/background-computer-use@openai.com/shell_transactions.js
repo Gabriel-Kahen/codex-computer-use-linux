@@ -77,6 +77,11 @@ export function restoreLeaseTransaction(lease, adapter) {
     };
 }
 
+export function assertFreshWindowFrame(settle, targetId) {
+    if (settle?.reason !== 'damaged-and-painted')
+        throw new Error(`window ${targetId} did not submit and paint a fresh buffer after unminimize`);
+}
+
 export function injectPointerTransaction(request, frame, adapter) {
     validatePointerRequest(request, frame);
     const local = request.action === 'drag' ? request.start : request.point;

@@ -110,6 +110,190 @@ class CaptureBoundaryTests(TestCase):
 
         capture.assert_not_called()
 
+    def test_fresh_minimized_capture_requires_acknowledgement(self) -> None:
+        window = {"id": "11", "minimized": True}
+
+        with self.assertRaisesRegex(ValueError, "acknowledge_interference"):
+            server.capture_minimized_window(
+                {"window": "11", "acknowledge_interference": False},
+                window,
+                "shell-a",
+            )
+
+    def test_fresh_minimized_capture_validates_damage_identity_and_restoration(self) -> None:
+        window = {
+            "id": "11",
+            "title": "Editor",
+            "focused": False,
+            "minimized": True,
+            "frame": {"width": 400, "height": 300},
+        }
+        integration = {
+            "shell_instance": "shell-a",
+            "protocol_version": server.FRESH_MINIMIZED_CAPTURE_PROTOCOL_VERSION,
+            "capabilities": [
+                server.WINDOW_ACTOR_CAPTURE_CAPABILITY,
+                server.BRIDGE_CONTRACT_CAPABILITY,
+                server.FRESH_MINIMIZED_CAPTURE_CAPABILITY,
+            ],
+            "bridge_contract": {
+                **server.BRIDGE_CONTRACT,
+                "role": "background-computer-use",
+                "features": ["fresh-minimized-capture"],
+            },
+        }
+
+        capability = "c" * 64
+        generation = "g" * 64
+
+        def capture(actual_capability: str):
+            self.assertEqual(actual_capability, capability)
+            return png(800, 600), {
+                "window": window,
+                "shell_instance": "shell-a",
+                "source": "meta-window-actor-freshened",
+                "potentially_stale": False,
+                "freshness": "client-damage-after-unminimize",
+                "operation_identity": {
+                    "contract_version": server.BRIDGE_CONTRACT["contract_version"],
+                    "shell_instance": "shell-a",
+                    "window": {
+                        "scheme": server.BRIDGE_CONTRACT["window_identity"],
+                        "id": "11",
+                    },
+                    "kind": "fresh-minimized-capture",
+                    "generation": generation,
+                },
+                "transaction": {
+                    "settle": {"reason": "damaged-and-painted"},
+                    "restoration": {
+                        "restored": True,
+                        "recovery_complete": True,
+                        "errors": [],
+                        "focus_changed_during_transaction": True,
+                    },
+                },
+            }
+
+        prepared = {
+            "capability": capability,
+            "lease_generation": generation,
+            "target": window,
+            "original": {"focused_window": "22", "workspace": 0},
+            "shell_instance": "shell-a",
+        }
+        with TemporaryDirectory() as directory:
+            lease_file = Path(directory) / "focus-lease.json"
+            with (
+                patch.object(server, "LEASE_FILE", lease_file),
+                patch.object(server, "LEGACY_LEASE_FILE", Path(directory) / "legacy.json"),
+                patch.object(server, "shell_status", return_value=integration),
+                patch.object(server, "dbus_call", return_value=prepared) as dbus,
+                patch.object(
+                    server, "dbus_capture_minimized_window", side_effect=capture
+                ) as dispatch,
+            ):
+                result = server.capture_minimized_window(
+                    {"window": "11", "acknowledge_interference": True},
+                    window,
+                    "shell-a",
+                )
+            self.assertFalse(lease_file.exists())
+
+        dbus.assert_called_once_with("BeginLease", "11")
+        dispatch.assert_called_once()
+        metadata = json.loads(result["content"][0]["text"])
+        self.assertEqual(
+            metadata["capture_source"], "meta-window-actor-freshened"
+        )
+        self.assertFalse(metadata["potentially_stale"])
+        self.assertTrue(metadata["desktop_restored_before_return"])
+        self.assertTrue(metadata["focus_changed_by_capture"])
+        self.assertEqual(
+            metadata["coordinate_space"]["pixel_to_window_scale"],
+            {"x": 0.5, "y": 0.5},
+        )
+
+    def test_fresh_minimized_capture_rejects_missing_damage_proof(self) -> None:
+        window = {
+            "id": "11",
+            "minimized": True,
+            "frame": {"width": 1, "height": 1},
+        }
+        integration = {
+            "shell_instance": "shell-a",
+            "protocol_version": server.FRESH_MINIMIZED_CAPTURE_PROTOCOL_VERSION,
+            "capabilities": [
+                server.FRESH_MINIMIZED_CAPTURE_CAPABILITY,
+                server.BRIDGE_CONTRACT_CAPABILITY,
+            ],
+            "bridge_contract": {
+                **server.BRIDGE_CONTRACT,
+                "role": "background-computer-use",
+                "features": ["fresh-minimized-capture"],
+            },
+        }
+        capability = "c" * 64
+        generation = "g" * 64
+        prepared = {
+            "capability": capability,
+            "lease_generation": generation,
+            "target": window,
+            "original": {"focused_window": "22", "workspace": 0},
+            "shell_instance": "shell-a",
+        }
+
+        def capture(actual_capability: str):
+            self.assertEqual(actual_capability, capability)
+            return png(1, 1), {
+                "window": window,
+                "shell_instance": "shell-a",
+                "potentially_stale": False,
+                "freshness": "client-damage-after-unminimize",
+                "operation_identity": {
+                    "contract_version": server.BRIDGE_CONTRACT["contract_version"],
+                    "shell_instance": "shell-a",
+                    "window": {
+                        "scheme": server.BRIDGE_CONTRACT["window_identity"],
+                        "id": "11",
+                    },
+                    "kind": "fresh-minimized-capture",
+                    "generation": generation,
+                },
+                "transaction": {
+                    "settle": {"reason": "timeout"},
+                    "restoration": {"recovery_complete": True, "errors": []},
+                },
+            }
+        def dbus(method: str, *args: str):
+            if method == "BeginLease":
+                return prepared
+            if method == "RecoverLease":
+                self.assertEqual(args, (capability,))
+                return {"restored": True, "recovery_complete": True, "errors": []}
+            self.fail(f"unexpected D-Bus method {method}")
+
+        with TemporaryDirectory() as directory:
+            lease_file = Path(directory) / "focus-lease.json"
+            with (
+                patch.object(server, "LEASE_FILE", lease_file),
+                patch.object(server, "LEGACY_LEASE_FILE", Path(directory) / "legacy.json"),
+                patch.object(server, "shell_status", return_value=integration),
+                patch.object(server, "dbus_call", side_effect=dbus),
+                patch.object(
+                    server,
+                    "dbus_capture_minimized_window",
+                    side_effect=capture,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "client-damaged painted frame"):
+                    server.capture_minimized_window(
+                        {"window": "11", "acknowledge_interference": True},
+                        window,
+                        "shell-a",
+                    )
+            self.assertFalse(lease_file.exists())
+
     def test_protocol_three_mapped_capture_keeps_legacy_metadata_compatibility(self) -> None:
         window = {
             "id": "11",

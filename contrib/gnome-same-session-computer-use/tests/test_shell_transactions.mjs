@@ -5,6 +5,7 @@ import {LeaseProtocol} from '../gnome-shell/background-computer-use@openai.com/l
 import {
     activateLeaseTransaction,
     assertInputSafe,
+    assertFreshWindowFrame,
     injectKeyTransaction,
     injectPointerTransaction,
     restoreLeaseTransaction,
@@ -201,6 +202,16 @@ test('restore clears a non-actionable lease when the leased target closed', () =
         'state',
     ]);
     assert.equal(protocol.lease, null);
+});
+
+test('fresh minimized capture accepts only client damage followed by paint', () => {
+    assert.doesNotThrow(() => assertFreshWindowFrame({reason: 'damaged-and-painted'}, '11'));
+    for (const reason of ['timeout', 'actor-destroyed', 'actor-unavailable']) {
+        assert.throws(
+            () => assertFreshWindowFrame({reason}, '11'),
+            /did not submit and paint a fresh buffer/,
+        );
+    }
 });
 
 for (const action of ['click', 'drag']) {

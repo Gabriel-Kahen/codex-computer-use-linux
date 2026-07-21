@@ -16,6 +16,7 @@ import {
 import {
     activateLeaseTransaction,
     assertInputSafe,
+    assertFreshWindowFrame,
     injectKeyTransaction,
     injectPointerTransaction,
     restoreLeaseTransaction,
@@ -30,7 +31,7 @@ import {
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.BackgroundComputerUse';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/BackgroundComputerUse';
-const PROTOCOL_VERSION = 5;
+const PROTOCOL_VERSION = 6;
 const MAX_CAPTURE_BYTES = 5 * 1024 * 1024;
 const MAX_CAPTURE_PIXELS = 7680 * 4320;
 const XML = `<node>
@@ -46,6 +47,7 @@ const XML = `<node>
     <method name="InjectPointer"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="InjectKeys"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="CaptureWindow"><arg type="s" direction="in"/><arg type="ay" direction="out"/><arg type="s" direction="out"/></method>
+    <method name="CaptureMinimizedWindow"><arg type="s" direction="in"/><arg type="ay" direction="out"/><arg type="s" direction="out"/></method>
     <method name="ActAndCapture"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="ay" direction="out"/><arg type="s" direction="out"/></method>
   </interface>
 </node>`;
@@ -202,11 +204,12 @@ export default class BackgroundComputerUseExtension extends Extension {
                 'window_actor_capture',
                 'act_and_capture',
                 'bridge_contract_v1',
+                'fresh_minimized_capture',
             ],
             bridge_contract: bridgeInfo(
                 this._bridgeContract,
                 'background-computer-use',
-                ['claimed-leases', 'window-actor-capture', 'act-and-capture'],
+                ['claimed-leases', 'window-actor-capture', 'act-and-capture', 'fresh-minimized-capture'],
             ),
             shell_version: Config.PACKAGE_VERSION,
             locked: Main.sessionMode.isLocked,
@@ -240,6 +243,15 @@ export default class BackgroundComputerUseExtension extends Extension {
         if (this._captureActive)
             throw new Error('another window capture is already in progress');
 
+        this._captureActive = true;
+        try {
+            return await this._captureMappedWindow(id);
+        } finally {
+            this._captureActive = false;
+        }
+    }
+
+    async _captureMappedWindow(id) {
         const window = this._find(id);
         if (window.minimized)
             throw new Error(`window ${id} is minimized; refusing a potentially stale compositor buffer`);
@@ -247,57 +259,125 @@ export default class BackgroundComputerUseExtension extends Extension {
         if (!actor || actor.is_destroyed())
             throw new Error(`window ${id} has no live compositor actor`);
 
+        const content = actor.paint_to_content(null);
+        if (!content)
+            throw new Error(`window ${id} has no capturable compositor content`);
+        const texture = content.get_texture();
+        if (!texture)
+            throw new Error(`window ${id} has no capturable compositor texture`);
+        const width = texture.get_width();
+        const height = texture.get_height();
+        if (width <= 0 || height <= 0 || width * height > MAX_CAPTURE_PIXELS)
+            throw new Error(`window ${id} capture dimensions are outside the supported bounds`);
+
+        const stream = Gio.MemoryOutputStream.new_resizable();
+        await Shell.Screenshot.composite_to_stream(
+            texture,
+            0, 0, -1, -1,
+            1,
+            null, 0, 0, 1,
+            stream,
+        );
+        stream.close(null);
+        const bytes = stream.steal_as_bytes().get_data();
+        if (bytes.length > MAX_CAPTURE_BYTES)
+            throw new Error(`captured PNG exceeds the ${MAX_CAPTURE_BYTES}-byte transport limit`);
+
+        const current = this._find(id);
+        if (current.get_compositor_private() !== actor || actor.is_destroyed())
+            throw new Error(`window ${id} changed while it was being captured`);
+        if (current.minimized)
+            throw new Error(`window ${id} became minimized while it was being captured`);
+        return {
+            bytes,
+            metadata: {
+                window: this._window(current),
+                screenshot_pixels: {width, height},
+                shell_instance: this._shellInstance,
+                source: 'meta-window-actor',
+                potentially_stale: false,
+                freshness: 'mapped-live-actor',
+                operation_identity: operationIdentity(
+                    this._bridgeContract,
+                    this._shellInstance,
+                    current,
+                    'capture',
+                ),
+            },
+        };
+    }
+
+    CaptureMinimizedWindowAsync([capability], invocation) {
+        this._captureMinimizedWindow(capability, invocation.get_sender())
+            .then(({bytes, metadata}) => {
+                invocation.return_value(new GLib.Variant('(ays)', [bytes, json(metadata)]));
+            })
+            .catch(error => {
+                invocation.return_dbus_error(
+                    `${BUS_NAME}.Error`, String(error.message ?? error));
+            });
+    }
+
+    async _captureMinimizedWindow(capability, sender) {
+        const lease = this._requireLease(capability, sender, 'pending');
+        if (!lease.targetMinimized)
+            throw new Error(`window ${lease.target} was not minimized when the transaction began`);
+        if (this._captureActive)
+            throw new Error('another window capture is already in progress');
+
         this._captureActive = true;
+        const startedUsec = GLib.get_monotonic_time();
+        let captured = null;
+        let settle = null;
+        let operationError = null;
         try {
-            const content = actor.paint_to_content(null);
-            if (!content)
-                throw new Error(`window ${id} has no capturable compositor content`);
-            const texture = content.get_texture();
-            if (!texture)
-                throw new Error(`window ${id} has no capturable compositor texture`);
-            const width = texture.get_width();
-            const height = texture.get_height();
-            if (width <= 0 || height <= 0 || width * height > MAX_CAPTURE_PIXELS)
-                throw new Error(`window ${id} capture dimensions are outside the supported bounds`);
-
-            const stream = Gio.MemoryOutputStream.new_resizable();
-            await Shell.Screenshot.composite_to_stream(
-                texture,
-                0, 0, -1, -1,
-                1,
-                null, 0, 0, 1,
-                stream,
+            this._assertInputSafe();
+            const target = this._find(lease.target);
+            const freshFrame = this._waitForWindowFrame(target, 1000);
+            const time = global.get_current_time();
+            activateLeaseTransaction(lease, {
+                findWindow: id => this._windows().find(window => this._id(window) === id) ?? null,
+                workspaceForWindow: window => window.get_workspace(),
+                markLeaseActive: () => this._protocol.activate(capability, sender),
+                activateWorkspace: workspace => workspace.activate(time),
+                unminimizeWindow: window => window.unminimize(),
+                focusWindow: window => window.activate(time),
+                state: () => this._state(),
+            });
+            this._cancelPendingExpiry();
+            settle = await freshFrame;
+            assertFreshWindowFrame(settle, lease.target);
+            captured = await this._captureMappedWindow(lease.target);
+            captured.metadata.source = 'meta-window-actor-freshened';
+            captured.metadata.freshness = 'client-damage-after-unminimize';
+            captured.metadata.operation_identity = operationIdentity(
+                this._bridgeContract,
+                this._shellInstance,
+                this._find(lease.target),
+                'fresh-minimized-capture',
+                lease.generation,
             );
-            stream.close(null);
-            const bytes = stream.steal_as_bytes().get_data();
-            if (bytes.length > MAX_CAPTURE_BYTES)
-                throw new Error(`captured PNG exceeds the ${MAX_CAPTURE_BYTES}-byte transport limit`);
-
-            const current = this._find(id);
-            if (current.get_compositor_private() !== actor || actor.is_destroyed())
-                throw new Error(`window ${id} changed while it was being captured`);
-            if (current.minimized)
-                throw new Error(`window ${id} became minimized while it was being captured`);
-            return {
-                bytes,
-                metadata: {
-                    window: this._window(current),
-                    screenshot_pixels: {width, height},
-                    shell_instance: this._shellInstance,
-                    source: 'meta-window-actor',
-                    potentially_stale: false,
-                    freshness: 'mapped-live-actor',
-                    operation_identity: operationIdentity(
-                        this._bridgeContract,
-                        this._shellInstance,
-                        current,
-                        'capture',
-                    ),
-                },
-            };
+        } catch (error) {
+            operationError = error;
         } finally {
             this._captureActive = false;
         }
+
+        const restoration = this._restoreLease(lease);
+        if (restoration.recovery_complete !== true) {
+            throw new Error(
+                `fresh minimized capture completed without full desktop restoration: ${json(restoration.errors ?? [])}`);
+        }
+        if (operationError)
+            throw operationError;
+
+        captured.metadata.window = this._window(this._find(lease.target));
+        captured.metadata.transaction = {
+            settle,
+            restoration,
+            interference_milliseconds: (GLib.get_monotonic_time() - startedUsec) / 1000,
+        };
+        return captured;
     }
 
     _waitForWindowFrame(window, timeoutMs = 180) {
