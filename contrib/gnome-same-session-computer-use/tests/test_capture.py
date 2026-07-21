@@ -32,7 +32,7 @@ class CaptureBoundaryTests(TestCase):
             with self.assertRaisesRegex(RuntimeError, "begin_focus_lease"):
                 server.capture_window({"window": "11"})
 
-    def test_window_actor_capture_observes_inactive_window_without_focus(self) -> None:
+    def test_window_actor_capture_ignores_unrelated_focus_lease(self) -> None:
         window = {
             "id": "11",
             "title": "Editor",
@@ -51,8 +51,13 @@ class CaptureBoundaryTests(TestCase):
             "source": "meta-window-actor",
             "potentially_stale": True,
         }
+        unrelated_lease = {
+            "owner_thread_id": "other-agent",
+            "phase": "active",
+            "window": {"id": "22"},
+        }
         with (
-            patch.object(server, "load_lease", return_value=None),
+            patch.object(server, "load_lease", return_value=unrelated_lease) as load_lease,
             patch.object(server, "shell_status", return_value=integration),
             patch.object(server, "dbus_capture_window", return_value=(png(800, 600), captured)) as capture,
             patch.object(server, "run") as run,
@@ -64,6 +69,7 @@ class CaptureBoundaryTests(TestCase):
             )
 
         capture.assert_called_once_with("11")
+        load_lease.assert_not_called()
         run.assert_not_called()
         metadata = json.loads(result["content"][0]["text"])
         self.assertFalse(metadata["capture_requires_focus"])
