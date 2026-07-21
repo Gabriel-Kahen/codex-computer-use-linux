@@ -191,7 +191,7 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         support: BackendSupport {
             desktop_session: "KDE Plasma / KWin",
             window_backend: "temporary KWin DBus scripting",
-            notes: "Lists and focuses windows through `org.kde.KWin` scripting when the session bus exposes it.",
+            notes: "Lists and focuses windows through `org.kde.KWin` scripting. Exact target capture calls `org.kde.KWin.ScreenShot2` directly from Rust, including inactive windows, without a screenshot helper process.",
         },
     },
     BackendDescriptor {
