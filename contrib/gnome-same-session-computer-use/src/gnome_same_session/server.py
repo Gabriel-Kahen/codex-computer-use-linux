@@ -386,12 +386,14 @@ def save_lease(state: dict[str, Any]) -> None:
 
 def shell_contract_valid(integration: dict[str, Any]) -> bool:
     actual = integration.get("bridge_contract")
+    capabilities = integration.get("capabilities")
     return (
         isinstance(actual, dict)
         and actual.get("role") == "background-computer-use"
         and all(actual.get(key) == value for key, value in BRIDGE_CONTRACT.items())
         and isinstance(actual.get("features"), list)
-        and BRIDGE_CONTRACT_CAPABILITY in integration.get("capabilities", [])
+        and isinstance(capabilities, list)
+        and BRIDGE_CONTRACT_CAPABILITY in capabilities
     )
 
 
@@ -556,8 +558,11 @@ def begin_lease(
     if load_lease():
         raise RuntimeError("a focus lease is already active; end or recover it first")
     selected = selected or resolve_window(arguments.get("window"))
-    if expected_shell_instance is not None:
+    integration = (
         require_shell_instance(expected_shell_instance)
+        if expected_shell_instance is not None
+        else None
+    )
     if claim:
         prepared = dbus_call(
             "BeginClaimedLease", str(selected["id"]), claim_recovery_seconds(claim)
@@ -570,8 +575,14 @@ def begin_lease(
     if not isinstance(capability, str) or not 64 <= len(capability) <= 256:
         raise RuntimeError("GNOME integration returned an invalid lease capability")
     lease_generation = prepared.get("lease_generation")
-    if lease_generation is not None and (
-        not isinstance(lease_generation, str) or not 32 <= len(lease_generation) <= 256
+    protocol_version = integration.get("protocol_version") if integration else None
+    generation_required = (
+        type(protocol_version) is int
+        and protocol_version >= BRIDGE_CONTRACT_PROTOCOL_VERSION
+    )
+    if (generation_required and lease_generation is None) or (
+        lease_generation is not None
+        and (not isinstance(lease_generation, str) or not 32 <= len(lease_generation) <= 256)
     ):
         raise RuntimeError("GNOME integration returned an invalid lease generation")
     state = {
@@ -1093,7 +1104,15 @@ def act_and_observe(
         current = capture_metadata.get("window")
         if not isinstance(current, dict) or str(current.get("id")) != str(selected["id"]):
             raise RuntimeError("GNOME integration observed a different window after the action")
-        if capture_metadata.get("potentially_stale") is True or current.get("minimized") is True:
+        potentially_stale = capture_metadata.get("potentially_stale")
+        if (
+            potentially_stale is True
+            or current.get("minimized") is True
+            or (
+                integration.get("protocol_version", 0) >= BRIDGE_CONTRACT_PROTOCOL_VERSION
+                and potentially_stale is not False
+            )
+        ):
             raise RuntimeError("GNOME act-and-observe could not prove the captured buffer is fresh")
         require_operation_identity(
             capture_metadata,

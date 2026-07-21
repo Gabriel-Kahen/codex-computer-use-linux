@@ -203,6 +203,7 @@ class CaptureBoundaryTests(TestCase):
         captured = {
             "window": {**window, "focused": True},
             "shell_instance": "shell-a",
+            "potentially_stale": False,
             "transaction": transaction,
             "operation_identity": {
                 "contract_version": server.BRIDGE_CONTRACT["contract_version"],
@@ -249,6 +250,67 @@ class CaptureBoundaryTests(TestCase):
         self.assertTrue(metadata["desktop_restored_before_return"])
         self.assertEqual(metadata["transaction"]["settle"]["reason"], "damaged-and-painted")
         self.assertEqual(metadata["coordinate_space"]["pixel_to_window_scale"], {"x": 0.5, "y": 0.5})
+
+    def test_act_and_observe_rejects_a_different_lease_generation(self) -> None:
+        window = {"id": "11", "focused": False, "frame": {"width": 1, "height": 1}}
+        integration = {
+            "shell_instance": "shell-a",
+            "protocol_version": server.BRIDGE_CONTRACT_PROTOCOL_VERSION,
+            "capabilities": [
+                server.ACT_AND_CAPTURE_CAPABILITY,
+                server.BRIDGE_CONTRACT_CAPABILITY,
+            ],
+            "bridge_contract": {
+                **server.BRIDGE_CONTRACT,
+                "role": "background-computer-use",
+                "features": ["act-and-capture"],
+            },
+            "lease_phase": None,
+        }
+        state = {
+            "token": "c" * 64,
+            "phase": "active",
+            "target": window,
+            "lease_generation": "g" * 64,
+        }
+        captured = {
+            "window": window,
+            "shell_instance": "shell-a",
+            "potentially_stale": False,
+            "transaction": {
+                "restoration": {"recovery_complete": True},
+            },
+            "operation_identity": {
+                "contract_version": server.BRIDGE_CONTRACT["contract_version"],
+                "shell_instance": "shell-a",
+                "window": {
+                    "scheme": server.BRIDGE_CONTRACT["window_identity"],
+                    "id": "11",
+                },
+                "kind": "act-and-capture",
+                "generation": "x" * 64,
+            },
+        }
+        arguments = {
+            "window": "11",
+            "acknowledge_interference": True,
+            "action": {"type": "shortcut", "key": "F6"},
+        }
+        with (
+            patch.object(server, "shell_status", return_value=integration),
+            patch.object(server, "begin_lease"),
+            patch.object(server, "load_lease", return_value=state),
+            patch.object(server, "dbus_act_and_capture", return_value=(png(1, 1), captured)),
+            patch.object(
+                server,
+                "restore_lease",
+                return_value={"recovery_complete": True, "errors": []},
+            ) as recover,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "mismatched operation identity"):
+                server.act_and_observe(arguments, "thread-a", window, None, "shell-a")
+
+        recover.assert_called_once_with(state, recovery=True)
 
     def test_act_and_observe_recovers_after_invalid_capture(self) -> None:
         window = {"id": "11", "focused": False, "frame": {"width": 1, "height": 1}}
