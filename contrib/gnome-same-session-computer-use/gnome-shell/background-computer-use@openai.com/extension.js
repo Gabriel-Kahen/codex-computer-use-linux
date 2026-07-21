@@ -23,7 +23,7 @@ import {
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.BackgroundComputerUse';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/BackgroundComputerUse';
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 const MAX_CAPTURE_BYTES = 5 * 1024 * 1024;
 const MAX_CAPTURE_PIXELS = 7680 * 4320;
 const XML = `<node>
@@ -39,6 +39,7 @@ const XML = `<node>
     <method name="InjectPointer"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="InjectKeys"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="CaptureWindow"><arg type="s" direction="in"/><arg type="ay" direction="out"/><arg type="s" direction="out"/></method>
+    <method name="ActAndCapture"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="ay" direction="out"/><arg type="s" direction="out"/></method>
   </interface>
 </node>`;
 
@@ -186,7 +187,7 @@ export default class BackgroundComputerUseExtension extends Extension {
     Status() {
         return json({
             protocol_version: PROTOCOL_VERSION,
-            capabilities: ['claimed_focus_leases', 'window_actor_capture'],
+            capabilities: ['claimed_focus_leases', 'window_actor_capture', 'act_and_capture'],
             shell_version: Config.PACKAGE_VERSION,
             locked: Main.sessionMode.isLocked,
             overview_visible: Main.overview.visible,
@@ -266,6 +267,98 @@ export default class BackgroundComputerUseExtension extends Extension {
         } finally {
             this._captureActive = false;
         }
+    }
+
+    _waitForWindowFrame(window, timeoutMs = 180) {
+        const actor = window.get_compositor_private();
+        if (!actor || actor.is_destroyed())
+            return Promise.resolve({reason: 'actor-unavailable'});
+
+        return new Promise(resolve => {
+            let damageId = 0;
+            let destroyId = 0;
+            let afterPaintId = 0;
+            let timeoutId = 0;
+            const finish = reason => {
+                if (damageId)
+                    actor.disconnect(damageId);
+                if (destroyId)
+                    actor.disconnect(destroyId);
+                if (afterPaintId)
+                    global.stage.disconnect(afterPaintId);
+                if (timeoutId)
+                    GLib.source_remove(timeoutId);
+                damageId = 0;
+                destroyId = 0;
+                afterPaintId = 0;
+                timeoutId = 0;
+                resolve({reason});
+            };
+            damageId = actor.connect('damaged', () => {
+                if (afterPaintId)
+                    return;
+                afterPaintId = global.stage.connect('after-paint', () => {
+                    finish('damaged-and-painted');
+                });
+                global.stage.queue_redraw();
+            });
+            destroyId = actor.connect('destroy', () => finish('actor-destroyed'));
+            timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, timeoutMs, () => {
+                timeoutId = 0;
+                finish('timeout');
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+    }
+
+    ActAndCaptureAsync([capability, serialized], invocation) {
+        this._actAndCapture(capability, serialized, invocation.get_sender())
+            .then(({bytes, metadata}) => {
+                invocation.return_value(new GLib.Variant('(ays)', [bytes, json(metadata)]));
+            })
+            .catch(error => {
+                invocation.return_dbus_error(
+                    `${BUS_NAME}.Error`, String(error.message ?? error));
+            });
+    }
+
+    async _actAndCapture(capability, serialized, sender) {
+        const lease = this._requireLease(capability, sender, 'active');
+        const request = JSON.parse(serialized);
+        const startedUsec = GLib.get_monotonic_time();
+        let actionResult = null;
+        let settle = null;
+        let captured = null;
+        let operationError = null;
+
+        try {
+            if (request.kind === 'pointer')
+                actionResult = this._injectPointer(capability, json(request.action), sender);
+            else if (request.kind === 'keys')
+                actionResult = this._injectKeys(capability, json(request.action), sender);
+            else
+                throw new Error(`unsupported transactional action kind ${request.kind}`);
+            settle = await this._waitForWindowFrame(this._find(lease.target));
+            captured = await this._captureWindow(lease.target);
+        } catch (error) {
+            operationError = error;
+        }
+
+        const restoration = this._restoreLease(lease);
+        if (restoration.recovery_complete !== true) {
+            throw new Error(
+                `transaction completed without full desktop restoration: ${json(restoration.errors ?? [])}`);
+        }
+        if (operationError)
+            throw operationError;
+
+        captured.metadata.transaction = {
+            action: actionResult,
+            settle,
+            restoration,
+            interference_milliseconds: (GLib.get_monotonic_time() - startedUsec) / 1000,
+        };
+        return captured;
     }
 
     BeginLeaseAsync([id], invocation) {

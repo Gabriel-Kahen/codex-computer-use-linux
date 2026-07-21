@@ -91,6 +91,95 @@ class CaptureBoundaryTests(TestCase):
                     expected_shell_instance="shell-a",
                 )
 
+    def test_act_and_observe_restores_before_returning_capture(self) -> None:
+        window = {
+            "id": "11",
+            "title": "Editor",
+            "focused": False,
+            "frame": {"width": 400, "height": 300},
+        }
+        integration = {
+            "shell_instance": "shell-a",
+            "protocol_version": server.ACT_AND_CAPTURE_PROTOCOL_VERSION,
+            "capabilities": [server.ACT_AND_CAPTURE_CAPABILITY],
+            "lease_phase": None,
+        }
+        state = {
+            "token": "c" * 64,
+            "phase": "active",
+            "target": window,
+            "shell_instance": "shell-a",
+        }
+        transaction = {
+            "settle": {"reason": "damaged-and-painted"},
+            "restoration": {"restored": True, "recovery_complete": True, "errors": []},
+            "interference_milliseconds": 23,
+        }
+        captured = {
+            "window": {**window, "focused": True},
+            "shell_instance": "shell-a",
+            "transaction": transaction,
+        }
+        arguments = {
+            "window": "11",
+            "acknowledge_interference": True,
+            "action": {"type": "click", "x": 20, "y": 30},
+        }
+        with (
+            TemporaryDirectory() as directory,
+            patch.object(server, "LEASE_FILE", Path(directory) / "lease.json"),
+            patch.object(server, "shell_status", return_value=integration),
+            patch.object(server, "begin_lease") as begin,
+            patch.object(server, "load_lease", return_value=state),
+            patch.object(server, "dbus_act_and_capture", return_value=(png(800, 600), captured)) as act,
+            patch.object(server, "restore_lease") as recover,
+        ):
+            result = server.act_and_observe(arguments, "thread-a", window, None, "shell-a")
+
+        begin.assert_called_once()
+        act.assert_called_once_with(
+            "c" * 64,
+            {
+                "kind": "pointer",
+                "action": {
+                    "action": "click",
+                    "button": "left",
+                    "point": {"x": 20.0, "y": 30.0},
+                    "count": 1,
+                },
+            },
+        )
+        recover.assert_not_called()
+        metadata = json.loads(result["content"][0]["text"])
+        self.assertTrue(metadata["desktop_restored_before_return"])
+        self.assertEqual(metadata["transaction"]["settle"]["reason"], "damaged-and-painted")
+        self.assertEqual(metadata["coordinate_space"]["pixel_to_window_scale"], {"x": 0.5, "y": 0.5})
+
+    def test_act_and_observe_recovers_after_invalid_capture(self) -> None:
+        window = {"id": "11", "focused": False, "frame": {"width": 1, "height": 1}}
+        integration = {
+            "shell_instance": "shell-a",
+            "protocol_version": server.ACT_AND_CAPTURE_PROTOCOL_VERSION,
+            "capabilities": [server.ACT_AND_CAPTURE_CAPABILITY],
+        }
+        state = {"token": "c" * 64, "phase": "active", "target": window}
+        arguments = {
+            "window": "11",
+            "acknowledge_interference": True,
+            "action": {"type": "shortcut", "key": "F6"},
+        }
+        with (
+            patch.object(server, "shell_status", return_value=integration),
+            patch.object(server, "begin_lease"),
+            patch.object(server, "load_lease", return_value=state),
+            patch.object(server, "dbus_act_and_capture", return_value=(b"invalid", {})),
+            patch.object(server, "restore_lease", return_value={"recovery_complete": True, "errors": []}) as recover,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid PNG"):
+                server.act_and_observe(arguments, "thread-a", window, None, "shell-a")
+
+        recover.assert_called_once_with(state, recovery=True)
+
     def test_failed_capture_preserves_destination(self) -> None:
         window = {"id": "11", "focused": True, "frame": {"width": 1, "height": 1}}
         with TemporaryDirectory() as directory:
