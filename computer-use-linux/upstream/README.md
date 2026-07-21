@@ -117,7 +117,7 @@ Validated manually on Ubuntu 25.10 (GNOME Shell 50.1, Wayland). Other compositor
 | Hyprland | `hyprctl clients -j` and `hyprctl dispatch focuswindow` | Requires `hyprctl` in the desktop session. |
 | Niri | `niri msg --json windows` and `niri msg action focus-window` | Requires `NIRI_SOCKET` and the `niri` command from the active compositor session. |
 | i3 | `i3-msg`; optional `xprop` for PID hydration | Lists and focuses i3 windows over the active i3 IPC socket. |
-| Generic X11 / Xfce / other EWMH WMs | `wmctrl`; optional `xprop` for focus verification | Lists, focuses, moves, and resizes EWMH windows. Without `xprop`, listing still works but focused-window verification is unavailable. |
+| Generic X11 / Xfce / other EWMH WMs | native X11/EWMH connection; `wmctrl`/`xprop` fallback | Lists and focuses through one persistent X11 connection, with event-invalidated snapshots. `wmctrl` remains the move/resize and compatibility fallback. |
 <!-- END GENERATED BACKEND SUPPORT MATRIX -->
 
 Sway and other unsupported wlroots compositors have no dedicated backend yet. AT-SPI, screenshots, and global `ydotool` input can still work, but exact window listing and focus are unavailable unless another backend applies.
@@ -370,6 +370,7 @@ files.
 - **MCP transport** — [`rmcp`](https://crates.io/crates/rmcp) with the `transport-io` feature; stdio framing, no network.
 - **Input fallback** — coordinate-bearing pointer actions use absolute uinput or write through `ydotoold`; the remote-desktop portal is limited to input that needs no screenshot-pixel mapping. `install.sh` can configure `ydotoold`; the `setup` command only enables the GNOME AT-SPI bridge.
 - **Window registry** — `list_windows`, `focused_window`, `activate_window`, `press_key`, and `type_text` share a backend registry. It tries GNOME extension, GNOME Introspect, COSMIC helper, KWin scripting, Hyprland `hyprctl`, and i3 IPC in that order, skipping empty or failed backends so another compositor backend can answer.
+- **Native generic X11 transport** — EWMH window listing, focused-window reads, and activation share one persistent X11 connection. Root and client events invalidate its bounded snapshot cache, avoiding `wmctrl`/`xprop` process polling during normal focus verification. `wmctrl` and `xprop` remain compatibility fallbacks, and X11 move/resize still use `wmctrl`; the optional background-capture companion continues to own its separate XComposite/XRes helper for now.
 - **GNOME extension fallback** — recent GNOME builds deny `org.gnome.Shell.Introspect.GetWindows` to non-blessed clients. The bundled Shell extension exposes window data and exact activation under `dev.avifenesh.ComputerUseLinux.WindowControl`.
 - **COSMIC helper** — `computer-use-linux-cosmic` talks to COSMIC toplevel protocols and is resolved from `COMPUTER_USE_LINUX_COSMIC_HELPER`, next to the running binary, or from `PATH`.
 - **Terminal enrichment** — `list_windows` cross-references each terminal window with its controlling TTY and the foreground process on that TTY, so `type_text` / `press_key` can target "the terminal where `pytest` is running" without the host ever knowing the window id.

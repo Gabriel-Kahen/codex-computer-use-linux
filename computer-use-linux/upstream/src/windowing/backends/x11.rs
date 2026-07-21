@@ -1,7 +1,8 @@
 //! Generic X11 / EWMH window backend.
 //!
 //! Unlike the compositor-specific backends (GNOME Shell, KWin, Hyprland, i3),
-//! this one talks plain [EWMH]/[ICCCM] through `wmctrl` + `xprop`, so it works
+//! this one talks plain [EWMH]/[ICCCM] through a persistent native X11
+//! connection, with `wmctrl` + `xprop` retained as a compatibility fallback, so it works
 //! on any reasonably standards-compliant X11 window manager that does not have
 //! a dedicated backend — Cinnamon/Muffin, MATE/Marco, Xfce/xfwm4, Openbox, etc.
 //! It is intentionally registered last so a session-native backend always wins
@@ -11,6 +12,7 @@
 //! [ICCCM]: https://tronche.com/gui/x/icccm/
 
 use crate::terminal::enrich_terminal_windows;
+use crate::windowing::backends::x11_native;
 use crate::windowing::registry::BackendProbe;
 use crate::windowing::types::{WindowBounds, WindowInfo};
 use anyhow::{bail, Context, Result};
@@ -38,6 +40,16 @@ fn is_x11_session() -> bool {
 pub fn probe() -> BackendProbe {
     if !is_x11_session() {
         return probe_fail("no X11 session (needs DISPLAY on an X11, not Wayland, session)");
+    }
+    if let Ok(detail) = x11_native::probe() {
+        return BackendProbe {
+            id: X11_BACKEND,
+            ok: true,
+            can_list_windows: true,
+            can_focus_apps: true,
+            can_focus_windows: true,
+            detail,
+        };
     }
     match wmctrl().args(["-l", "-p", "-G", "-x"]).output() {
         Ok(output) if output.status.success() => {
@@ -85,6 +97,11 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
     if !is_x11_session() {
         bail!("not an X11 session (needs DISPLAY on an X11, not Wayland, session)");
     }
+    if let Ok(mut windows) = x11_native::list_windows() {
+        enrich_terminal_windows(&mut windows);
+        return Ok(windows);
+    }
+
     let output = wmctrl()
         .args(["-l", "-p", "-G", "-x"])
         .output()
@@ -103,8 +120,18 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
 }
 
 pub fn activate_window(window_id: u64) -> Result<()> {
+    if x11_native::activate_window(window_id).is_ok() {
+        return Ok(());
+    }
     let id = window_id_arg(window_id);
     run_wmctrl(&["-i", "-a", id.as_str()], "activate window", window_id)
+}
+
+pub fn focused_window() -> Option<WindowInfo> {
+    is_x11_session()
+        .then(x11_native::focused_window)
+        .and_then(Result::ok)
+        .flatten()
 }
 
 pub fn move_window(window_id: u64, x: i32, y: i32) -> Result<String> {

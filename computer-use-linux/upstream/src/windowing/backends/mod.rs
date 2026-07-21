@@ -5,3 +5,4 @@ pub mod i3;
 pub mod kwin;
 pub mod niri;
 pub mod x11;
+mod x11_native;
