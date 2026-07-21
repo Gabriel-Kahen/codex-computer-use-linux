@@ -144,6 +144,16 @@ hyprctl plugin list
 
 The generated shared object is intentionally excluded from Git. Build it on the target machine so it matches that machine's Hyprland ABI.
 
+## Test the native path
+
+The `hyprland-native-e2e` workflow boots the supported Hyprland release in a NixOS VM with a virtual GPU and real input devices. It builds and loads the extension, captures a background GTK window, injects a click and shortcut into that window, and verifies that a foreground sentinel keeps its focus, workspace, and pointer state.
+
+On a Hyprland development machine, run the same smoke test nested inside the current session:
+
+```bash
+PYTHONPATH=src python tests/native_e2e.py
+```
+
 ## Run the MCP broker
 
 ```bash
