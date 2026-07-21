@@ -126,8 +126,71 @@ class SafetyProbeTests(TestCase):
 
         self.assertEqual(events, ["safe", "snapshot", "snapshot"])
 
+    def test_targeted_pointer_rejects_changed_physical_state(self) -> None:
+        window = {"address": "0x1", "size": [100, 100], "xwayland": False}
+        before = {
+            "active_address": "0xphysical",
+            "workspace": 1,
+            "cursor": {"x": 10, "y": 20},
+        }
+        after = {**before, "workspace": 2}
+
+        with (
+            patch.object(server, "resolve_window", return_value=window),
+            patch.object(server, "ensure_target_pointer_plugin"),
+            patch.object(server, "physical_snapshot", side_effect=(before, after)),
+            patch.object(server, "run", return_value=completed([], '{"ok":true}')),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "workspace_changed_by_backend"
+            ):
+                server._targeted_pointer(
+                    {"window": "0x1", "x": 10, "y": 10}, "click"
+                )
+
+    def test_targeted_pointer_reports_observed_state_changes(self) -> None:
+        window = {"address": "0x1", "size": [100, 100], "xwayland": False}
+        snapshot = {
+            "active_address": "0xphysical",
+            "workspace": 1,
+            "cursor": {"x": 10, "y": 20},
+        }
+
+        with (
+            patch.object(server, "resolve_window", return_value=window),
+            patch.object(server, "ensure_target_pointer_plugin"),
+            patch.object(server, "physical_snapshot", return_value=snapshot),
+            patch.object(server, "run", return_value=completed([], '{"ok":true}')),
+        ):
+            result = server._targeted_pointer(
+                {"window": "0x1", "x": 10, "y": 10}, "click"
+            )
+
+        self.assertEqual(
+            {
+                key: result[key]
+                for key in (
+                    "observed_physical_state_unchanged",
+                    "cursor_moved_by_backend",
+                    "keyboard_focus_changed_by_backend",
+                    "workspace_changed_by_backend",
+                )
+            },
+            {
+                "observed_physical_state_unchanged": True,
+                "cursor_moved_by_backend": False,
+                "keyboard_focus_changed_by_backend": False,
+                "workspace_changed_by_backend": False,
+            },
+        )
+
     def test_shortcut_checks_safety_before_dispatch(self) -> None:
         events: list[str] = []
+        snapshot = {
+            "active_address": "0xphysical",
+            "workspace": 1,
+            "cursor": {"x": 10, "y": 20},
+        }
 
         def safe() -> dict[str, bool]:
             events.append("safe")
@@ -143,11 +206,52 @@ class SafetyProbeTests(TestCase):
             patch.object(server.coordination, "window_guard", return_value=nullcontext()),
             patch.object(server, "require_window_mutation_access", return_value=None),
             patch.object(server, "ensure_native_input_safe", side_effect=safe),
+            patch.object(server, "physical_snapshot", return_value=snapshot),
             patch.object(server, "run", side_effect=run),
         ):
-            server.call_tool("send_window_shortcut", {"address": "0x1", "key": "RETURN"})
+            result = server.send_window_shortcut(
+                {"address": "0x1", "key": "RETURN"}
+            )
 
         self.assertEqual(events, ["safe", "dispatch"])
+        self.assertEqual(
+            result,
+            {
+                "sent": True,
+                "address": "0x1",
+                "key": "RETURN",
+                "modifiers": "",
+                "focus_changed": False,
+                "pointer_moved": False,
+                "observed_physical_state_unchanged": True,
+                "physical_state_before": snapshot,
+                "physical_state_after": snapshot,
+                "cursor_moved_by_backend": False,
+                "keyboard_focus_changed_by_backend": False,
+                "workspace_changed_by_backend": False,
+            },
+        )
+
+    def test_shortcut_rejects_changed_physical_state(self) -> None:
+        before = {
+            "active_address": "0xphysical",
+            "workspace": 1,
+            "cursor": {"x": 10, "y": 20},
+        }
+        after = {**before, "cursor": {"x": 11, "y": 20}}
+        with (
+            patch.object(server, "hypr_windows", return_value=[{"address": "0x1"}]),
+            patch.object(server, "session_binding", return_value={}),
+            patch.object(server.coordination, "window_guard", return_value=nullcontext()),
+            patch.object(server, "require_window_mutation_access", return_value=None),
+            patch.object(server, "ensure_native_input_safe"),
+            patch.object(server, "physical_snapshot", side_effect=(before, after)),
+            patch.object(server, "run", return_value=completed([], "ok")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cursor_moved_by_backend"):
+                server.call_tool(
+                    "send_window_shortcut", {"address": "0x1", "key": "RETURN"}
+                )
 
     def test_lease_checks_safety_before_reading_desktop_state(self) -> None:
         window = {"address": "0x1", "workspace": 1, "size": [100, 100]}

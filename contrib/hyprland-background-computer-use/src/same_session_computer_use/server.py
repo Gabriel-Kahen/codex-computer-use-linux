@@ -846,6 +846,31 @@ def physical_snapshot() -> dict[str, Any]:
     return {"active_address": hypr_json(["activewindow"]).get("address"), "workspace": hypr_json(["activeworkspace"]).get("id"), "cursor": hypr_json(["cursorpos"])}
 
 
+def verified_physical_state(
+    action: str, before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    changes = {
+        "cursor_moved_by_backend": before.get("cursor") != after.get("cursor"),
+        "keyboard_focus_changed_by_backend": before.get("active_address")
+        != after.get("active_address"),
+        "workspace_changed_by_backend": before.get("workspace")
+        != after.get("workspace"),
+    }
+    if any(changes.values()):
+        raise RuntimeError(
+            f"{action} did not preserve physical desktop state: "
+            f"changes={json.dumps(changes, sort_keys=True)}; "
+            f"before={json.dumps(before, sort_keys=True)}; "
+            f"after={json.dumps(after, sort_keys=True)}"
+        )
+    return {
+        "observed_physical_state_unchanged": True,
+        "physical_state_before": before,
+        "physical_state_after": after,
+        **changes,
+    }
+
+
 def validate_point(window: dict[str, Any], x: float, y: float) -> None:
     size = window.get("size") or []
     if len(size) != 2 or not (0 <= x < float(size[0]) and 0 <= y < float(size[1])):
@@ -1062,8 +1087,12 @@ def _targeted_pointer(
 
     if isinstance(result, dict) and result.get("ok") is False: raise RuntimeError(str(result.get("error") or "targeted pointer action failed"))
     after = physical_snapshot()
-    unchanged = after == before
-    return {"action": action, "window": bounded_window(window), "result": result, "observed_physical_state_unchanged": unchanged, "physical_state_before": before, "physical_state_after": after, "cursor_moved_by_backend": False, "keyboard_focus_changed_by_backend": False, "workspace_changed_by_backend": False}
+    return {
+        "action": action,
+        "window": bounded_window(window),
+        "result": result,
+        **verified_physical_state(f"targeted pointer {action}", before, after),
+    }
 
 
 def targeted_pointer(
@@ -1215,6 +1244,7 @@ def send_window_shortcut(
             )
             try:
                 ensure_native_input_safe()
+                before = physical_snapshot()
                 proc = run(
                     [
                         "hyprctl",
@@ -1228,6 +1258,7 @@ def send_window_shortcut(
                         or proc.stdout.strip()
                         or "targeted shortcut failed"
                     )
+                after = physical_snapshot()
                 result = {
                     "sent": True,
                     "address": address,
@@ -1235,6 +1266,9 @@ def send_window_shortcut(
                     "modifiers": modifiers,
                     "focus_changed": False,
                     "pointer_moved": False,
+                    **verified_physical_state(
+                        "targeted shortcut", before, after
+                    ),
                 }
             except Exception:
                 finish_claimed_window_access(
