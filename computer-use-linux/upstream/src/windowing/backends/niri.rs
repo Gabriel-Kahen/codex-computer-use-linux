@@ -5,9 +5,25 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::process::Command;
 
+use super::{niri_capture, niri_ipc};
+
 pub const NIRI_BACKEND: &str = "niri";
 
 pub fn probe() -> BackendProbe {
+    if let Ok(windows) = niri_ipc::cached_windows() {
+        return BackendProbe {
+            id: NIRI_BACKEND,
+            ok: true,
+            can_list_windows: true,
+            can_focus_apps: true,
+            can_focus_windows: true,
+            detail: with_capture_detail(format!(
+                "Niri IPC event stream returned an initial snapshot with {} window(s)",
+                windows.len()
+            )),
+        };
+    }
+
     match niri_output(&["msg", "--json", "windows"]) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -22,7 +38,7 @@ pub fn probe() -> BackendProbe {
                 can_focus_apps: ok,
                 can_focus_windows: ok,
                 detail: if ok {
-                    "niri msg --json windows returned a JSON array".to_string()
+                    with_capture_detail("niri msg --json windows returned a JSON array".to_string())
                 } else {
                     "niri msg --json windows did not return a JSON array".to_string()
                 },
@@ -47,7 +63,16 @@ pub fn probe() -> BackendProbe {
     }
 }
 
+fn with_capture_detail(window_detail: String) -> String {
+    let capture = niri_capture::exact_capture_support();
+    format!("{window_detail}. {}", capture.detail)
+}
+
 pub fn list_windows() -> Result<Vec<WindowInfo>> {
+    if let Ok(records) = niri_ipc::cached_windows() {
+        return windows_from_records(records);
+    }
+
     let output = niri_output(&["msg", "--json", "windows"])
         .context("failed to run niri msg --json windows")?;
     if !output.status.success() {
@@ -63,6 +88,10 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
 pub(crate) fn parse_niri_windows(json: &str) -> Result<Vec<WindowInfo>> {
     let records: Vec<NiriWindow> =
         serde_json::from_str(json).context("failed to parse niri msg --json windows output")?;
+    windows_from_records(records)
+}
+
+fn windows_from_records(records: Vec<NiriWindow>) -> Result<Vec<WindowInfo>> {
     let mut windows = records
         .into_iter()
         .map(WindowInfo::from)
@@ -73,6 +102,10 @@ pub(crate) fn parse_niri_windows(json: &str) -> Result<Vec<WindowInfo>> {
 }
 
 pub fn activate_window(window_id: u64) -> Result<()> {
+    if niri_ipc::focus_window(window_id).is_ok() {
+        return Ok(());
+    }
+
     let args = niri_focus_args(window_id);
     let output = niri_output(&args.iter().map(String::as_str).collect::<Vec<_>>())
         .with_context(|| format!("failed to focus Niri window {window_id}"))?;
@@ -109,21 +142,21 @@ fn command_failure_detail(output: &std::process::Output) -> String {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct NiriWindow {
-    id: u64,
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct NiriWindow {
+    pub(super) id: u64,
     title: Option<String>,
     app_id: Option<String>,
     pid: Option<i64>,
     workspace_id: Option<u64>,
     #[serde(default)]
-    is_focused: bool,
-    layout: Option<NiriWindowLayout>,
+    pub(super) is_focused: bool,
+    pub(super) layout: Option<NiriWindowLayout>,
 }
 
-#[derive(Debug, Deserialize)]
-struct NiriWindowLayout {
-    window_size: Option<[i64; 2]>,
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct NiriWindowLayout {
+    pub(super) window_size: Option<[i64; 2]>,
 }
 
 impl From<NiriWindow> for WindowInfo {

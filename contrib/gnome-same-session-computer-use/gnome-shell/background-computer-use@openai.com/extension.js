@@ -14,16 +14,27 @@ import {
     renewLeaseAsync,
 } from './lease_dbus.js';
 import {
+    actAndCaptureTransaction,
     activateLeaseTransaction,
     assertInputSafe,
+    captureMinimizedWindowTransaction,
     injectKeyTransaction,
     injectPointerTransaction,
     restoreLeaseTransaction,
 } from './shell_transactions.js';
+import {
+    bridgeInfo,
+    CONTRACT_FILENAME,
+    operationIdentity,
+    parseBridgeContract,
+    stableWindowId,
+} from './gnome_shell_bridge_contract.js';
 
 const BUS_NAME = 'org.gnome.Shell.Extensions.BackgroundComputerUse';
 const OBJECT_PATH = '/org/gnome/Shell/Extensions/BackgroundComputerUse';
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 6;
+const MAX_CAPTURE_BYTES = 5 * 1024 * 1024;
+const MAX_CAPTURE_PIXELS = 7680 * 4320;
 const XML = `<node>
   <interface name="org.gnome.Shell.Extensions.BackgroundComputerUse">
     <method name="Status"><arg type="s" direction="out"/></method>
@@ -36,8 +47,13 @@ const XML = `<node>
     <method name="RecoverLease"><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="InjectPointer"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="InjectKeys"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="CaptureWindow"><arg type="s" direction="in"/><arg type="ay" direction="out"/><arg type="s" direction="out"/></method>
+    <method name="CaptureMinimizedWindow"><arg type="s" direction="in"/><arg type="ay" direction="out"/><arg type="s" direction="out"/></method>
+    <method name="ActAndCapture"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="ay" direction="out"/><arg type="s" direction="out"/></method>
   </interface>
 </node>`;
+
+Gio._promisify(Shell.Screenshot, 'composite_to_stream');
 
 function json(value) {
     return JSON.stringify(value);
@@ -45,6 +61,8 @@ function json(value) {
 
 export default class BackgroundComputerUseExtension extends Extension {
     enable() {
+        const [, contents] = this.dir.get_child(CONTRACT_FILENAME).load_contents(null);
+        this._bridgeContract = parseBridgeContract(new TextDecoder().decode(contents));
         this._tracker = Shell.WindowTracker.get_default();
         this._seat = Clutter.get_default_backend().get_default_seat();
         this._pointer = this._seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
@@ -52,6 +70,7 @@ export default class BackgroundComputerUseExtension extends Extension {
         this._protocol = new LeaseProtocol();
         this._shellInstance = GLib.uuid_string_random();
         this._leaseExpiryId = null;
+        this._captureActive = false;
         this._object = Gio.DBusExportedObject.wrapJSObject(XML, this);
         this._object.export(Gio.DBus.session, OBJECT_PATH);
         this._owner = Gio.bus_own_name_on_connection(
@@ -77,8 +96,10 @@ export default class BackgroundComputerUseExtension extends Extension {
         this._tracker = null;
         this._protocol?.clear();
         this._protocol = null;
+        this._bridgeContract = null;
         this._shellInstance = null;
         this._leaseExpiryId = null;
+        this._captureActive = false;
     }
 
     _windows() {
@@ -88,7 +109,7 @@ export default class BackgroundComputerUseExtension extends Extension {
     }
 
     _id(window) {
-        return String(window.get_stable_sequence());
+        return stableWindowId(window);
     }
 
     _find(id) {
@@ -179,7 +200,18 @@ export default class BackgroundComputerUseExtension extends Extension {
     Status() {
         return json({
             protocol_version: PROTOCOL_VERSION,
-            capabilities: ['claimed_focus_leases'],
+            capabilities: [
+                'claimed_focus_leases',
+                'window_actor_capture',
+                'act_and_capture',
+                'bridge_contract_v1',
+                'fresh_minimized_capture',
+            ],
+            bridge_contract: bridgeInfo(
+                this._bridgeContract,
+                'background-computer-use',
+                ['claimed-leases', 'window-actor-capture', 'act-and-capture', 'fresh-minimized-capture'],
+            ),
             shell_version: Config.PACKAGE_VERSION,
             locked: Main.sessionMode.isLocked,
             overview_visible: Main.overview.visible,
@@ -193,6 +225,237 @@ export default class BackgroundComputerUseExtension extends Extension {
 
     ListWindows() {
         return json(this._windows().map(window => this._window(window)));
+    }
+
+    CaptureWindowAsync([id], invocation) {
+        this._captureWindow(id)
+            .then(({bytes, metadata}) => {
+                invocation.return_value(new GLib.Variant('(ays)', [bytes, json(metadata)]));
+            })
+            .catch(error => {
+                invocation.return_dbus_error(
+                    `${BUS_NAME}.Error`, String(error.message ?? error));
+            });
+    }
+
+    async _captureWindow(id) {
+        if (Main.sessionMode.isLocked)
+            throw new Error('cannot capture a window while the GNOME session is locked');
+        if (this._captureActive)
+            throw new Error('another window capture is already in progress');
+
+        this._captureActive = true;
+        try {
+            return await this._captureMappedWindow(id);
+        } finally {
+            this._captureActive = false;
+        }
+    }
+
+    async _captureMappedWindow(id) {
+        const window = this._find(id);
+        if (window.minimized)
+            throw new Error(`window ${id} is minimized; refusing a potentially stale compositor buffer`);
+        const actor = window.get_compositor_private();
+        if (!actor || actor.is_destroyed())
+            throw new Error(`window ${id} has no live compositor actor`);
+
+        const content = actor.paint_to_content(null);
+        if (!content)
+            throw new Error(`window ${id} has no capturable compositor content`);
+        const texture = content.get_texture();
+        if (!texture)
+            throw new Error(`window ${id} has no capturable compositor texture`);
+        const width = texture.get_width();
+        const height = texture.get_height();
+        if (width <= 0 || height <= 0 || width * height > MAX_CAPTURE_PIXELS)
+            throw new Error(`window ${id} capture dimensions are outside the supported bounds`);
+
+        const stream = Gio.MemoryOutputStream.new_resizable();
+        await Shell.Screenshot.composite_to_stream(
+            texture,
+            0, 0, -1, -1,
+            1,
+            null, 0, 0, 1,
+            stream,
+        );
+        stream.close(null);
+        const bytes = stream.steal_as_bytes().get_data();
+        if (bytes.length > MAX_CAPTURE_BYTES)
+            throw new Error(`captured PNG exceeds the ${MAX_CAPTURE_BYTES}-byte transport limit`);
+
+        const current = this._find(id);
+        if (current.get_compositor_private() !== actor || actor.is_destroyed())
+            throw new Error(`window ${id} changed while it was being captured`);
+        if (current.minimized)
+            throw new Error(`window ${id} became minimized while it was being captured`);
+        return {
+            bytes,
+            metadata: {
+                window: this._window(current),
+                screenshot_pixels: {width, height},
+                shell_instance: this._shellInstance,
+                source: 'meta-window-actor',
+                potentially_stale: false,
+                freshness: 'mapped-live-actor',
+                operation_identity: operationIdentity(
+                    this._bridgeContract,
+                    this._shellInstance,
+                    current,
+                    'capture',
+                ),
+            },
+        };
+    }
+
+    CaptureMinimizedWindowAsync([capability], invocation) {
+        this._captureMinimizedWindow(capability, invocation.get_sender())
+            .then(({bytes, metadata}) => {
+                invocation.return_value(new GLib.Variant('(ays)', [bytes, json(metadata)]));
+            })
+            .catch(error => {
+                invocation.return_dbus_error(
+                    `${BUS_NAME}.Error`, String(error.message ?? error));
+            });
+    }
+
+    async _captureMinimizedWindow(capability, sender) {
+        const lease = this._requireLease(capability, sender, 'pending');
+        if (!lease.targetMinimized)
+            throw new Error(`window ${lease.target} was not minimized when the transaction began`);
+        if (this._captureActive)
+            throw new Error('another window capture is already in progress');
+
+        this._captureActive = true;
+        try {
+            let unminimized = false;
+            const {captured, transaction} = await captureMinimizedWindowTransaction(lease.target, {
+                armWindowFrame: () => this._armWindowFrame(
+                    this._find(lease.target), 1000, () => unminimized),
+                activate: () => {
+                    this._assertInputSafe();
+                    const time = global.get_current_time();
+                    activateLeaseTransaction(lease, {
+                        findWindow: id => this._windows().find(window => this._id(window) === id) ?? null,
+                        workspaceForWindow: window => window.get_workspace(),
+                        markLeaseActive: () => this._protocol.activate(capability, sender),
+                        activateWorkspace: workspace => workspace.activate(time),
+                        unminimizeWindow: window => {
+                            unminimized = true;
+                            window.unminimize();
+                        },
+                        focusWindow: window => window.activate(time),
+                        state: () => this._state(),
+                    });
+                    this._cancelPendingExpiry();
+                },
+                capture: async () => {
+                    const captured = await this._captureMappedWindow(lease.target);
+                    captured.metadata.source = 'meta-window-actor-freshened';
+                    captured.metadata.freshness = 'client-damage-after-unminimize';
+                    captured.metadata.operation_identity = operationIdentity(
+                        this._bridgeContract,
+                        this._shellInstance,
+                        this._find(lease.target),
+                        'fresh-minimized-capture',
+                        lease.generation,
+                    );
+                    return captured;
+                },
+                restore: () => this._restoreLease(lease),
+                monotonicTimeUsec: () => GLib.get_monotonic_time(),
+            });
+            captured.metadata.window = this._window(this._find(lease.target));
+            captured.metadata.transaction = transaction;
+            return captured;
+        } finally {
+            this._captureActive = false;
+        }
+    }
+
+    _armWindowFrame(window, timeoutMs = 180, acceptDamage = () => true) {
+        const actor = window.get_compositor_private();
+        if (!actor || actor.is_destroyed()) {
+            return {
+                promise: Promise.resolve({reason: 'actor-unavailable'}),
+                cancel: () => {},
+            };
+        }
+
+        let cancel = null;
+        const promise = new Promise(resolve => {
+            let damageId = 0;
+            let destroyId = 0;
+            let afterPaintId = 0;
+            let timeoutId = 0;
+            const finish = reason => {
+                if (damageId)
+                    actor.disconnect(damageId);
+                if (destroyId)
+                    actor.disconnect(destroyId);
+                if (afterPaintId)
+                    global.stage.disconnect(afterPaintId);
+                if (timeoutId)
+                    GLib.source_remove(timeoutId);
+                damageId = 0;
+                destroyId = 0;
+                afterPaintId = 0;
+                timeoutId = 0;
+                resolve({reason});
+            };
+            cancel = () => finish('cancelled');
+            damageId = actor.connect('damaged', () => {
+                if (afterPaintId || !acceptDamage())
+                    return;
+                afterPaintId = global.stage.connect('after-paint', () => {
+                    finish('damaged-and-painted');
+                });
+                global.stage.queue_redraw();
+            });
+            destroyId = actor.connect('destroy', () => finish('actor-destroyed'));
+            timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, timeoutMs, () => {
+                timeoutId = 0;
+                finish('timeout');
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+        return {promise, cancel: () => cancel()};
+    }
+
+    ActAndCaptureAsync([capability, serialized], invocation) {
+        this._actAndCapture(capability, serialized, invocation.get_sender())
+            .then(({bytes, metadata}) => {
+                invocation.return_value(new GLib.Variant('(ays)', [bytes, json(metadata)]));
+            })
+            .catch(error => {
+                invocation.return_dbus_error(
+                    `${BUS_NAME}.Error`, String(error.message ?? error));
+            });
+    }
+
+    async _actAndCapture(capability, serialized, sender) {
+        const lease = this._requireLease(capability, sender, 'active');
+        const request = JSON.parse(serialized);
+        const {captured, transaction} = await actAndCaptureTransaction(request, {
+            armWindowFrame: () => this._armWindowFrame(this._find(lease.target)),
+            injectPointer: action => this._injectPointer(capability, json(action), sender),
+            injectKeys: action => this._injectKeys(capability, json(action), sender),
+            capture: async () => {
+                const captured = await this._captureWindow(lease.target);
+                captured.metadata.operation_identity = operationIdentity(
+                    this._bridgeContract,
+                    this._shellInstance,
+                    this._find(lease.target),
+                    'act-and-capture',
+                    lease.generation,
+                );
+                return captured;
+            },
+            restore: () => this._restoreLease(lease),
+            monotonicTimeUsec: () => GLib.get_monotonic_time(),
+        });
+        captured.metadata.transaction = transaction;
+        return captured;
     }
 
     BeginLeaseAsync([id], invocation) {
@@ -217,12 +480,14 @@ export default class BackgroundComputerUseExtension extends Extension {
         this._assertInputSafe();
         const window = this._find(id);
         const capability = `${GLib.uuid_string_random()}${GLib.uuid_string_random()}`;
+        const generation = `${GLib.uuid_string_random()}${GLib.uuid_string_random()}`;
         const lease = this._protocol.begin({
             capability,
             owner,
             target: id,
             targetMinimized: Boolean(window.minimized),
             original: this._state(),
+            generation,
             recoveryDeadlineUsec,
         });
         this._leaseExpiryId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 30, () => {
@@ -232,6 +497,7 @@ export default class BackgroundComputerUseExtension extends Extension {
         });
         return {
             capability,
+            lease_generation: generation,
             phase: 'pending',
             target: this._window(window),
             original: lease.original,

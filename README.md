@@ -73,7 +73,7 @@ application APIs such as browser automation, D-Bus, or OBS WebSocket.
 | [GNOME](./contrib/gnome-same-session-computer-use/)        | **No**                       | **Application-dependent** | **No**                   | **No**                 |
 | [KDE Plasma](./contrib/plasma-same-session-computer-use/)  | **Yes**                      | **Application-dependent** | **No**                   | **No**                 |
 | [Generic X11/EWMH](./contrib/x11-background-computer-use/) | **Usually**                  | **Application-dependent** | **Best effort**          | **No reliable path**   |
-| Niri                                                       | **No dedicated path**        | **Application-dependent** | **No dedicated path**    | **No dedicated path**  |
+| Niri                                                       | **Yes, with GStreamer**       | **Application-dependent** | **No dedicated path**    | **No dedicated path**  |
 | COSMIC Wayland                                             | **No dedicated path**        | **Application-dependent** | **No dedicated path**    | **No dedicated path**  |
 | i3                                                         | **No dedicated path**        | **Application-dependent** | **No dedicated path**    | **No dedicated path**  |
 
@@ -99,7 +99,15 @@ In practical terms:
   lease focuses the target and restores desktop, focus, pointer, and minimized
   state. Exact capture requires a mapped window; minimized windows must first
   be restored.
-- **Niri, COSMIC, and i3** provide window discovery, focus, accessibility, and
+- **Niri** can capture one inactive window through its compositor ScreenCast
+  service, keyed to the same stable window ID returned by IPC. The optional
+  path needs GStreamer's PipeWire, base, and good plugins and fails closed if
+  the target disappears or changes identity; it never substitutes the desktop.
+  Niri's screencast block-out rules are honored and may return black pixels.
+  Current Niri IPC exposes no minimized-window state, so no additional
+  minimized-window guarantee is claimed. Input still uses the shared generic
+  engine.
+- **COSMIC and i3** provide window discovery, focus, accessibility, and
   shared input through the generic engine, without the stronger per-window
   background-control and recovery guarantees of the companion integrations.
   Compatible i3/EWMH sessions may instead use the X11 companion.
@@ -116,8 +124,12 @@ In practical terms:
   engine also provides basic KWin window discovery and focus on Plasma 5 and 6.
 - **Generic X11/EWMH:** intended for Xorg desktops such as Xfce, Cinnamon,
   MATE, LXQt/Openbox, and legacy GNOME or KDE sessions.
-- **Niri:** requires `NIRI_SOCKET` and working `niri msg` access.
-- **COSMIC Wayland:** uses the bundled `computer-use-linux-cosmic` helper.
+- **Niri:** requires `NIRI_SOCKET`; `niri msg` is used only when the direct IPC
+  event-stream or action path is unavailable. Exact inactive capture requires
+  Niri's ScreenCast service plus `gst-launch-1.0` with `pipewiresrc`,
+  `videoconvert`, and `pngenc`.
+- **COSMIC Wayland:** uses the bundled persistent `computer-use-linux-cosmic`
+  helper, with automatic restart and a compatible one-shot fallback.
 - **i3:** requires `i3-msg`; `xprop` adds process details when available.
 
 Real behavior depends on the portal, accessibility, compositor, and input
