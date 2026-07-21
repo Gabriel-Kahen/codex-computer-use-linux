@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import call
 from unittest.mock import patch
 
 from same_session_computer_use import coordination, server
@@ -578,18 +579,56 @@ class ParallelBackendTests(TestCase):
         with (
             patch.object(server, "resolve_window", return_value=window),
             patch.object(server, "require_window_access", return_value=claim),
-            patch.object(server, "capture_result", return_value={"captured": True}),
+            patch.object(server, "capture_result", return_value={"captured": True}) as capture,
             patch.object(server, "finish_claimed_window_access") as finish,
         ):
-            result = server.call_tool(
+            legacy_result = server.call_tool(
                 "capture_session_window",
-                {"window": "0x1", "claim_token": "claim-token"},
+                {
+                    "window": "0x1",
+                    "claim_token": "claim-token",
+                    "save_path": "/tmp/legacy-capture.png",
+                },
+                "owner-a",
+            )
+            save_result = server.call_tool(
+                "save_session_window_capture",
+                {
+                    "window": "0x1",
+                    "claim_token": "claim-token",
+                    "save_path": "/tmp/new-capture.png",
+                },
                 "owner-a",
             )
 
-        self.assertEqual(result, {"captured": True})
-        finish.assert_called_once_with(
-            BINDING, window, "owner-a", claim, renew=True
+        self.assertEqual((legacy_result, save_result), ({"captured": True},) * 2)
+        self.assertEqual(
+            capture.call_args_list,
+            [
+                call(
+                    {
+                        "window": "0x1",
+                        "claim_token": "claim-token",
+                        "save_path": "/tmp/legacy-capture.png",
+                    },
+                    selected=window,
+                ),
+                call(
+                    {
+                        "window": "0x1",
+                        "claim_token": "claim-token",
+                        "save_path": "/tmp/new-capture.png",
+                    },
+                    selected=window,
+                ),
+            ],
+        )
+        self.assertEqual(
+            finish.call_args_list,
+            [
+                call(BINDING, window, "owner-a", claim, renew=True),
+                call(BINDING, window, "owner-a", claim, renew=True),
+            ],
         )
 
     def test_capture_call_tool_does_not_renew_claim_after_failure(self) -> None:
@@ -605,7 +644,7 @@ class ParallelBackendTests(TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "capture failed"):
                 server.call_tool(
-                    "capture_session_window",
+                    "get_session_window_capture",
                     {"window": "0x1", "claim_token": "claim-token"},
                     "owner-a",
                 )

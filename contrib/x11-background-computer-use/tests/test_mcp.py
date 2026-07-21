@@ -36,7 +36,7 @@ class McpSmokeTests(TestCase):
         self.assertIn("AT-SPI", responses[1]["result"]["instructions"])
         tools = responses[2]["result"]["tools"]
         names = [tool["name"] for tool in tools]
-        self.assertEqual(len(names), 14)
+        self.assertEqual(len(names), 16)
         self.assertEqual(len(names), len(set(names)))
         self.assertLessEqual(
             {"claim_session_window", "release_session_window", "list_window_claims"},
@@ -69,6 +69,8 @@ class McpSmokeTests(TestCase):
             {
                 "release_session_window",
                 "capture_session_window",
+                "get_session_window_capture",
+                "save_session_window_capture",
                 "send_window_shortcut",
                 "begin_input_lease",
                 "lease_key",
@@ -77,6 +79,27 @@ class McpSmokeTests(TestCase):
                 "lease_pointer_drag",
                 "end_input_lease",
             },
+        )
+        by_name = {tool["name"]: tool for tool in tools}
+        self.assertIn(
+            "save_path",
+            by_name["capture_session_window"]["inputSchema"]["properties"],
+        )
+        self.assertTrue(
+            by_name["capture_session_window"]["annotations"]["destructiveHint"]
+        )
+        self.assertNotIn(
+            "save_path",
+            by_name["get_session_window_capture"]["inputSchema"]["properties"],
+        )
+        self.assertTrue(
+            by_name["get_session_window_capture"]["annotations"]["readOnlyHint"]
+        )
+        self.assertTrue(
+            by_name["save_session_window_capture"]["annotations"]["destructiveHint"]
+        )
+        self.assertFalse(
+            by_name["save_session_window_capture"]["annotations"]["idempotentHint"]
         )
         self.assertEqual(responses[3]["result"], {})
         for tool in tools:

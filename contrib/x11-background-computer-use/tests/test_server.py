@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest import TestCase
+from unittest.mock import call
 from unittest.mock import Mock
 from unittest.mock import patch
 
@@ -457,7 +458,7 @@ class LeaseTests(TestCase):
         fingerprint = {"display": ":42", "socket_inode": 123}
         target = ({"xid": "0x20"}, {"xid": "0x20", "pid": 20})
         store = Mock(unsafe=True)
-        store.window_guard.return_value = contextlib.nullcontext()
+        store.window_guard.side_effect = lambda _identity: contextlib.nullcontext()
         with (
             patch.object(
                 server,
@@ -1083,6 +1084,13 @@ class StatusTests(TestCase):
 
 
 class McpErrorTests(TestCase):
+    def test_read_only_capture_rejects_save_path(self) -> None:
+        with self.assertRaisesRegex(ValueError, "save_session_window_capture"):
+            server.call_tool(
+                "get_session_window_capture",
+                {"window": "App", "save_path": "/tmp/capture.png"},
+            )
+
     def test_initialize_echoes_known_protocol_versions(self) -> None:
         for version in ("2024-11-05", "2025-03-26", "2025-06-18", server.PROTOCOL_VERSION):
             with self.subTest(version=version):
@@ -1105,11 +1113,43 @@ class McpErrorTests(TestCase):
         store.window_guard.return_value = contextlib.nullcontext()
         store.assert_access.return_value = None
         with patch.object(server, "ensure_session", return_value={"session": "same"}), patch.object(server, "_resolve_target", return_value=(window, identity)) as resolve, patch.object(server, "_identity_matches", return_value=server.IdentityMatch.MATCH), patch.object(server, "_claim_store", return_value=store), patch.object(server, "capture_window", return_value=expected) as capture_window:
-            result = server.call_tool("capture_session_window", {"window": "App", "save_path": None})
+            legacy_result = server.call_tool(
+                "capture_session_window",
+                {"window": "App", "save_path": "/tmp/legacy-capture.png"},
+            )
+            save_result = server.call_tool(
+                "save_session_window_capture",
+                {"window": "App", "save_path": "/tmp/new-capture.png"},
+            )
+
+        self.assertEqual((legacy_result, save_result), (expected, expected))
+        self.assertEqual(resolve.call_args_list, [call("App"), call("App")])
+        self.assertEqual(
+            store.assert_access.call_args_list,
+            [
+                call(f"mcp-process:{os.getpid()}", identity, None, mark_inflight=True),
+                call(f"mcp-process:{os.getpid()}", identity, None, mark_inflight=True),
+            ],
+        )
+        self.assertEqual(
+            capture_window.call_args_list,
+            [
+                call(window, "/tmp/legacy-capture.png"),
+                call(window, "/tmp/new-capture.png"),
+            ],
+        )
+
+    def test_read_only_capture_routes_without_a_save_path(self) -> None:
+        window = {"xid": "0x20"}
+        identity = {"xid": "0x20", "pid": 20}
+        expected = {"content": [], "isError": False}
+        store = Mock(unsafe=True)
+        store.window_guard.return_value = contextlib.nullcontext()
+        store.assert_access.return_value = None
+        with patch.object(server, "ensure_session", return_value={"session": "same"}), patch.object(server, "_resolve_target", return_value=(window, identity)), patch.object(server, "_identity_matches", return_value=server.IdentityMatch.MATCH), patch.object(server, "_claim_store", return_value=store), patch.object(server, "capture_window", return_value=expected) as capture_window:
+            result = server.call_tool("get_session_window_capture", {"window": "App"})
 
         self.assertEqual(result, expected)
-        resolve.assert_called_once_with("App")
-        store.assert_access.assert_called_once_with(f"mcp-process:{os.getpid()}", identity, None, mark_inflight=True)
         capture_window.assert_called_once_with(window, None)
 
     def test_window_listing_is_paginated(self) -> None:

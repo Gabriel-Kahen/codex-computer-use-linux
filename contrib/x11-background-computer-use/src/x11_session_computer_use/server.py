@@ -112,7 +112,7 @@ def _jsonrpc_error(request_id: Any, code: int, message: Any) -> dict[str, Any]:
     return bounded if _serialized_size(bounded) <= MAX_ERROR_RESULT_BYTES else response("error response exceeded its size limit", None)
 
 
-def tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None, *, read_only: bool = False, idempotent: bool = False) -> dict[str, Any]:
+def tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None, *, read_only: bool = False, idempotent: bool = False, open_world: bool | None = None) -> dict[str, Any]:
     schema: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         schema["required"] = required
@@ -124,7 +124,7 @@ def tool(name: str, description: str, properties: dict[str, Any], required: list
             "readOnlyHint": read_only,
             "destructiveHint": not read_only,
             "idempotentHint": idempotent,
-            "openWorldHint": not read_only,
+            "openWorldHint": not read_only if open_world is None else open_world,
         },
     }
 
@@ -145,7 +145,9 @@ TOOLS = [
     tool("claim_session_window", "Claim one live window for this Codex agent's observe-act-verify cycle. Different windows remain available to other agents; a same-window claim is exclusive and expiring.", {**WINDOW, "lease_seconds": {"type": "integer", "minimum": MIN_LEASE_SECONDS, "maximum": MAX_LEASE_SECONDS, "default": DEFAULT_LEASE_SECONDS}}, ["window"]),
     tool("release_session_window", "Release this Codex agent's live window claim unless an unfinished input lease still reserves that window.", CLAIM_TOKEN, ["claim_token"], idempotent=True),
     tool("list_window_claims", "List active, session-bound window claims after pruning expired agent ownership.", {}, read_only=True, idempotent=True),
-    tool("capture_session_window", "Capture the compositor's exact unobscured pixmap for one mapped X11 window without focusing it, changing desktops, or moving the pointer.", {**WINDOW, **CLAIM_TOKEN, "save_path": {"type": ["string", "null"]}}, ["window"], idempotent=True),
+    tool("capture_session_window", "Deprecated compatibility tool. Capture one exact X11 window and optionally write save_path. Prefer get_session_window_capture for inline capture or save_session_window_capture for writes.", {**WINDOW, **CLAIM_TOKEN, "save_path": {"type": ["string", "null"]}}, ["window"], idempotent=True),
+    tool("get_session_window_capture", "Return an inline PNG of the compositor's exact unobscured pixmap for one mapped X11 window without focusing it, changing desktops, moving the pointer, or creating a caller-selected file.", {**WINDOW, **CLAIM_TOKEN}, ["window"], read_only=True, idempotent=True),
+    tool("save_session_window_capture", "Capture one mapped X11 window and atomically create or replace an absolute PNG path. Also returns the PNG inline.", {**WINDOW, **CLAIM_TOKEN, "save_path": {"type": "string", "minLength": 1, "maxLength": 4096}}, ["window", "save_path"], open_world=False),
     tool("send_window_shortcut", "Best-effort no-focus XSendEvent shortcut delivery. Many modern clients reject synthetic events; use an acknowledged input lease when reliable delivery is required.", {**WINDOW, **CLAIM_TOKEN, "key": {"type": "string", "minLength": 1, "maxLength": MAX_SHORTCUT_KEY_CHARS}, "modifiers": {"type": "string", "maxLength": MAX_SHORTCUT_MODIFIERS_CHARS, "default": ""}}, ["window", "key"]),
     tool("begin_input_lease", "Begin an explicit journaled focus/pointer lease bound to an existing or implicit window claim, snapshotting the active desktop, focus, pointer, and target minimized state for restoration.", {**WINDOW, **CLAIM_TOKEN, "acknowledge_interference": {"type": "boolean"}}, ["window", "acknowledge_interference"]),
     tool("lease_key", "Send a reliable key or shortcut while the acknowledged target input lease is active.", {**TOKEN, **CLAIM_TOKEN, "key": {"type": "string", "minLength": 1, "maxLength": MAX_SHORTCUT_KEY_CHARS}, "modifiers": {"type": "string", "maxLength": MAX_SHORTCUT_MODIFIERS_CHARS, "default": ""}}, ["lease_token", "key"]),
@@ -1212,7 +1214,17 @@ def call_tool(
                 break
             claims.append(claim)
         return text_result({"claims": claims, "truncated": len(claims) < len(active)})
-    if name == "capture_session_window":
+    if name in {"capture_session_window", "get_session_window_capture", "save_session_window_capture"}:
+        if name == "get_session_window_capture" and arguments.get("save_path") not in (None, ""):
+            raise ValueError(
+                "get_session_window_capture does not accept save_path; use save_session_window_capture to write a PNG"
+            )
+        if name == "save_session_window_capture" and (
+            not isinstance(arguments.get("save_path"), str)
+            or not arguments["save_path"]
+            or len(arguments["save_path"]) > 4096
+        ):
+            raise ValueError("save_path must be a non-empty string of at most 4096 characters")
         window, identity, session_fingerprint = _resolve_bound_target(str(arguments["window"]))
         store = _claim_store(session_fingerprint)
         with store.window_guard(identity):
