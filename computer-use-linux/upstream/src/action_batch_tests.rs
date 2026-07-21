@@ -214,6 +214,49 @@ async fn stops_after_a_middle_failure_and_reports_completed_actions() {
 }
 
 #[tokio::test]
+async fn prefix_results_preserve_absolute_failure_indices() {
+    let prefix = vec![bounded_output("click", true, "native click")];
+    let actions = vec![
+        BatchAction::TypeText {
+            text: "hello".to_string(),
+        },
+        BatchAction::PressKey {
+            key: "Enter".to_string(),
+        },
+    ];
+    let calls = RefCell::new(Vec::new());
+    let outputs = RefCell::new(VecDeque::from([
+        action_output(false, "failed"),
+        action_output(true, "must not run"),
+    ]));
+
+    let result =
+        execute_action_batch_with_prefix(batch(actions.clone()), prefix, |action, window_id| {
+            calls.borrow_mut().push((window_id, action));
+            ready(BatchActionRun::Completed(
+                outputs.borrow_mut().pop_front().unwrap(),
+            ))
+        })
+        .await;
+
+    assert_eq!(calls.into_inner(), vec![(42, actions[0].clone())]);
+    assert_eq!(outputs.into_inner().len(), 1);
+    assert_eq!(
+        result,
+        ActionBatchOutput {
+            ok: false,
+            completed: 1,
+            failed_at: Some(1),
+            results: vec![
+                bounded_output("click", true, "native click"),
+                bounded_output("type_text", false, "failed"),
+            ],
+            error: Some("Action 1 failed; later actions were not attempted.".to_string()),
+        }
+    );
+}
+
+#[tokio::test]
 async fn stops_before_enter_when_text_landing_feedback_warns() {
     let actions = vec![
         BatchAction::TypeText {

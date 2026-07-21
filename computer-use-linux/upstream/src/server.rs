@@ -2,9 +2,9 @@ use crate::accessibility_snapshot::{
     AccessibilitySnapshot, AccessibilitySnapshotStore, AccessibilitySnapshotTarget,
 };
 use crate::action_batch::{
-    bounded_action_result_message, execute_action_batch, ActionBatchOutput, ActionBatchParams,
-    ActionOutput, BatchAction, BatchActionRun, BatchClick, NON_EDITABLE_TEXT_LANDING_WARNING,
-    NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING,
+    bounded_action_result_message, execute_action_batch_with_prefix, ActionBatchOutput,
+    ActionBatchParams, ActionOutput, BatchAction, BatchActionRun, BatchClick,
+    NON_EDITABLE_TEXT_LANDING_WARNING, NO_FOCUSED_ELEMENT_TEXT_LANDING_WARNING,
 };
 use crate::atspi_tree::{
     focused_element_summary, list_accessible_apps, perform_action_by_identity, set_element_value,
@@ -15,6 +15,9 @@ use crate::claim_coordination::{acquire_mutation_guards, ClaimContext, Coordinat
 use crate::desktop_transaction::DesktopTransaction;
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
+use crate::hyprland_native_batch::{
+    run_native_pointer_batch, NativeBatchOutcome, NativePointerAction, NativePointerBatch,
+};
 use crate::input_policy::PointerInputOverrides;
 use crate::observation::{
     prepare_visual_captures, AdaptiveObservationMetadata, ObservationMode, ObservationRegion,
@@ -3143,10 +3146,32 @@ impl TypeTextParams {
 impl ComputerUseLinux {
     async fn execute_validated_action_batch_unlocked(
         &self,
-        params: ActionBatchParams,
+        mut params: ActionBatchParams,
     ) -> ActionBatchOutput {
         let claim = params.claim.clone();
-        execute_action_batch(params, |action, window_id| {
+        let mut prefix = Vec::new();
+        if let Some(batch) = self.native_hyprland_pointer_prefix(&params).await {
+            match run_native_pointer_batch(batch).await {
+                NativeBatchOutcome::Completed => {
+                    params.actions.remove(0);
+                    prefix.push(ActionOutput {
+                        ok: true,
+                        implemented: true,
+                        action: "click".to_string(),
+                        message: "Action sent through one identity-bound Hyprland compositor transaction without moving focus or the physical pointer.".to_string(),
+                        received: None,
+                    });
+                }
+                NativeBatchOutcome::Unavailable(_) => {}
+                NativeBatchOutcome::Refused(message) => {
+                    return native_batch_error(message, false);
+                }
+                NativeBatchOutcome::SubmittedFailure(message) => {
+                    return native_batch_error(message, true);
+                }
+            }
+        }
+        execute_action_batch_with_prefix(params, prefix, |action, window_id| {
             let claim = claim.clone();
             async move {
                 match action {
@@ -3181,6 +3206,64 @@ impl ComputerUseLinux {
             }
         })
         .await
+    }
+
+    async fn native_hyprland_pointer_prefix(
+        &self,
+        params: &ActionBatchParams,
+    ) -> Option<NativePointerBatch> {
+        if env::var("HYPRLAND_INSTANCE_SIGNATURE")
+            .ok()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return None;
+        }
+        let BatchAction::Click(click) = params.actions.first()? else {
+            return None;
+        };
+        let (x, y) = click.x.zip(click.y)?;
+        let button = click
+            .button
+            .as_deref()
+            .unwrap_or("left")
+            .to_ascii_lowercase();
+        let count = click.click_count.unwrap_or(1);
+        if !matches!(button.as_str(), "left" | "right" | "middle") || count > 3 {
+            return None;
+        }
+        let target = WindowTarget {
+            window_id: Some(params.window_id),
+            ..Default::default()
+        };
+        let windows = list_windows().await.ok()?;
+        let window = resolve_window_target(&windows, &target).ok()?;
+        if window.backend != registry::HYPRLAND_BACKEND
+            || window.client_type.as_deref() != Some("wayland")
+        {
+            return None;
+        }
+        let bounds = window.bounds.as_ref()?;
+        let (local_x, local_y) = if click.relative == Some(true) {
+            (x, y)
+        } else {
+            (x.checked_sub(bounds.x?)?, y.checked_sub(bounds.y?)?)
+        };
+        if local_x < 0
+            || local_y < 0
+            || u32::try_from(local_x).ok()? >= bounds.width
+            || u32::try_from(local_y).ok()? >= bounds.height
+        {
+            return None;
+        }
+        Some(NativePointerBatch {
+            window_id: params.window_id,
+            actions: vec![NativePointerAction::Click {
+                x: f64::from(local_x),
+                y: f64::from(local_y),
+                button,
+                count,
+            }],
+        })
     }
 
     fn validate_action_batch(&self, params: &ActionBatchParams) -> Result<(), String> {
@@ -4438,6 +4521,28 @@ fn bounded_screenshot_error(error: impl std::fmt::Display) -> String {
         bounded.push('…');
     }
     bounded
+}
+
+fn native_batch_error(message: String, may_have_been_submitted: bool) -> ActionBatchOutput {
+    let replay = if may_have_been_submitted {
+        "The compositor may have received input, so the click was not replayed through another backend."
+    } else {
+        "The native plugin identity or ABI was rejected before input submission; no fallback was attempted."
+    };
+    let message = bounded_action_result_message(&format!("{message} {replay}"));
+    ActionBatchOutput {
+        ok: false,
+        completed: 0,
+        failed_at: Some(0),
+        results: vec![ActionOutput {
+            ok: false,
+            implemented: true,
+            action: "click".to_string(),
+            message: message.clone(),
+            received: None,
+        }],
+        error: Some(message),
+    }
 }
 
 fn session_is_wayland(session_type: Option<&str>, wayland_display: Option<&str>) -> bool {

@@ -10,6 +10,7 @@ mod desktop_transaction;
 #[path = "diagnostics.rs"]
 mod diagnostics_impl;
 mod gnome_extension;
+mod hyprland_native_batch;
 mod identity;
 mod input_policy;
 mod observation;

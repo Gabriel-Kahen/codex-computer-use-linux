@@ -115,6 +115,18 @@ impl ActionBatchOutput {
 
 pub(crate) async fn execute_action_batch<F, Fut>(
     params: ActionBatchParams,
+    run_action: F,
+) -> ActionBatchOutput
+where
+    F: FnMut(BatchAction, u64) -> Fut,
+    Fut: Future<Output = BatchActionRun>,
+{
+    execute_action_batch_with_prefix(params, Vec::new(), run_action).await
+}
+
+pub(crate) async fn execute_action_batch_with_prefix<F, Fut>(
+    params: ActionBatchParams,
+    mut results: Vec<ActionOutput>,
     mut run_action: F,
 ) -> ActionBatchOutput
 where
@@ -122,8 +134,10 @@ where
     Fut: Future<Output = BatchActionRun>,
 {
     let window_id = params.window_id;
-    let mut results = Vec::with_capacity(params.actions.len());
+    let start_index = results.len();
+    results.reserve(params.actions.len());
     for (index, action) in params.actions.into_iter().enumerate() {
+        let index = start_index + index;
         let action_name = match &action {
             BatchAction::Click(_) => "click",
             BatchAction::TypeText { .. } => "type_text",
@@ -149,7 +163,7 @@ where
             };
             return ActionBatchOutput {
                 ok: false,
-                completed: index,
+                completed: results.len() - 1,
                 failed_at: Some(index),
                 results,
                 error: Some(error),

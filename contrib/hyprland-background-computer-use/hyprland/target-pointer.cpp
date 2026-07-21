@@ -46,6 +46,14 @@ struct ParsedRequest {
     int         amount = 1;
 };
 
+struct ParsedBatch {
+    std::string               identity;
+    uintptr_t                 address = 0;
+    std::vector<ParsedRequest> actions;
+};
+
+constexpr int BATCH_PROTOCOL_VERSION = 1;
+
 struct PhysicalState {
     uintptr_t address = 0;
     int64_t   workspace = WORKSPACE_INVALID;
@@ -167,6 +175,77 @@ bool parseRequest(const std::string& request, ParsedRequest& parsed, std::string
     return true;
 }
 
+bool parseBatchRequest(const std::string& request, ParsedBatch& parsed, std::string& error) {
+    auto args = words(request);
+    if (!args.empty() && args.front() == "cutargetbatch") args.erase(args.begin());
+    if (args.size() < 5 || args[0] != "v1" || !parseAddress(args[2], parsed.address)) {
+        error = "usage: cutargetbatch v1 IDENTITY ADDRESS COUNT ACTION...";
+        return false;
+    }
+    parsed.identity = args[1];
+    int count = 0;
+    if (!parseInt(args[3], count) || count < 1 || count > 8) {
+        error = "batch action count must be between 1 and 8";
+        return false;
+    }
+    size_t offset = 4;
+    for (int index = 0; index < count; ++index) {
+        if (offset >= args.size()) {
+            error = "batch ended before its declared action count";
+            return false;
+        }
+        ParsedRequest action;
+        action.action = args[offset++];
+        action.identity = parsed.identity;
+        action.address = parsed.address;
+        const auto require = [&](size_t fields) { return offset + fields <= args.size(); };
+        if (action.action == "click") {
+            if (!require(4) || !parseDouble(args[offset], action.x1) || !parseDouble(args[offset + 1], action.y1) ||
+                !parseInt(args[offset + 3], action.amount)) {
+                error = "batch click expects X Y BUTTON COUNT";
+                return false;
+            }
+            action.button = args[offset + 2];
+            offset += 4;
+            if (action.amount < 1 || action.amount > 3 ||
+                (action.button != "left" && action.button != "right" && action.button != "middle")) {
+                error = "batch click button or count is outside supported bounds";
+                return false;
+            }
+        } else if (action.action == "scroll") {
+            if (!require(3) || !parseDouble(args[offset], action.x1) || !parseDouble(args[offset + 1], action.y1) ||
+                !parseInt(args[offset + 2], action.amount) || action.amount == 0 || std::abs(action.amount) > 20) {
+                error = "batch scroll expects X Y STEPS";
+                return false;
+            }
+            offset += 3;
+        } else if (action.action == "drag") {
+            if (!require(6) || !parseDouble(args[offset], action.x1) || !parseDouble(args[offset + 1], action.y1) ||
+                !parseDouble(args[offset + 2], action.x2) || !parseDouble(args[offset + 3], action.y2) ||
+                !parseInt(args[offset + 5], action.amount)) {
+                error = "batch drag expects START_X START_Y END_X END_Y BUTTON MOTION_STEPS";
+                return false;
+            }
+            action.button = args[offset + 4];
+            offset += 6;
+            if (action.amount < 2 || action.amount > 32 ||
+                (action.button != "left" && action.button != "right" && action.button != "middle")) {
+                error = "batch drag button or motion step count is outside supported bounds";
+                return false;
+            }
+        } else {
+            error = "unknown batch action; expected click, scroll, or drag";
+            return false;
+        }
+        parsed.actions.push_back(std::move(action));
+    }
+    if (offset != args.size()) {
+        error = "batch contains trailing fields after its declared actions";
+        return false;
+    }
+    return true;
+}
+
 PhysicalState physicalState() {
     PhysicalState state;
     const auto    focus = Desktop::focusState();
@@ -263,6 +342,43 @@ void ensureSafeToInject(PHLWINDOW window) {
     if (PROTO::data && PROTO::data->dndActive()) throw std::runtime_error("a drag-and-drop operation is active");
 }
 
+TargetPoint injectPointerAction(const ParsedRequest& parsed, PHLWINDOW window) {
+    const auto now = static_cast<uint32_t>(Time::millis(Time::steadyNow()));
+    const auto start = resolveTarget(window, parsed.x1, parsed.y1, parsed.action == "drag");
+    g_pSeatManager->setPointerFocus(start.surface, start.local);
+    g_pSeatManager->sendPointerMotion(now, start.local);
+    g_pSeatManager->sendPointerFrame();
+
+    if (parsed.action == "click") {
+        const auto button = buttonCode(parsed.button);
+        for (int i = 0; i < parsed.amount; ++i) {
+            g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_PRESSED);
+            g_pSeatManager->sendPointerFrame();
+            g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_RELEASED);
+            g_pSeatManager->sendPointerFrame();
+        }
+    } else if (parsed.action == "scroll") {
+        const auto value120 = parsed.amount * 120;
+        g_pSeatManager->sendPointerAxis(now, WL_POINTER_AXIS_VERTICAL_SCROLL, static_cast<double>(parsed.amount) * 15.0,
+                                        parsed.amount, value120, WL_POINTER_AXIS_SOURCE_WHEEL,
+                                        WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+        g_pSeatManager->sendPointerFrame();
+    } else if (parsed.action == "drag") {
+        const auto button = buttonCode(parsed.button);
+        g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_PRESSED);
+        g_pSeatManager->sendPointerFrame();
+        for (int i = 1; i <= parsed.amount; ++i) {
+            const double t = static_cast<double>(i) / parsed.amount;
+            const Vector2D local{parsed.x1 + (parsed.x2 - parsed.x1) * t, parsed.y1 + (parsed.y2 - parsed.y1) * t};
+            g_pSeatManager->sendPointerMotion(now, local);
+            g_pSeatManager->sendPointerFrame();
+        }
+        g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_RELEASED);
+        g_pSeatManager->sendPointerFrame();
+    }
+    return start;
+}
+
 std::string handleStatus(eHyprCtlOutputFormat, std::string) {
     const bool pointerSeat = g_pSeatManager && g_pSeatManager->m_mouse;
     const bool inputManager = static_cast<bool>(g_pInputManager);
@@ -273,9 +389,9 @@ std::string handleStatus(eHyprCtlOutputFormat, std::string) {
     const bool dndActive = PROTO::data && PROTO::data->dndActive();
     const bool safe = pointerSeat && inputManager && !sessionLocked && !heldButtons && !pointerConstrained && !pointerLocked && !dndActive;
     return std::format(
-        "{{\"ok\":true,\"plugin_version\":\"{}\",\"source_sha256\":\"{}\",\"hyprland_build_sha256\":\"{}\",\"hyprland_build_abi\":\"{}\",\"hyprland_runtime_abi\":\"{}\",\"safe_to_inject\":{},\"pointer_seat\":{},\"session_locked\":{},\"held_buttons\":{},\"pointer_constrained\":{},\"pointer_locked\":{},\"dnd_active\":{}}}",
-        CU_PLUGIN_VERSION, CU_SOURCE_SHA256, CU_HYPRLAND_BUILD_SHA256, __hyprland_api_get_client_hash(), __hyprland_api_get_hash(), safe,
-        pointerSeat, sessionLocked, heldButtons, pointerConstrained, pointerLocked, dndActive);
+        "{{\"ok\":true,\"plugin_version\":\"{}\",\"source_sha256\":\"{}\",\"hyprland_build_sha256\":\"{}\",\"hyprland_build_abi\":\"{}\",\"hyprland_runtime_abi\":\"{}\",\"batch_protocol_version\":{},\"identity_token\":\"{}\",\"safe_to_inject\":{},\"pointer_seat\":{},\"session_locked\":{},\"held_buttons\":{},\"pointer_constrained\":{},\"pointer_locked\":{},\"dnd_active\":{}}}",
+        CU_PLUGIN_VERSION, CU_SOURCE_SHA256, CU_HYPRLAND_BUILD_SHA256, __hyprland_api_get_client_hash(), __hyprland_api_get_hash(),
+        BATCH_PROTOCOL_VERSION, identityToken(), safe, pointerSeat, sessionLocked, heldButtons, pointerConstrained, pointerLocked, dndActive);
 }
 
 std::string handleRequest(eHyprCtlOutputFormat, std::string request) {
@@ -297,39 +413,7 @@ std::string handleRequest(eHyprCtlOutputFormat, std::string request) {
         TargetPoint start;
         {
             PointerFocusRestore restore;
-            const auto now = static_cast<uint32_t>(Time::millis(Time::steadyNow()));
-            start = resolveTarget(window, parsed.x1, parsed.y1, parsed.action == "drag");
-            g_pSeatManager->setPointerFocus(start.surface, start.local);
-            g_pSeatManager->sendPointerMotion(now, start.local);
-            g_pSeatManager->sendPointerFrame();
-
-            if (parsed.action == "click") {
-                const auto button = buttonCode(parsed.button);
-                for (int i = 0; i < parsed.amount; ++i) {
-                    g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_PRESSED);
-                    g_pSeatManager->sendPointerFrame();
-                    g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_RELEASED);
-                    g_pSeatManager->sendPointerFrame();
-                }
-            } else if (parsed.action == "scroll") {
-                const auto value120 = parsed.amount * 120;
-                g_pSeatManager->sendPointerAxis(now, WL_POINTER_AXIS_VERTICAL_SCROLL, static_cast<double>(parsed.amount) * 15.0,
-                                                parsed.amount, value120, WL_POINTER_AXIS_SOURCE_WHEEL,
-                                                WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
-                g_pSeatManager->sendPointerFrame();
-            } else if (parsed.action == "drag") {
-                const auto button = buttonCode(parsed.button);
-                g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_PRESSED);
-                g_pSeatManager->sendPointerFrame();
-                for (int i = 1; i <= parsed.amount; ++i) {
-                    const double t = static_cast<double>(i) / parsed.amount;
-                    const Vector2D local{parsed.x1 + (parsed.x2 - parsed.x1) * t, parsed.y1 + (parsed.y2 - parsed.y1) * t};
-                    g_pSeatManager->sendPointerMotion(now, local);
-                    g_pSeatManager->sendPointerFrame();
-                }
-                g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_RELEASED);
-                g_pSeatManager->sendPointerFrame();
-            }
+            start = injectPointerAction(parsed, window);
         }
 
         const auto after = physicalState();
@@ -337,6 +421,40 @@ std::string handleRequest(eHyprCtlOutputFormat, std::string request) {
             before.cursor.y != after.cursor.y)
             return physicalStateError(parsed, before, after);
         return jsonOk(parsed, start.local, start.kind, before, after);
+    } catch (const std::exception& exception) { return jsonError(exception.what()); }
+}
+
+std::string handleBatchRequest(eHyprCtlOutputFormat, std::string request) {
+    try {
+        ParsedBatch parsed;
+        std::string error;
+        if (!parseBatchRequest(request, parsed, error)) return jsonError(error);
+        if (parsed.identity != identityToken()) return jsonError("native input transaction identity does not match this broker");
+        if (std::string{__hyprland_api_get_client_hash()} != std::string{__hyprland_api_get_hash()})
+            return jsonError("native input transaction Hyprland ABI does not match the runtime");
+        const auto window = findWindow(parsed.address);
+        ensureSafeToInject(window);
+        if (window->m_isX11) throw std::runtime_error("XWayland targets are not supported by the native batch ABI");
+
+        for (const auto& action : parsed.actions) {
+            resolveTarget(window, action.x1, action.y1, action.action == "drag");
+            if (action.action == "drag") resolveTarget(window, action.x2, action.y2, true);
+        }
+
+        const auto before = physicalState();
+        {
+            PointerFocusRestore restore;
+            for (const auto& action : parsed.actions) injectPointerAction(action, window);
+        }
+        const auto after = physicalState();
+        if (before.address != after.address || before.workspace != after.workspace || before.cursor.x != after.cursor.x ||
+            before.cursor.y != after.cursor.y)
+            return jsonError(std::format("targeted pointer batch did not preserve physical desktop state: before={}; after={}",
+                                         physicalStateJson(before), physicalStateJson(after)));
+        return std::format(
+            "{{\"ok\":true,\"batch_protocol_version\":{},\"identity\":{},\"address\":\"0x{:x}\",\"completed\":{},\"observed_physical_state_unchanged\":true,\"physical_state_before\":{},\"physical_state_after\":{}}}",
+            BATCH_PROTOCOL_VERSION, identityJson(), parsed.address, parsed.actions.size(), physicalStateJson(before),
+            physicalStateJson(after));
     } catch (const std::exception& exception) { return jsonError(exception.what()); }
 }
 
@@ -354,6 +472,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     const auto command = HyprlandAPI::registerHyprCtlCommand(
         PHANDLE, SHyprCtlCommand{.name = "cutarget", .exact = false, .fn = handleRequest});
     if (!command) throw std::runtime_error("same-session-target-pointer: failed to register cutarget command");
+
+    const auto batchCommand = HyprlandAPI::registerHyprCtlCommand(
+        PHANDLE, SHyprCtlCommand{.name = "cutargetbatch", .exact = false, .fn = handleBatchRequest});
+    if (!batchCommand) throw std::runtime_error("same-session-target-pointer: failed to register cutargetbatch command");
 
     const auto statusCommand = HyprlandAPI::registerHyprCtlCommand(
         PHANDLE, SHyprCtlCommand{.name = "cutargetstatus", .exact = true, .fn = handleStatus});

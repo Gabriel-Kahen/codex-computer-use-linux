@@ -306,6 +306,33 @@ def main() -> int:
                 raise RuntimeError("targeted click changed nested compositor state")
             assert_event(target_events, "click")
 
+            plugin_status = hypr_json(inner, "cutargetstatus")
+            batch_result = hypr_json(
+                inner,
+                "cutargetbatch",
+                "v1",
+                plugin_status["identity_token"],
+                target["address"],
+                "1",
+                "click",
+                str(size[0] / 2),
+                str(size[1] / 2),
+                "left",
+                "1",
+            )
+            if (
+                batch_result.get("ok") is not True
+                or batch_result.get("batch_protocol_version") != 1
+                or batch_result.get("completed") != 1
+                or batch_result.get("observed_physical_state_unchanged") is not True
+            ):
+                raise RuntimeError(f"native pointer batch failed: {batch_result}")
+            wait_for(
+                "batched click",
+                lambda: target_events.is_file()
+                and target_events.read_text().splitlines().count("click") >= 2,
+            )
+
             server.send_window_shortcut({"address": target["address"], "key": "x"})
             assert_event(target_events, "key:x")
             after = {
@@ -319,7 +346,7 @@ def main() -> int:
                 )
 
             print(
-                "real Hyprland capture, plugin load, targeted click, and targeted shortcut passed"
+                "real Hyprland capture, plugin load, targeted click, native batch, and targeted shortcut passed"
             )
             return 0
         except Exception:
