@@ -51,6 +51,16 @@ class FileGuardTests(TestCase):
 
 
 class PluginBuildTests(TestCase):
+    def test_batch_command_is_registered_before_legacy_prefix(self) -> None:
+        source = (
+            Path(native_plugin.__file__).resolve().parents[2]
+            / "hyprland/target-pointer.cpp"
+        ).read_text()
+
+        batch_registration = source.index('.name = "cutargetbatch"')
+        legacy_registration = source.index('.name = "cutarget"')
+        self.assertLess(batch_registration, legacy_registration)
+
     def test_builds_versioned_plugin_in_xdg_cache(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "plugin"
