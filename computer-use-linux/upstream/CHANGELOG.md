@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Niri window discovery now connects directly to `NIRI_SOCKET`, consumes the
+  compositor's complete initial event-stream state, and applies incremental
+  window, focus, close, and layout events without spawning `niri msg` for every
+  query. The client reconnects after compositor or socket replacement, sends
+  focus actions over direct IPC, and retains `niri msg` as a compatibility
+  fallback.
+
 ### Changed
 - **Breaking:** Element-targeted `scroll` calls now require the originating
   `observation_id` alongside `element_index`. Coordinate scrolls must provide

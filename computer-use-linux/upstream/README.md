@@ -115,7 +115,7 @@ Validated manually on Ubuntu 25.10 (GNOME Shell 50.1, Wayland). Other compositor
 | COSMIC Wayland | `computer-use-linux-cosmic` helper | Installed automatically by `./install.sh`, `cargo install`, and npm. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`. |
 | KDE Plasma / KWin | temporary KWin DBus scripting | Lists and focuses windows through `org.kde.KWin` scripting when the session bus exposes it. |
 | Hyprland | `hyprctl clients -j` and `hyprctl dispatch focuswindow` | Requires `hyprctl` in the desktop session. |
-| Niri | `niri msg --json windows` and `niri msg action focus-window` | Requires `NIRI_SOCKET` and the `niri` command from the active compositor session. |
+| Niri | direct `NIRI_SOCKET` event stream and actions; `niri msg` fallback | Uses Niri's complete event-stream snapshot and incremental updates without polling. The `niri` command is only required for compatibility fallback. |
 | i3 | `i3-msg`; optional `xprop` for PID hydration | Lists and focuses i3 windows over the active i3 IPC socket. |
 | Generic X11 / Xfce / other EWMH WMs | `wmctrl`; optional `xprop` for focus verification | Lists, focuses, moves, and resizes EWMH windows. Without `xprop`, listing still works but focused-window verification is unavailable. |
 <!-- END GENERATED BACKEND SUPPORT MATRIX -->

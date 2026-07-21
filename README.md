@@ -116,7 +116,8 @@ In practical terms:
   engine also provides basic KWin window discovery and focus on Plasma 5 and 6.
 - **Generic X11/EWMH:** intended for Xorg desktops such as Xfce, Cinnamon,
   MATE, LXQt/Openbox, and legacy GNOME or KDE sessions.
-- **Niri:** requires `NIRI_SOCKET` and working `niri msg` access.
+- **Niri:** requires `NIRI_SOCKET`; `niri msg` is used only when the direct IPC
+  event-stream or action path is unavailable.
 - **COSMIC Wayland:** uses the bundled `computer-use-linux-cosmic` helper.
 - **i3:** requires `i3-msg`; `xprop` adds process details when available.
 

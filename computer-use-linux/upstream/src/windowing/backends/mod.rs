@@ -4,4 +4,5 @@ pub mod hyprland;
 pub mod i3;
 pub mod kwin;
 pub mod niri;
+mod niri_ipc;
 pub mod x11;
