@@ -1,13 +1,37 @@
 use crate::terminal::enrich_terminal_windows;
+use crate::windowing::backends::i3_ipc::I3Ipc;
 use crate::windowing::registry::BackendProbe;
 use crate::windowing::types::{WindowBounds, WindowInfo};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::{env, fs, os::unix::fs::FileTypeExt, path::PathBuf, process::Command};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    os::unix::fs::FileTypeExt,
+    path::PathBuf,
+    process::Command,
+    sync::{Mutex, MutexGuard, OnceLock},
+    time::{Duration, Instant},
+};
 
 pub const I3_BACKEND: &str = "i3";
+const PID_MISS_TTL: Duration = Duration::from_secs(2);
 
 pub fn probe() -> BackendProbe {
+    if let Ok(detail) = with_persistent_session(PersistentI3::probe) {
+        return BackendProbe {
+            id: I3_BACKEND,
+            ok: true,
+            can_list_windows: true,
+            can_focus_apps: true,
+            can_focus_windows: true,
+            detail,
+        };
+    }
+    probe_with_i3_msg()
+}
+
+fn probe_with_i3_msg() -> BackendProbe {
     match i3_msg_command().args(["-t", "get_tree"]).output() {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -52,6 +76,13 @@ pub fn probe() -> BackendProbe {
 }
 
 pub fn list_windows() -> Result<Vec<WindowInfo>> {
+    if let Ok(windows) = with_persistent_session(PersistentI3::list_windows) {
+        return Ok(windows);
+    }
+    list_windows_with_i3_msg()
+}
+
+fn list_windows_with_i3_msg() -> Result<Vec<WindowInfo>> {
     let output = i3_msg_command()
         .args(["-t", "get_tree"])
         .output()
@@ -79,6 +110,13 @@ pub(crate) fn parse_i3_tree(json: &str) -> Result<Vec<WindowInfo>> {
 }
 
 pub fn activate_window(window_id: u64) -> Result<()> {
+    if with_persistent_session(|session| session.activate_window(window_id)).is_ok() {
+        return Ok(());
+    }
+    activate_window_with_i3_msg(window_id)
+}
+
+fn activate_window_with_i3_msg(window_id: u64) -> Result<()> {
     let selector = format!(r#"[id="0x{window_id:x}"] focus"#);
     let output = i3_msg_command()
         .arg(&selector)
@@ -91,9 +129,20 @@ pub fn activate_window(window_id: u64) -> Result<()> {
         );
     }
 
+    validate_command_reply(&selector, &output.stdout)
+}
+
+pub fn focused_window() -> Option<WindowInfo> {
+    likely_i3_session()
+        .then(|| with_persistent_session(PersistentI3::focused_window))
+        .and_then(Result::ok)
+        .flatten()
+}
+
+fn validate_command_reply(selector: &str, payload: &[u8]) -> Result<()> {
     let replies: Vec<I3CommandReply> =
-        serde_json::from_slice(&output.stdout).context("failed to parse i3-msg focus reply")?;
-    if replies.iter().all(|reply| reply.success) {
+        serde_json::from_slice(payload).context("failed to parse i3 focus reply")?;
+    if !replies.is_empty() && replies.iter().all(|reply| reply.success) {
         Ok(())
     } else {
         let details = replies
@@ -102,7 +151,7 @@ pub fn activate_window(window_id: u64) -> Result<()> {
             .collect::<Vec<_>>()
             .join("; ");
         bail!(
-            "i3-msg {selector} did not focus the window: {}",
+            "i3 command {selector} did not focus the window: {}",
             if details.is_empty() {
                 "unknown i3 failure"
             } else {
@@ -110,6 +159,133 @@ pub fn activate_window(window_id: u64) -> Result<()> {
             }
         );
     }
+}
+
+struct CachedWindows {
+    generation: u64,
+    windows: Vec<WindowInfo>,
+}
+
+struct CachedPid {
+    captured_at: Instant,
+    pid: Option<u32>,
+}
+
+struct PersistentI3 {
+    ipc: I3Ipc,
+    windows: Option<CachedWindows>,
+    pid_cache: HashMap<u64, CachedPid>,
+}
+
+impl PersistentI3 {
+    fn connect(socket_path: PathBuf) -> Result<Self> {
+        Ok(Self {
+            ipc: I3Ipc::connect(socket_path)?,
+            windows: None,
+            pid_cache: HashMap::new(),
+        })
+    }
+
+    fn probe(&mut self) -> Result<String> {
+        self.ipc.refresh_tree()?;
+        let tree = self.ipc.tree_payload()?;
+        if !matches!(
+            serde_json::from_slice::<serde_json::Value>(tree),
+            Ok(serde_json::Value::Object(_))
+        ) {
+            bail!("native i3 IPC get_tree did not return a JSON object");
+        }
+        Ok("persistent native i3 IPC connection and event subscription are available".to_string())
+    }
+
+    fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+        let generation = self.ipc.refresh_tree()?;
+        if let Some(cached) = self
+            .windows
+            .as_ref()
+            .filter(|cached| cached.generation == generation)
+        {
+            return Ok(cached.windows.clone());
+        }
+
+        let tree =
+            std::str::from_utf8(self.ipc.tree_payload()?).context("i3 IPC tree was not UTF-8")?;
+        let mut windows = parse_i3_tree(tree)?;
+        self.hydrate_window_pids(&mut windows);
+        enrich_terminal_windows(&mut windows);
+        self.windows = Some(CachedWindows {
+            generation,
+            windows: windows.clone(),
+        });
+        Ok(windows)
+    }
+
+    fn focused_window(&mut self) -> Result<Option<WindowInfo>> {
+        Ok(self
+            .list_windows()?
+            .into_iter()
+            .find(|window| window.focused))
+    }
+
+    fn activate_window(&mut self, window_id: u64) -> Result<()> {
+        let selector = format!(r#"[id="0x{window_id:x}"] focus"#);
+        let reply = self.ipc.command(&selector)?;
+        validate_command_reply(&selector, &reply)
+    }
+
+    fn hydrate_window_pids(&mut self, windows: &mut [WindowInfo]) {
+        let current_ids = windows
+            .iter()
+            .map(|window| window.window_id)
+            .collect::<HashSet<_>>();
+        self.pid_cache
+            .retain(|window_id, _| current_ids.contains(window_id));
+        for window in windows {
+            if window.pid.is_some() {
+                continue;
+            }
+            let now = Instant::now();
+            if let Some(cached) = self.pid_cache.get(&window.window_id).filter(|cached| {
+                cached.pid.is_some()
+                    || now.saturating_duration_since(cached.captured_at) < PID_MISS_TTL
+            }) {
+                window.pid = cached.pid;
+                continue;
+            }
+            window.pid = i3_window_pid(window.window_id);
+            self.pid_cache.insert(
+                window.window_id,
+                CachedPid {
+                    captured_at: now,
+                    pid: window.pid,
+                },
+            );
+        }
+    }
+}
+
+fn with_persistent_session<T>(operation: impl FnOnce(&mut PersistentI3) -> Result<T>) -> Result<T> {
+    let socket_path = i3_socket_path().context("could not locate the active i3 IPC socket")?;
+    let mut guard = persistent_session();
+    if guard
+        .as_ref()
+        .is_none_or(|session| !session.ipc.is_current_socket(&socket_path))
+    {
+        *guard = Some(PersistentI3::connect(socket_path)?);
+    }
+    let result = operation(guard.as_mut().expect("persistent i3 session initialized"));
+    if result.is_err() {
+        *guard = None;
+    }
+    result
+}
+
+fn persistent_session() -> MutexGuard<'static, Option<PersistentI3>> {
+    static SESSION: OnceLock<Mutex<Option<PersistentI3>>> = OnceLock::new();
+    SESSION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn collect_i3_windows(
@@ -198,6 +374,18 @@ fn i3_socket_path() -> Option<PathBuf> {
 
 fn xdg_runtime_dir() -> Option<PathBuf> {
     env_var("XDG_RUNTIME_DIR").map(PathBuf::from)
+}
+
+fn likely_i3_session() -> bool {
+    env_var("I3SOCK").is_some()
+        || ["XDG_CURRENT_DESKTOP", "DESKTOP_SESSION"]
+            .into_iter()
+            .filter_map(env_var)
+            .any(|value| {
+                value
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|component| component.eq_ignore_ascii_case("i3"))
+            })
 }
 
 fn env_var(name: &str) -> Option<String> {
