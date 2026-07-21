@@ -211,9 +211,11 @@ fn lock_state(shared: &SharedState) -> MutexGuard<'_, EventState> {
 }
 
 fn event_worker(socket_path: &Path, shared: &SharedState) {
+    mark_disconnected(shared);
     while !shared.stop.load(Ordering::Acquire) {
+        let result = consume_event_stream(socket_path, shared);
         mark_disconnected(shared);
-        if consume_event_stream(socket_path, shared).is_ok() {
+        if result.is_ok() {
             continue;
         }
         if shared.stop.load(Ordering::Acquire) {
