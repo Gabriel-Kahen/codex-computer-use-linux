@@ -17,11 +17,16 @@ use zbus::{
 const PORTAL_DESKTOP_SERVICE: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 const PORTAL_REMOTE_DESKTOP_INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
+const PORTAL_SCREEN_CAST_INTERFACE: &str = "org.freedesktop.portal.ScreenCast";
 const PORTAL_REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 const DEVICE_KEYBOARD: u32 = 1;
 const DEVICE_POINTER: u32 = 2;
+const SOURCE_MONITOR: u32 = 1;
+const BUTTON_LEFT: i32 = 272;
+const BUTTON_RIGHT: i32 = 273;
+const BUTTON_MIDDLE: i32 = 274;
 const PERSIST_MODE_EXPLICITLY_REVOKED: u32 = 2;
 const MAX_RESTORE_TOKEN_BYTES: usize = 4096;
 
@@ -36,6 +41,14 @@ pub struct PortalSession {
     connection: Connection,
     session_handle: OwnedObjectPath,
     devices: u32,
+    streams: Vec<PortalStream>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PortalStream {
+    node_id: u32,
+    position: (i32, i32),
+    size: (u32, u32),
 }
 
 impl PortalSession {
@@ -46,10 +59,30 @@ impl PortalSession {
     pub(crate) fn has_keyboard(&self) -> bool {
         self.devices & DEVICE_KEYBOARD != 0
     }
+
+    pub(crate) fn has_absolute_pointer_mapping(&self) -> bool {
+        !self.streams.is_empty()
+    }
+
+    fn map_desktop_point(&self, x: i32, y: i32) -> Result<(u32, f64, f64)> {
+        map_desktop_point(&self.streams, x, y)
+    }
 }
 
 pub type PortalPointerSession = PortalSession;
 pub type PortalKeyboardSession = PortalSession;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortalStreamMapping {
+    NotRequired,
+    Required,
+}
+
+impl PortalStreamMapping {
+    fn required(self) -> bool {
+        self == Self::Required
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum PortalActionError {
@@ -85,7 +118,7 @@ enum PortalPersistence<'a> {
     Enabled { restore_token: Option<&'a str> },
 }
 
-pub async fn start_portal_session() -> Result<PortalSession> {
+pub async fn start_portal_session(stream_mapping: PortalStreamMapping) -> Result<PortalSession> {
     hydrate_session_bus_env();
 
     let restore_store = if let Some(restore_path) = restore_token_path() {
@@ -110,6 +143,9 @@ pub async fn start_portal_session() -> Result<PortalSession> {
         },
         None => PortalPersistence::Disabled,
     };
+    if stream_mapping.required() {
+        select_monitor_sources(&connection, &session_handle, "rd_sources").await?;
+    }
     select_devices(
         &connection,
         &session_handle,
@@ -135,12 +171,13 @@ pub async fn start_portal_session() -> Result<PortalSession> {
         connection,
         session_handle,
         devices: started.devices,
+        streams: started.streams,
     })
 }
 
 #[allow(dead_code)]
 pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
-    let session = start_portal_session().await?;
+    let session = start_portal_session(PortalStreamMapping::Required).await?;
     if !session.has_pointer() {
         bail!("remote desktop portal session started without pointer access");
     }
@@ -149,7 +186,7 @@ pub async fn start_portal_pointer_session() -> Result<PortalPointerSession> {
 
 #[allow(dead_code)]
 pub async fn start_portal_keyboard_session() -> Result<PortalKeyboardSession> {
-    let session = start_portal_session().await?;
+    let session = start_portal_session(PortalStreamMapping::NotRequired).await?;
     if !session.has_keyboard() {
         bail!("remote desktop portal session started without keyboard access");
     }
@@ -180,16 +217,112 @@ pub async fn scroll(
         .await
         .map_err(PortalActionError::PreDispatch)?;
 
-    let (axis, steps) = match direction {
-        ScrollDirection::Up => (AXIS_VERTICAL, steps.max(1)),
-        ScrollDirection::Down => (AXIS_VERTICAL, -steps.max(1)),
-        ScrollDirection::Left => (AXIS_HORIZONTAL, steps.max(1)),
-        ScrollDirection::Right => (AXIS_HORIZONTAL, -steps.max(1)),
-    };
+    let (axis, steps) = scroll_axis_and_steps(direction, steps);
 
     notify_pointer_axis_discrete(&proxy, &session.session_handle, axis, steps)
         .await
         .map_err(PortalActionError::MayHaveDelivered)
+}
+
+pub async fn scroll_at(
+    session: &PortalPointerSession,
+    x: i32,
+    y: i32,
+    direction: ScrollDirection,
+    steps: i32,
+) -> std::result::Result<(), PortalActionError> {
+    let target = session
+        .map_desktop_point(x, y)
+        .map_err(PortalActionError::PreDispatch)?;
+    let proxy = remote_desktop_proxy(&session.connection)
+        .await
+        .map_err(PortalActionError::PreDispatch)?;
+    notify_pointer_motion_absolute(&proxy, &session.session_handle, target)
+        .await
+        .map_err(PortalActionError::MayHaveDelivered)?;
+    let (axis, steps) = scroll_axis_and_steps(direction, steps);
+    notify_pointer_axis_discrete(&proxy, &session.session_handle, axis, steps)
+        .await
+        .map_err(PortalActionError::MayHaveDelivered)
+}
+
+pub async fn click(
+    session: &PortalPointerSession,
+    x: i32,
+    y: i32,
+    button: Option<&str>,
+    count: u32,
+) -> std::result::Result<(), PortalActionError> {
+    let target = session
+        .map_desktop_point(x, y)
+        .map_err(PortalActionError::PreDispatch)?;
+    let button = portal_button_code(button).map_err(PortalActionError::PreDispatch)?;
+    let proxy = remote_desktop_proxy(&session.connection)
+        .await
+        .map_err(PortalActionError::PreDispatch)?;
+    notify_pointer_motion_absolute(&proxy, &session.session_handle, target)
+        .await
+        .map_err(PortalActionError::MayHaveDelivered)?;
+    for _ in 0..count.clamp(1, 10) {
+        if let Err(error) =
+            notify_pointer_button(&proxy, &session.session_handle, button, KEY_PRESSED).await
+        {
+            let _ =
+                notify_pointer_button(&proxy, &session.session_handle, button, KEY_RELEASED).await;
+            return Err(PortalActionError::MayHaveDelivered(error));
+        }
+        if let Err(error) =
+            notify_pointer_button(&proxy, &session.session_handle, button, KEY_RELEASED).await
+        {
+            let _ =
+                notify_pointer_button(&proxy, &session.session_handle, button, KEY_RELEASED).await;
+            return Err(PortalActionError::MayHaveDelivered(error));
+        }
+    }
+    Ok(())
+}
+
+fn scroll_axis_and_steps(direction: ScrollDirection, steps: i32) -> (u32, i32) {
+    match direction {
+        ScrollDirection::Up => (AXIS_VERTICAL, steps.max(1)),
+        ScrollDirection::Down => (AXIS_VERTICAL, -steps.max(1)),
+        ScrollDirection::Left => (AXIS_HORIZONTAL, steps.max(1)),
+        ScrollDirection::Right => (AXIS_HORIZONTAL, -steps.max(1)),
+    }
+}
+
+fn portal_button_code(button: Option<&str>) -> Result<i32> {
+    match button
+        .unwrap_or("left")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "left" | "primary" => Ok(BUTTON_LEFT),
+        "right" | "secondary" => Ok(BUTTON_RIGHT),
+        "middle" => Ok(BUTTON_MIDDLE),
+        value => bail!("unsupported portal pointer button {value:?}"),
+    }
+}
+
+fn map_desktop_point(streams: &[PortalStream], x: i32, y: i32) -> Result<(u32, f64, f64)> {
+    let stream = streams
+        .iter()
+        .find(|stream| {
+            let (left, top) = stream.position;
+            let right = i64::from(left) + i64::from(stream.size.0);
+            let bottom = i64::from(top) + i64::from(stream.size.1);
+            i64::from(x) >= i64::from(left)
+                && i64::from(y) >= i64::from(top)
+                && i64::from(x) < right
+                && i64::from(y) < bottom
+        })
+        .with_context(|| format!("desktop point {x},{y} is outside the selected portal streams"))?;
+    Ok((
+        stream.node_id,
+        f64::from(x - stream.position.0),
+        f64::from(y - stream.position.1),
+    ))
 }
 
 pub async fn type_text_with_keysyms(
@@ -301,9 +434,37 @@ async fn select_devices(
     Ok(())
 }
 
+async fn select_monitor_sources(
+    connection: &Connection,
+    session: &OwnedObjectPath,
+    request_prefix: &str,
+) -> Result<()> {
+    let screen_cast_proxy = screen_cast_proxy(connection).await?;
+    let (request_path, mut response_stream) =
+        portal_request_stream(connection, request_prefix).await?;
+    let mut options: HashMap<&str, Value<'_>> = HashMap::new();
+    options.insert(
+        "handle_token",
+        Value::from(last_path_component(&request_path)),
+    );
+    options.insert("types", Value::from(SOURCE_MONITOR));
+    options.insert("multiple", Value::from(true));
+    let handle: OwnedObjectPath = screen_cast_proxy
+        .call("SelectSources", &(session, options))
+        .await
+        .context("ScreenCast SelectSources call failed")?;
+    let (response_code, _) =
+        await_portal_response(connection, handle, &request_path, &mut response_stream).await?;
+    if response_code != 0 {
+        bail!("ScreenCast SelectSources denied or cancelled with response code {response_code}");
+    }
+    Ok(())
+}
+
 struct StartedSession {
     devices: u32,
     restore_token: Option<String>,
+    streams: Vec<PortalStream>,
 }
 
 async fn start_remote_desktop_session(
@@ -337,10 +498,39 @@ async fn start_remote_desktop_session(
         .and_then(|value| value.try_clone().ok())
         .and_then(|value| String::try_from(value).ok())
         .filter(|token| valid_restore_token(token));
+    let streams = results
+        .get("streams")
+        .and_then(|value| value.try_clone().ok())
+        .and_then(|value| Vec::<(u32, HashMap<String, OwnedValue>)>::try_from(value).ok())
+        .map(parse_portal_streams)
+        .unwrap_or_default();
     Ok(StartedSession {
         devices,
         restore_token,
+        streams,
     })
+}
+
+fn parse_portal_streams(streams: Vec<(u32, HashMap<String, OwnedValue>)>) -> Vec<PortalStream> {
+    streams
+        .into_iter()
+        .filter_map(|(node_id, properties)| {
+            let position = properties
+                .get("position")
+                .and_then(|value| value.try_clone().ok())
+                .and_then(|value| <(i32, i32)>::try_from(value).ok())?;
+            let size = properties
+                .get("size")
+                .and_then(|value| value.try_clone().ok())
+                .and_then(|value| <(i32, i32)>::try_from(value).ok())?;
+            let size = (u32::try_from(size.0).ok()?, u32::try_from(size.1).ok()?);
+            (size.0 > 0 && size.1 > 0).then_some(PortalStream {
+                node_id,
+                position,
+                size,
+            })
+        })
+        .collect()
 }
 
 async fn notify_pointer_axis_discrete(
@@ -357,6 +547,36 @@ async fn notify_pointer_axis_discrete(
         )
         .await
         .context("RemoteDesktop NotifyPointerAxisDiscrete failed")?;
+    Ok(())
+}
+
+async fn notify_pointer_motion_absolute(
+    proxy: &Proxy<'_>,
+    session: &OwnedObjectPath,
+    target: (u32, f64, f64),
+) -> Result<()> {
+    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    let _: () = proxy
+        .call(
+            "NotifyPointerMotionAbsolute",
+            &(session, options, target.0, target.1, target.2),
+        )
+        .await
+        .context("RemoteDesktop NotifyPointerMotionAbsolute failed")?;
+    Ok(())
+}
+
+async fn notify_pointer_button(
+    proxy: &Proxy<'_>,
+    session: &OwnedObjectPath,
+    button: i32,
+    state: u32,
+) -> Result<()> {
+    let options: HashMap<&str, Value<'_>> = HashMap::new();
+    let _: () = proxy
+        .call("NotifyPointerButton", &(session, options, button, state))
+        .await
+        .context("RemoteDesktop NotifyPointerButton failed")?;
     Ok(())
 }
 
@@ -397,6 +617,17 @@ async fn remote_desktop_proxy(connection: &Connection) -> Result<Proxy<'_>> {
     )
     .await
     .context("failed to create RemoteDesktop portal proxy")
+}
+
+async fn screen_cast_proxy(connection: &Connection) -> Result<Proxy<'_>> {
+    Proxy::new(
+        connection,
+        PORTAL_DESKTOP_SERVICE,
+        PORTAL_DESKTOP_PATH,
+        PORTAL_SCREEN_CAST_INTERFACE,
+    )
+    .await
+    .context("failed to create ScreenCast portal proxy")
 }
 
 async fn portal_request_stream<'a>(
@@ -703,5 +934,85 @@ mod tests {
         assert!(!valid_restore_token("bad\0token"));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn maps_logical_desktop_points_to_the_selected_monitor_stream() {
+        let streams = vec![
+            PortalStream {
+                node_id: 11,
+                position: (-1280, 0),
+                size: (1280, 1024),
+            },
+            PortalStream {
+                node_id: 22,
+                position: (0, 0),
+                size: (1920, 1080),
+            },
+            PortalStream {
+                node_id: 33,
+                position: (2048, 256),
+                size: (1024, 768),
+            },
+        ];
+
+        assert_eq!(
+            map_desktop_point(&streams, -1280, 0).unwrap(),
+            (11, 0.0, 0.0)
+        );
+        assert_eq!(
+            map_desktop_point(&streams, -1, 1023).unwrap(),
+            (11, 1279.0, 1023.0)
+        );
+        assert_eq!(
+            map_desktop_point(&streams, 1919, 1079).unwrap(),
+            (22, 1919.0, 1079.0)
+        );
+        assert_eq!(
+            map_desktop_point(&streams, 2048, 256).unwrap(),
+            (33, 0.0, 0.0)
+        );
+        assert!(map_desktop_point(&streams, 2000, 256).is_err());
+        assert!(map_desktop_point(&streams, 1920, 1080).is_err());
+    }
+
+    #[test]
+    fn portal_buttons_use_linux_input_event_codes() {
+        assert_eq!(portal_button_code(None).unwrap(), BUTTON_LEFT);
+        assert_eq!(portal_button_code(Some("right")).unwrap(), BUTTON_RIGHT);
+        assert_eq!(portal_button_code(Some("middle")).unwrap(), BUTTON_MIDDLE);
+        assert!(portal_button_code(Some("back")).is_err());
+    }
+
+    #[test]
+    fn parses_only_streams_with_complete_positive_geometry() {
+        let value = |pair: (i32, i32)| {
+            OwnedValue::try_from(Value::from(pair)).expect("tuple value should become owned")
+        };
+        let streams = parse_portal_streams(vec![
+            (
+                7,
+                HashMap::from([
+                    ("position".to_string(), value((-1920, 0))),
+                    ("size".to_string(), value((1920, 1080))),
+                ]),
+            ),
+            (
+                8,
+                HashMap::from([
+                    ("position".to_string(), value((0, 0))),
+                    ("size".to_string(), value((0, 1080))),
+                ]),
+            ),
+        ]);
+
+        assert_eq!(
+            streams,
+            vec![PortalStream {
+                node_id: 7,
+                position: (-1920, 0),
+                size: (1920, 1080),
+            }]
+        );
     }
 }
