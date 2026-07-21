@@ -1,5 +1,8 @@
 #include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
+#include <hyprland/src/helpers/Monitor.hpp>
 #include <hyprland/src/managers/PointerManager.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/SessionLockManager.hpp>
@@ -33,6 +36,7 @@ namespace {
 
 struct ParsedRequest {
     std::string action;
+    std::string identity;
     uintptr_t   address = 0;
     double      x1 = 0;
     double      y1 = 0;
@@ -40,6 +44,12 @@ struct ParsedRequest {
     double      y2 = 0;
     std::string button = "left";
     int         amount = 1;
+};
+
+struct PhysicalState {
+    uintptr_t address = 0;
+    int64_t   workspace = WORKSPACE_INVALID;
+    Vector2D  cursor;
 };
 
 std::string jsonError(const std::string& message) {
@@ -53,10 +63,28 @@ std::string jsonError(const std::string& message) {
     return std::format("{{\"ok\":false,\"error\":\"{}\"}}", escaped);
 }
 
-std::string jsonOk(const ParsedRequest& req, const Vector2D& local, const std::string& surfaceKind) {
+std::string identityToken() {
+    return std::format("v1.{}.{}.{}", CU_PLUGIN_VERSION, CU_SOURCE_SHA256, CU_HYPRLAND_BUILD_SHA256);
+}
+
+std::string identityJson() {
     return std::format(
-        "{{\"ok\":true,\"action\":\"{}\",\"address\":\"0x{:x}\",\"local_x\":{:.3f},\"local_y\":{:.3f},\"surface\":\"{}\",\"cursor_moved\":false,\"keyboard_focus_changed\":false}}",
-        req.action, req.address, local.x, local.y, surfaceKind);
+        "{{\"plugin_version\":\"{}\",\"source_sha256\":\"{}\",\"hyprland_build_sha256\":\"{}\",\"hyprland_build_abi\":\"{}\",\"hyprland_runtime_abi\":\"{}\"}}",
+        CU_PLUGIN_VERSION, CU_SOURCE_SHA256, CU_HYPRLAND_BUILD_SHA256, __hyprland_api_get_client_hash(), __hyprland_api_get_hash());
+}
+
+std::string physicalStateJson(const PhysicalState& state) {
+    const auto address = state.address == 0 ? std::string{"null"} : std::format("\"0x{:x}\"", state.address);
+    const auto workspace = state.workspace == WORKSPACE_INVALID ? std::string{"null"} : std::to_string(state.workspace);
+    return std::format("{{\"active_address\":{},\"workspace\":{},\"cursor\":{{\"x\":{},\"y\":{}}}}}", address, workspace,
+                       static_cast<int>(state.cursor.x), static_cast<int>(state.cursor.y));
+}
+
+std::string jsonOk(const ParsedRequest& req, const Vector2D& local, const std::string& surfaceKind, const PhysicalState& before,
+                   const PhysicalState& after) {
+    return std::format(
+        "{{\"ok\":true,\"identity\":{},\"action\":\"{}\",\"address\":\"0x{:x}\",\"local_x\":{:.3f},\"local_y\":{:.3f},\"surface\":\"{}\",\"cursor_moved\":false,\"keyboard_focus_changed\":false,\"observed_physical_state_unchanged\":true,\"physical_state_before\":{},\"physical_state_after\":{},\"cursor_moved_by_backend\":false,\"keyboard_focus_changed_by_backend\":false,\"workspace_changed_by_backend\":false}}",
+        identityJson(), req.action, req.address, local.x, local.y, surfaceKind, physicalStateJson(before), physicalStateJson(after));
 }
 
 bool parseAddress(const std::string& value, uintptr_t& output) {
@@ -90,39 +118,40 @@ std::vector<std::string> words(const std::string& request) {
 bool parseRequest(const std::string& request, ParsedRequest& parsed, std::string& error) {
     auto args = words(request);
     if (!args.empty() && args.front() == "cutarget") args.erase(args.begin());
-    if (args.size() < 4) {
-        error = "usage: cutarget click|scroll|drag ADDRESS X Y [options]";
+    if (args.size() < 5) {
+        error = "usage: cutarget click|scroll|drag IDENTITY ADDRESS X Y [options]";
         return false;
     }
     parsed.action = args[0];
-    if (!parseAddress(args[1], parsed.address) || !parseDouble(args[2], parsed.x1) || !parseDouble(args[3], parsed.y1)) {
+    parsed.identity = args[1];
+    if (!parseAddress(args[2], parsed.address) || !parseDouble(args[3], parsed.x1) || !parseDouble(args[4], parsed.y1)) {
         error = "invalid address or coordinate";
         return false;
     }
     if (parsed.action == "click") {
-        if (args.size() > 4) parsed.button = args[4];
-        if (args.size() > 5 && !parseInt(args[5], parsed.amount)) {
+        if (args.size() > 5) parsed.button = args[5];
+        if (args.size() > 6 && !parseInt(args[6], parsed.amount)) {
             error = "invalid click count";
             return false;
         }
-        if (args.size() > 6 || parsed.amount < 1 || parsed.amount > 3 ||
+        if (args.size() > 7 || parsed.amount < 1 || parsed.amount > 3 ||
             (parsed.button != "left" && parsed.button != "right" && parsed.button != "middle")) {
-            error = "click expects ADDRESS X Y [left|right|middle] [1..3]";
+            error = "click expects IDENTITY ADDRESS X Y [left|right|middle] [1..3]";
             return false;
         }
     } else if (parsed.action == "scroll") {
-        if (args.size() != 5 || !parseInt(args[4], parsed.amount) || parsed.amount == 0 || std::abs(parsed.amount) > 20) {
-            error = "scroll expects ADDRESS X Y STEPS (-20..20, excluding 0)";
+        if (args.size() != 6 || !parseInt(args[5], parsed.amount) || parsed.amount == 0 || std::abs(parsed.amount) > 20) {
+            error = "scroll expects IDENTITY ADDRESS X Y STEPS (-20..20, excluding 0)";
             return false;
         }
     } else if (parsed.action == "drag") {
-        if (args.size() < 6 || args.size() > 8 || !parseDouble(args[4], parsed.x2) || !parseDouble(args[5], parsed.y2)) {
-            error = "drag expects ADDRESS START_X START_Y END_X END_Y [left|right|middle] [2..32 motion steps]";
+        if (args.size() < 7 || args.size() > 9 || !parseDouble(args[5], parsed.x2) || !parseDouble(args[6], parsed.y2)) {
+            error = "drag expects IDENTITY ADDRESS START_X START_Y END_X END_Y [left|right|middle] [2..32 motion steps]";
             return false;
         }
-        if (args.size() > 6) parsed.button = args[6];
+        if (args.size() > 7) parsed.button = args[7];
         parsed.amount = 8;
-        if (args.size() > 7 && !parseInt(args[7], parsed.amount)) {
+        if (args.size() > 8 && !parseInt(args[8], parsed.amount)) {
             error = "invalid drag motion step count";
             return false;
         }
@@ -136,6 +165,28 @@ bool parseRequest(const std::string& request, ParsedRequest& parsed, std::string
         return false;
     }
     return true;
+}
+
+PhysicalState physicalState() {
+    PhysicalState state;
+    const auto    focus = Desktop::focusState();
+    if (focus) {
+        const auto window = focus->window();
+        if (Desktop::View::validMapped(window)) state.address = reinterpret_cast<uintptr_t>(window.get());
+        const auto monitor = focus->monitor();
+        if (monitor && valid(monitor->m_activeWorkspace)) state.workspace = monitor->m_activeWorkspace->m_id;
+    }
+    state.cursor = g_pInputManager->getMouseCoordsInternal().floor();
+    return state;
+}
+
+std::string physicalStateError(const ParsedRequest& request, const PhysicalState& before, const PhysicalState& after) {
+    const bool cursorChanged = before.cursor.x != after.cursor.x || before.cursor.y != after.cursor.y;
+    const bool focusChanged = before.address != after.address;
+    const bool workspaceChanged = before.workspace != after.workspace;
+    return jsonError(std::format(
+        "targeted pointer {} did not preserve physical desktop state: changes={{\"cursor_moved_by_backend\":{},\"keyboard_focus_changed_by_backend\":{},\"workspace_changed_by_backend\":{}}}; before={}; after={}",
+        request.action, cursorChanged, focusChanged, workspaceChanged, physicalStateJson(before), physicalStateJson(after)));
 }
 
 PHLWINDOW findWindow(uintptr_t address) {
@@ -209,6 +260,8 @@ void ensureSafeToInject(PHLWINDOW window) {
     if (g_pSessionLockManager && g_pSessionLockManager->isSessionLocked()) throw std::runtime_error("session is locked");
     if (g_pInputManager->hasHeldButtons()) throw std::runtime_error("physical pointer button is currently held");
     if (g_pInputManager->isConstrained() || g_pInputManager->isLocked()) throw std::runtime_error("physical pointer is constrained or locked");
+    if (g_pSeatManager->m_seatGrab && g_pSeatManager->m_seatGrab->m_pointer)
+        throw std::runtime_error("a pointer seat grab is active");
     if (PROTO::data && PROTO::data->dndActive()) throw std::runtime_error("a drag-and-drop operation is active");
 }
 
@@ -219,12 +272,14 @@ std::string handleStatus(eHyprCtlOutputFormat, std::string) {
     const bool heldButtons = inputManager && g_pInputManager->hasHeldButtons();
     const bool pointerConstrained = inputManager && g_pInputManager->isConstrained();
     const bool pointerLocked = inputManager && g_pInputManager->isLocked();
+    const bool pointerGrab = g_pSeatManager && g_pSeatManager->m_seatGrab && g_pSeatManager->m_seatGrab->m_pointer;
     const bool dndActive = PROTO::data && PROTO::data->dndActive();
-    const bool safe = pointerSeat && inputManager && !sessionLocked && !heldButtons && !pointerConstrained && !pointerLocked && !dndActive;
+    const bool safe =
+        pointerSeat && inputManager && !sessionLocked && !heldButtons && !pointerConstrained && !pointerLocked && !pointerGrab && !dndActive;
     return std::format(
-        "{{\"ok\":true,\"plugin_version\":\"{}\",\"source_sha256\":\"{}\",\"hyprland_build_sha256\":\"{}\",\"hyprland_build_abi\":\"{}\",\"hyprland_runtime_abi\":\"{}\",\"safe_to_inject\":{},\"pointer_seat\":{},\"session_locked\":{},\"held_buttons\":{},\"pointer_constrained\":{},\"pointer_locked\":{},\"dnd_active\":{}}}",
+        "{{\"ok\":true,\"plugin_version\":\"{}\",\"source_sha256\":\"{}\",\"hyprland_build_sha256\":\"{}\",\"hyprland_build_abi\":\"{}\",\"hyprland_runtime_abi\":\"{}\",\"safe_to_inject\":{},\"pointer_seat\":{},\"session_locked\":{},\"held_buttons\":{},\"pointer_constrained\":{},\"pointer_locked\":{},\"pointer_grab\":{},\"dnd_active\":{}}}",
         CU_PLUGIN_VERSION, CU_SOURCE_SHA256, CU_HYPRLAND_BUILD_SHA256, __hyprland_api_get_client_hash(), __hyprland_api_get_hash(), safe,
-        pointerSeat, sessionLocked, heldButtons, pointerConstrained, pointerLocked, dndActive);
+        pointerSeat, sessionLocked, heldButtons, pointerConstrained, pointerLocked, pointerGrab, dndActive);
 }
 
 std::string handleRequest(eHyprCtlOutputFormat, std::string request) {
@@ -232,6 +287,9 @@ std::string handleRequest(eHyprCtlOutputFormat, std::string request) {
         ParsedRequest parsed;
         std::string error;
         if (!parseRequest(request, parsed, error)) return jsonError(error);
+        if (parsed.identity != identityToken()) return jsonError("native input transaction identity does not match this broker");
+        if (std::string{__hyprland_api_get_client_hash()} != std::string{__hyprland_api_get_hash()})
+            return jsonError("native input transaction Hyprland ABI does not match the runtime");
         const auto window = findWindow(parsed.address);
         ensureSafeToInject(window);
 
@@ -239,45 +297,50 @@ std::string handleRequest(eHyprCtlOutputFormat, std::string request) {
 
         if (parsed.action == "drag") resolveTarget(window, parsed.x2, parsed.y2, true);
 
-        PointerFocusRestore restore;
-        const auto now = static_cast<uint32_t>(Time::millis(Time::steadyNow()));
-        auto start = resolveTarget(window, parsed.x1, parsed.y1, parsed.action == "drag");
-        g_pSeatManager->setPointerFocus(start.surface, start.local);
-        g_pSeatManager->sendPointerMotion(now, start.local);
-        g_pSeatManager->sendPointerFrame();
+        const auto before = physicalState();
+        TargetPoint start;
+        {
+            PointerFocusRestore restore;
+            const auto now = static_cast<uint32_t>(Time::millis(Time::steadyNow()));
+            start = resolveTarget(window, parsed.x1, parsed.y1, parsed.action == "drag");
+            g_pSeatManager->setPointerFocus(start.surface, start.local);
+            g_pSeatManager->sendPointerMotion(now, start.local);
+            g_pSeatManager->sendPointerFrame();
 
-        if (parsed.action == "click") {
-            const auto button = buttonCode(parsed.button);
-            for (int i = 0; i < parsed.amount; ++i) {
+            if (parsed.action == "click") {
+                const auto button = buttonCode(parsed.button);
+                for (int i = 0; i < parsed.amount; ++i) {
+                    g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_PRESSED);
+                    g_pSeatManager->sendPointerFrame();
+                    g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_RELEASED);
+                    g_pSeatManager->sendPointerFrame();
+                }
+            } else if (parsed.action == "scroll") {
+                const auto value120 = parsed.amount * 120;
+                g_pSeatManager->sendPointerAxis(now, WL_POINTER_AXIS_VERTICAL_SCROLL, static_cast<double>(parsed.amount) * 15.0,
+                                                parsed.amount, value120, WL_POINTER_AXIS_SOURCE_WHEEL,
+                                                WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+                g_pSeatManager->sendPointerFrame();
+            } else if (parsed.action == "drag") {
+                const auto button = buttonCode(parsed.button);
                 g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_PRESSED);
                 g_pSeatManager->sendPointerFrame();
+                for (int i = 1; i <= parsed.amount; ++i) {
+                    const double t = static_cast<double>(i) / parsed.amount;
+                    const Vector2D local{parsed.x1 + (parsed.x2 - parsed.x1) * t, parsed.y1 + (parsed.y2 - parsed.y1) * t};
+                    g_pSeatManager->sendPointerMotion(now, local);
+                    g_pSeatManager->sendPointerFrame();
+                }
                 g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_RELEASED);
                 g_pSeatManager->sendPointerFrame();
             }
-        } else if (parsed.action == "scroll") {
-            const auto value120 = parsed.amount * 120;
-            g_pSeatManager->sendPointerAxis(now, WL_POINTER_AXIS_VERTICAL_SCROLL, static_cast<double>(parsed.amount) * 15.0,
-                                            parsed.amount, value120, WL_POINTER_AXIS_SOURCE_WHEEL,
-                                            WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
-            g_pSeatManager->sendPointerFrame();
-        } else if (parsed.action == "drag") {
-            const auto button = buttonCode(parsed.button);
-            g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_PRESSED);
-            g_pSeatManager->sendPointerFrame();
-            for (int i = 1; i <= parsed.amount; ++i) {
-                const double t = static_cast<double>(i) / parsed.amount;
-                const Vector2D local{parsed.x1 + (parsed.x2 - parsed.x1) * t, parsed.y1 + (parsed.y2 - parsed.y1) * t};
-                const auto size = window->m_realSize->goal();
-                if (local.x < 0 || local.y < 0 || local.x >= size.x || local.y >= size.y)
-                    throw std::runtime_error("drag endpoint or path leaves the target window");
-                g_pSeatManager->sendPointerMotion(now, local);
-                g_pSeatManager->sendPointerFrame();
-            }
-            g_pSeatManager->sendPointerButton(now, button, WL_POINTER_BUTTON_STATE_RELEASED);
-            g_pSeatManager->sendPointerFrame();
         }
 
-        return jsonOk(parsed, start.local, start.kind);
+        const auto after = physicalState();
+        if (before.address != after.address || before.workspace != after.workspace || before.cursor.x != after.cursor.x ||
+            before.cursor.y != after.cursor.y)
+            return physicalStateError(parsed, before, after);
+        return jsonOk(parsed, start.local, start.kind, before, after);
     } catch (const std::exception& exception) { return jsonError(exception.what()); }
 }
 
