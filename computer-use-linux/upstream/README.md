@@ -39,7 +39,7 @@ MCP tools exposed by the server:
 
 - `doctor` — single-shot JSON readiness report (platform, portals, accessibility, windowing, input, readiness summary, and a capability map of available backends)
 - `setup_accessibility` — enables GNOME's `org.gnome.desktop.interface toolkit-accessibility` setting so toolkit apps expose AT-SPI trees
-- `setup_window_targeting` — installs and enables the bundled GNOME Shell extension when `org.gnome.Shell.Introspect` is locked down
+- `setup_window_targeting` — installs and enables the bundled GNOME Shell extension when `org.gnome.Shell.Introspect` is locked down; its `GetBridgeInfo` method and stable IDs share the repository's versioned GNOME bridge contract with the same-session capture companion
 
 **Discovery**
 

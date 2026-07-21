@@ -7,6 +7,8 @@ destination=${XDG_DATA_HOME:-"$HOME/.local/share"}/gnome-shell/extensions/$uuid
 mkdir -p "$(dirname -- "$destination")"
 rm -rf "$destination"
 cp -R "$root/gnome-shell/$uuid" "$destination"
+cp "$root/gnome_shell_bridge_contract.js" "$destination/"
+cp "$root/gnome_shell_bridge_contract.json" "$destination/"
 if gnome-extensions enable "$uuid"; then
     printf '%s\n' "Installed and enabled $uuid."
 else
