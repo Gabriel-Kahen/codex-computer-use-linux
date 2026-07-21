@@ -1,0 +1,10 @@
+# Fork-owned project identity, policy, and contribution files.
+.github/pull_request_template.md
+.github/upstream-sync-protected-paths.txt
+.github/workflows/upstream-sync.yml
+CONTRIBUTING.md
+LICENSE
+NOTICE
+README.md
+SECURITY.md
+docs/contributing.md
