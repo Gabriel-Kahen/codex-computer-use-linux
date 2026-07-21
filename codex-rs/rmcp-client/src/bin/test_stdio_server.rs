@@ -325,6 +325,7 @@ impl TestToolServer {
     ///   - `mcpimg.image_scenario({"scenario":"invalid_image_bytes_then_image"})`
     ///   - `mcpimg.image_scenario({"scenario":"multiple_valid_images"})`
     ///   - `mcpimg.image_scenario({"scenario":"image_then_text","caption":"Here is the image:"})`
+    ///   - `mcpimg.image_scenario({"scenario":"structured_content_and_image"})`
     ///   - `mcpimg.image_scenario({"scenario":"text_only","caption":"Here is the image:"})`
     /// - You should see an extra history cell: `tool result (image output)`.
     fn image_scenario_tool() -> Tool {
@@ -342,6 +343,7 @@ impl TestToolServer {
                         "invalid_image_bytes_then_image",
                         "multiple_valid_images",
                         "image_then_text",
+                        "structured_content_and_image",
                         "text_only"
                     ]
                 },
@@ -457,6 +459,7 @@ enum ImageScenario {
     InvalidImageBytesThenImage,
     MultipleValidImages,
     ImageThenText,
+    StructuredContentAndImage,
     TextOnly,
 }
 
@@ -789,6 +792,12 @@ impl TestToolServer {
             ImageScenario::ImageThenText => {
                 content.push(rmcp::model::Content::image(valid_data_b64, mime_type));
                 content.push(rmcp::model::Content::text(caption));
+            }
+            ImageScenario::StructuredContentAndImage => {
+                content.push(rmcp::model::Content::image(valid_data_b64, mime_type));
+                let mut result = CallToolResult::success(content);
+                result.structured_content = Some(json!({"caption": "structured image"}));
+                return Ok(result);
             }
             ImageScenario::TextOnly => {
                 content.push(rmcp::model::Content::text(caption));
