@@ -903,7 +903,14 @@ async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::R
     use tokio::io::AsyncReadExt as _;
     use tokio::io::AsyncWriteExt as _;
 
-    let mut stream = tokio::net::TcpStream::connect(started_proxy.proxy().http_addr()).await?;
+    let prepared = started_proxy
+        .proxy()
+        .prepare_for_remote_environment(std::collections::HashMap::new(), "test-bridge")?;
+    let proxy_addr = prepared.env["HTTP_PROXY"]
+        .strip_prefix("http://")
+        .expect("HTTP proxy URL")
+        .parse::<std::net::SocketAddr>()?;
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr).await?;
     stream
         .write_all(
             b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
@@ -1237,6 +1244,39 @@ async fn user_shell_commands_do_not_inherit_managed_network_proxy() -> anyhow::R
         if let EventMsg::ExecCommandEnd(event) = event.msg {
             assert_eq!(event.exit_code, 0);
             assert_eq!(event.stdout.trim(), "not-set");
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_shell_commands_remain_login_shells_when_model_login_shells_are_disabled()
+-> anyhow::Result<()> {
+    let (session, rx) = make_session_with_config_and_rx(|config| {
+        config.permissions.allow_login_shell = false;
+    })
+    .await?;
+    let turn_context = session.new_default_turn().await;
+    let command = "echo managed-login-shell".to_string();
+    let expected_command = session
+        .user_shell()
+        .derive_exec_args(&command, /*use_login_shell*/ true);
+
+    execute_user_shell_command(
+        Arc::clone(&session),
+        turn_context,
+        command,
+        CancellationToken::new(),
+        UserShellCommandMode::StandaloneTurn,
+    )
+    .await;
+
+    loop {
+        let event = rx.recv().await.expect("channel open");
+        if let EventMsg::ExecCommandBegin(event) = event.msg {
+            assert_eq!(event.command, expected_command);
             break;
         }
     }
@@ -4573,10 +4613,12 @@ async fn session_configuration_apply_preserves_profile_file_system_policy_on_cwd
                 value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path { path: docs_dir },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
     ]);
     let network_sandbox_policy = NetworkSandboxPolicy::from(&sandbox_policy);
@@ -4620,6 +4662,7 @@ async fn session_configuration_apply_permission_profile_preserves_existing_deny_
             pattern: "**/*.env".to_string(),
         },
         access: FileSystemAccessMode::Deny,
+        missing_path_behavior: None,
     };
     let mut existing_file_system_policy =
         FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
@@ -4683,6 +4726,7 @@ async fn session_configuration_apply_permission_profile_accepts_direct_write_roo
                 path: external_write_path.clone(),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         }]);
     let permission_profile = PermissionProfile::from_runtime_permissions(
         &file_system_sandbox_policy,
@@ -4932,12 +4976,14 @@ async fn session_configuration_apply_preserves_absolute_cwd_write_root_on_cwd_up
                 value: FileSystemSpecialPath::Root,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: original_cwd.clone(),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
     ]);
     session_configuration
@@ -6175,6 +6221,7 @@ async fn request_permissions_tool_resolves_relative_paths_against_selected_envir
                     path: environment_cwd.join("relative.txt"),
                 },
                 access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
             }],
             glob_scan_max_depth: None,
         }),
@@ -6261,6 +6308,7 @@ async fn request_permissions_response_materializes_session_cwd_grants_before_rec
                     value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
             }],
             glob_scan_max_depth: None,
         }),
@@ -8825,6 +8873,7 @@ fn file_system_policy_with_unreadable_glob(turn_context: &TurnContext) -> FileSy
             pattern: format!("{cwd_display}/**/*.env"),
         },
         access: FileSystemAccessMode::Deny,
+        missing_path_behavior: None,
     });
     policy
 }
