@@ -1756,7 +1756,7 @@ async fn load_exec_server_remote_auth_provider(
         let auth = CodexAuth::from_agent_identity_jwt(
             &agent_identity_jwt,
             Some(&config.chatgpt_base_url),
-            auth_route_config.as_ref(),
+            &auth_route_config,
         )
         .await?;
         return Ok(codex_model_provider::auth_provider_from_auth(&auth));
@@ -4131,6 +4131,16 @@ mod tests {
         };
         let overrides = toggles.to_overrides().expect("valid features");
         assert_eq!(overrides, vec!["features.enable_fanout=true".to_string(),]);
+    }
+
+    #[test]
+    fn feature_toggles_accept_removed_item_ids_flag() {
+        let toggles = FeatureToggles {
+            enable: vec!["item_ids".to_string()],
+            disable: Vec::new(),
+        };
+        let overrides = toggles.to_overrides().expect("valid features");
+        assert_eq!(overrides, vec!["features.item_ids=true".to_string()]);
     }
 
     #[test]
