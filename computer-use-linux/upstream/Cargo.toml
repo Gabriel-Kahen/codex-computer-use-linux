@@ -23,6 +23,7 @@ path = "src/bin/computer-use-linux-cosmic.rs"
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }
 anyhow = "1.0.102"
+polling = "3.11.0"
 # atspi without its "connection" feature: that feature pulls atspi-connection
 # with default features, which include "p2p" — and p2p peer enumeration during
 # connect() calls GetInterfaces on every a11y-bus peer, so a single

@@ -105,6 +105,35 @@ fn rejects_out_of_sequence_service_responses() {
 }
 
 #[test]
+fn application_rejection_does_not_restart_the_helper() {
+    let temporary = TestDir::new();
+    let helper = temporary.0.join("rejecting-cosmic-helper");
+    let starts = temporary.0.join("starts");
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nIFS= read -r line || exit 1\nid=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\nprintf '{{\"version\":1,\"id\":%s,\"ok\":false,\"error\":\"minimized\"}}\\n' \"$id\"\n",
+            starts.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let error = ServiceManager::default()
+        .request(
+            &helper,
+            CosmicServiceCommand::CaptureWindow {
+                window_id: 42,
+                output_path: temporary.0.join("capture.png"),
+            },
+        )
+        .unwrap_err();
+
+    assert!(error.downcast_ref::<HelperRejected>().is_some());
+    assert_eq!(fs::read_to_string(starts).unwrap().lines().count(), 1);
+}
+
+#[test]
 fn rejects_unsupported_service_protocol_versions() {
     let temporary = TestDir::new();
     let helper = temporary.0.join("future-cosmic-helper");

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, BufRead, Read};
+use std::path::PathBuf;
 
 pub const COSMIC_SERVICE_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_COSMIC_SERVICE_MESSAGE_BYTES: u64 = 1024 * 1024;
@@ -34,7 +35,13 @@ pub enum CosmicServiceCommand {
     Probe,
     ListWindows,
     FocusedWindow,
-    ActivateWindow { window_id: u64 },
+    ActivateWindow {
+        window_id: u64,
+    },
+    CaptureWindow {
+        window_id: u64,
+        output_path: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

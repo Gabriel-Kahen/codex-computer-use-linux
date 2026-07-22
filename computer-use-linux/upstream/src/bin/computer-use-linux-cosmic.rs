@@ -10,6 +10,9 @@ use cosmic_protocols::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 use wayland_client::{
     event_created_child,
     globals::{registry_queue_init, GlobalListContents},
@@ -20,8 +23,12 @@ use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1, ext_foreign_toplevel_list_v1,
 };
 
-const HELP: &str = "computer-use-linux-cosmic\n\nUsage:\n  computer-use-linux-cosmic probe\n  computer-use-linux-cosmic list-windows\n  computer-use-linux-cosmic focused-window\n  computer-use-linux-cosmic activate-window --window-id <id>\n  computer-use-linux-cosmic serve";
+#[path = "computer-use-linux-cosmic/cosmic_capture.rs"]
+mod cosmic_capture;
+
+const HELP: &str = "computer-use-linux-cosmic\n\nUsage:\n  computer-use-linux-cosmic probe\n  computer-use-linux-cosmic list-windows\n  computer-use-linux-cosmic focused-window\n  computer-use-linux-cosmic activate-window --window-id <id>\n  computer-use-linux-cosmic capture-window --window-id <id> --output <path>\n  computer-use-linux-cosmic serve";
 const BACKEND: &str = "cosmic-wayland";
+const DIRECT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WindowInfo {
@@ -69,6 +76,8 @@ struct ToplevelRecord {
     app_id: Option<String>,
     focused: bool,
     hidden: bool,
+    cosmic_state_received: bool,
+    cosmic_state_known: bool,
 }
 
 impl ToplevelRecord {
@@ -101,6 +110,7 @@ struct AppData {
         Vec<WEnum<zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1>>,
     records: HashMap<u32, ToplevelRecord>,
     by_cosmic_id: HashMap<u32, u32>,
+    capture: cosmic_capture::CaptureRuntime,
 }
 
 fn main() -> Result<()> {
@@ -109,6 +119,10 @@ fn main() -> Result<()> {
         Command::ListWindows => print_json(&collect_windows()?),
         Command::FocusedWindow => print_json(&focused_window()?),
         Command::ActivateWindow { window_id } => print_json(&activate_window(window_id)?),
+        Command::CaptureWindow {
+            window_id,
+            output_path,
+        } => print_json(&capture_window(window_id, &output_path)?),
         Command::Serve => serve(),
     }
 }
@@ -118,7 +132,13 @@ enum Command {
     Probe,
     ListWindows,
     FocusedWindow,
-    ActivateWindow { window_id: u64 },
+    ActivateWindow {
+        window_id: u64,
+    },
+    CaptureWindow {
+        window_id: u64,
+        output_path: std::path::PathBuf,
+    },
     Serve,
 }
 
@@ -136,6 +156,18 @@ impl Command {
                         .with_context(|| format!("invalid window id {value}"))?,
                 })
             }
+            [command, id_flag, id, output_flag, output_path]
+                if command == "capture-window"
+                    && id_flag == "--window-id"
+                    && output_flag == "--output" =>
+            {
+                Ok(Self::CaptureWindow {
+                    window_id: id
+                        .parse::<u64>()
+                        .with_context(|| format!("invalid window id {id}"))?,
+                    output_path: output_path.into(),
+                })
+            }
             [command] if command == "--help" || command == "-h" => {
                 println!("{HELP}");
                 std::process::exit(0);
@@ -144,7 +176,7 @@ impl Command {
                 println!("{HELP}");
                 std::process::exit(0);
             }
-            _ => bail!("unknown arguments. Expected one of: probe, list-windows, focused-window, activate-window --window-id <id>, serve"),
+            _ => bail!("unknown arguments. Expected one of: probe, list-windows, focused-window, activate-window --window-id <id>, capture-window --window-id <id> --output <path>, serve"),
         }
     }
 }
@@ -165,6 +197,39 @@ fn focused_window() -> Result<Option<WindowInfo>> {
 fn activate_window(window_id: u64) -> Result<ActivationOutput> {
     let mut snapshot = Snapshot::collect()?;
     snapshot.activate(window_id)
+}
+
+fn capture_window(window_id: u64, output_path: &std::path::Path) -> Result<serde_json::Value> {
+    let output_path = output_path.to_path_buf();
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let result = (|| {
+            let mut snapshot = Snapshot::collect()?;
+            snapshot.capture(window_id, &output_path)?;
+            Ok(serde_json::json!({ "captured": true }))
+        })();
+        let _ = result_tx.send(result);
+    });
+    match result_rx.recv_timeout(DIRECT_CAPTURE_TIMEOUT) {
+        Ok(result) => {
+            worker
+                .join()
+                .map_err(|_| anyhow!("COSMIC direct capture worker panicked"))?;
+            result
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            bail!(
+                "COSMIC direct capture timed out after {} ms",
+                DIRECT_CAPTURE_TIMEOUT.as_millis()
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            worker
+                .join()
+                .map_err(|_| anyhow!("COSMIC direct capture worker panicked"))?;
+            bail!("COSMIC direct capture worker stopped without a result")
+        }
+    }
 }
 
 fn serve() -> Result<()> {
@@ -220,6 +285,13 @@ fn execute_service_command(
         CosmicServiceCommand::ActivateWindow { window_id } => {
             serde_json::to_value(snapshot.activate(window_id)?)
         }
+        CosmicServiceCommand::CaptureWindow {
+            window_id,
+            output_path,
+        } => {
+            snapshot.capture(window_id, &output_path)?;
+            Ok(serde_json::json!({ "captured": true }))
+        }
     }
     .context("failed to serialize COSMIC service result")
 }
@@ -256,6 +328,7 @@ impl Snapshot {
         snapshot.app_data.toplevel_manager = globals
             .bind::<zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, _, _>(&qh, 1..=4, ())
             .ok();
+        snapshot.app_data.capture.bind_initial(&globals, &qh);
         globals.contents().with_list(|entries| {
             for global in entries {
                 if global.interface == "wl_seat" {
@@ -405,6 +478,15 @@ impl Snapshot {
             },
         })
     }
+
+    fn capture(&mut self, window_id: u64, output_path: &std::path::Path) -> Result<()> {
+        cosmic_capture::capture_window(
+            &mut self.event_queue,
+            &mut self.app_data,
+            window_id,
+            output_path,
+        )
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for AppData {
@@ -552,7 +634,11 @@ impl Dispatch<ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()> fo
                         app_data.by_cosmic_id.remove(&cosmic.id().protocol_id());
                         cosmic.destroy();
                     }
-                    handle.destroy();
+                    if let Some(foreign) = record.foreign {
+                        foreign.destroy();
+                    } else {
+                        handle.destroy();
+                    }
                 }
             }
             _ => unreachable!(),
@@ -562,13 +648,27 @@ impl Dispatch<ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1, ()> fo
 
 impl Dispatch<zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1, ()> for AppData {
     fn event(
-        _app_data: &mut Self,
+        app_data: &mut Self,
         _info: &zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1,
-        _event: zcosmic_toplevel_info_v1::Event,
+        event: zcosmic_toplevel_info_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        match event {
+            zcosmic_toplevel_info_v1::Event::Done => {
+                for record in app_data.records.values_mut() {
+                    if record.cosmic_state_received
+                        && record.cosmic.as_ref().is_some_and(Proxy::is_alive)
+                    {
+                        record.cosmic_state_known = true;
+                    }
+                }
+            }
+            zcosmic_toplevel_info_v1::Event::Toplevel { .. }
+            | zcosmic_toplevel_info_v1::Event::Finished => {}
+            _ => unreachable!(),
+        }
     }
 
     event_created_child!(
@@ -599,6 +699,8 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppDa
                 record.cosmic = None;
                 record.focused = false;
                 record.hidden = false;
+                record.cosmic_state_received = false;
+                record.cosmic_state_known = false;
             }
             handle.destroy();
             return;
@@ -608,6 +710,8 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppDa
         };
         match event {
             zcosmic_toplevel_handle_v1::Event::State { state } => {
+                record.cosmic_state_known = false;
+                record.cosmic_state_received = true;
                 record.focused = false;
                 record.hidden = false;
                 for value in state.chunks_exact(4) {
@@ -625,6 +729,11 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppDa
                     }
                 }
             }
+            zcosmic_toplevel_handle_v1::Event::Done => {
+                if record.cosmic_state_received {
+                    record.cosmic_state_known = true;
+                }
+            }
             zcosmic_toplevel_handle_v1::Event::Geometry { .. }
             | zcosmic_toplevel_handle_v1::Event::OutputEnter { .. }
             | zcosmic_toplevel_handle_v1::Event::OutputLeave { .. }
@@ -633,8 +742,7 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppDa
             | zcosmic_toplevel_handle_v1::Event::ExtWorkspaceEnter { .. }
             | zcosmic_toplevel_handle_v1::Event::ExtWorkspaceLeave { .. }
             | zcosmic_toplevel_handle_v1::Event::Title { .. }
-            | zcosmic_toplevel_handle_v1::Event::AppId { .. }
-            | zcosmic_toplevel_handle_v1::Event::Done => {}
+            | zcosmic_toplevel_handle_v1::Event::AppId { .. } => {}
             _ => unreachable!(),
         }
     }
@@ -723,6 +831,26 @@ mod tests {
         assert!(matches!(
             Command::parse(vec!["serve".to_string()]).unwrap(),
             Command::Serve
+        ));
+    }
+
+    #[test]
+    fn parse_capture_window_command() {
+        let command = Command::parse(vec![
+            "capture-window".to_string(),
+            "--window-id".to_string(),
+            "42".to_string(),
+            "--output".to_string(),
+            "/tmp/cosmic.png".to_string(),
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            command,
+            Command::CaptureWindow {
+                window_id: 42,
+                output_path,
+            } if output_path == std::path::Path::new("/tmp/cosmic.png")
         ));
     }
 }

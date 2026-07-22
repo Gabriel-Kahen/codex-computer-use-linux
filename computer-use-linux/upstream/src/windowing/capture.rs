@@ -1,8 +1,11 @@
+use crate::cosmic_helper;
 use crate::diagnostics::hydrate_session_bus_env;
 use crate::screenshot::RawScreenshotCapture;
 use crate::screenshot_impl::{read_png_as_capture_inner, temp_png_path};
 use crate::windowing::backends::{hyprland, kwin, niri::NIRI_BACKEND, niri_capture, x11_native};
-use crate::windowing::{WindowInfo, HYPRLAND_BACKEND, KWIN_BACKEND, X11_BACKEND};
+use crate::windowing::{
+    WindowInfo, COSMIC_WAYLAND_BACKEND, HYPRLAND_BACKEND, KWIN_BACKEND, X11_BACKEND,
+};
 use anyhow::{bail, Context, Result};
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use std::collections::HashMap;
@@ -35,12 +38,24 @@ pub(crate) async fn capture_window_exact(
     window: &WindowInfo,
 ) -> Result<Option<RawScreenshotCapture>> {
     match window.backend.as_str() {
+        COSMIC_WAYLAND_BACKEND => capture_cosmic_window_exact(window).await.map(Some),
         NIRI_BACKEND => niri_capture::capture_window_exact(window).await.map(Some),
         KWIN_BACKEND => capture_kwin_window_exact(window).await,
         HYPRLAND_BACKEND => capture_hyprland_window_exact(window).await,
         X11_BACKEND => capture_x11_window_exact(window).await,
         _ => Ok(None),
     }
+}
+
+async fn capture_cosmic_window_exact(window: &WindowInfo) -> Result<RawScreenshotCapture> {
+    let window_id = window.window_id;
+    tokio::task::spawn_blocking(move || {
+        let temporary = TemporaryCapture::new(temp_png_path("cosmic-window"));
+        cosmic_helper::capture_window(window_id, temporary.path())?;
+        read_png_as_capture_inner(temporary.path(), "cosmic-ext-image-copy-exact")
+    })
+    .await
+    .context("COSMIC exact capture task failed")?
 }
 
 async fn capture_x11_window_exact(window: &WindowInfo) -> Result<Option<RawScreenshotCapture>> {

@@ -10,7 +10,7 @@ use std::io::{BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -93,6 +93,27 @@ pub fn activate_window(window_id: u64) -> Result<CosmicHelperActivation> {
     )
 }
 
+pub fn capture_window(window_id: u64, output_path: &Path) -> Result<()> {
+    let output_path = output_path.to_path_buf();
+    let result = run_command(
+        CosmicServiceCommand::CaptureWindow {
+            window_id,
+            output_path: output_path.clone(),
+        },
+        vec![
+            "capture-window".to_string(),
+            "--window-id".to_string(),
+            window_id.to_string(),
+            "--output".to_string(),
+            output_path.to_string_lossy().into_owned(),
+        ],
+    )?;
+    if result.get("captured").and_then(Value::as_bool) != Some(true) {
+        bail!("{COSMIC_HELPER_BINARY} did not confirm exact window capture");
+    }
+    Ok(())
+}
+
 fn run_json_command<T>(command: CosmicServiceCommand, fallback_args: Vec<String>) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -110,6 +131,9 @@ fn run_command(command: CosmicServiceCommand, fallback_args: Vec<String>) -> Res
         .request(&helper_path, command);
     match service_result {
         Ok(value) => Ok(value),
+        Err(service_error) if service_error.downcast_ref::<HelperRejected>().is_some() => {
+            Err(service_error)
+        }
         Err(service_error) if service_error.downcast_ref::<HelperTimeout>().is_some() => {
             Err(service_error).context("persistent COSMIC helper timed out after restart")
         }
@@ -120,10 +144,36 @@ fn run_command(command: CosmicServiceCommand, fallback_args: Vec<String>) -> Res
 }
 
 fn run_one_shot(helper: &Path, args: &[String]) -> Result<Value> {
-    let output = Command::new(helper)
+    let mut child = Command::new(helper)
         .args(args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("failed to run {}", helper.display()))?;
+    let deadline = Instant::now() + SERVICE_RESPONSE_TIMEOUT;
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("failed to poll {}", helper.display()))?
+            .is_some()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "{} {} timed out after {} ms",
+                helper.display(),
+                args.join(" "),
+                SERVICE_RESPONSE_TIMEOUT.as_millis()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to collect {} output", helper.display()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -181,6 +231,9 @@ impl ServiceManager {
                 .request(command.clone());
             match result {
                 Ok(value) => return Ok(value),
+                Err(error) if error.downcast_ref::<HelperRejected>().is_some() => {
+                    return Err(error);
+                }
                 Err(error) => {
                     last_error = Some(error);
                     self.helper = None;
@@ -214,6 +267,9 @@ enum HelperOutput {
 #[derive(Debug)]
 struct HelperTimeout;
 
+#[derive(Debug)]
+struct HelperRejected(String);
+
 impl fmt::Display for HelperTimeout {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -225,6 +281,18 @@ impl fmt::Display for HelperTimeout {
 }
 
 impl std::error::Error for HelperTimeout {}
+
+impl fmt::Display for HelperRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "persistent COSMIC helper rejected request: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for HelperRejected {}
 
 impl PersistentHelper {
     fn spawn(path: PathBuf) -> Result<Self> {
@@ -332,13 +400,12 @@ impl PersistentHelper {
         if response.result.is_some() {
             bail!("persistent COSMIC helper error response included a result");
         }
-        bail!(
-            "persistent COSMIC helper rejected request: {}",
+        Err(HelperRejected(
             response
                 .error
-                .as_deref()
-                .unwrap_or("unspecified helper error")
+                .unwrap_or_else(|| "unspecified helper error".to_string()),
         )
+        .into())
     }
 }
 

@@ -178,7 +178,7 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         support: BackendSupport {
             desktop_session: "COSMIC Wayland",
             window_backend: "persistent `computer-use-linux-cosmic` helper",
-            notes: "Installed automatically by `./install.sh`, `cargo install`, and npm. Normal operations reuse one helper and Wayland connection, with automatic restart and a one-shot fallback. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`.",
+            notes: "Installed automatically by `./install.sh`, `cargo install`, and npm. Normal operations and exact inactive-window captures reuse one helper and Wayland connection, with automatic restart and a one-shot fallback. Capture uses COSMIC's foreign-toplevel image-copy protocols and fails closed rather than substituting a desktop crop. For custom/manual layouts, put the helper next to the main binary, on `PATH`, or set `COMPUTER_USE_LINUX_COSMIC_HELPER`.",
         },
     },
     BackendDescriptor {
