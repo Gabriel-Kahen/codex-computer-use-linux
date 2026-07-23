@@ -38,6 +38,7 @@ cosmic-protocols = { version = "0.2.0", default-features = false, features = ["c
 futures-util = "0.3.32"
 fs2 = "0.4.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2"
 rmcp = { version = "1.5.0", features = ["transport-io"] }
 schemars = "1.0"
 serde = { version = "1.0.228", features = ["derive"] }

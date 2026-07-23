@@ -333,6 +333,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "image",
+ "libc",
  "mimalloc",
  "polling",
  "rmcp",

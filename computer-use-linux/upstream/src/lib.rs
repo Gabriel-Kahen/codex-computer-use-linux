@@ -5,6 +5,7 @@ mod action_batch;
 mod atspi_tree_impl;
 mod claim_coordination;
 mod cli;
+mod coordination_identity;
 #[doc(hidden)]
 pub mod coordination_protocol;
 mod cosmic_helper;
