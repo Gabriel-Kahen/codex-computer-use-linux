@@ -15,9 +15,9 @@ Operate the user's real desktop session. Reuse existing application processes, p
    - GNOME: `$gnome-same-session-computer-use:gnome-same-session-computer-use`
    - Plasma Wayland: `$plasma-same-session-computer-use:plasma-same-session-computer-use`
    - EWMH Xorg: `$x11-background-computer-use:x11-same-session-computer-use`
-3. Treat companion window claims and focus/input leases as authoritative. The shared MCP server cannot mechanically enforce a companion's claims, so never use it to inspect or mutate a window claimed by another task.
-4. Keep claim and lease tokens private to their owning task. Follow the companion's validation, renewal, recovery, and cleanup sequence exactly.
-5. For Niri, COSMIC, and i3, use the shared plugin directly and serialize desktop mutations because no companion claim broker is provided.
+3. For non-Hyprland backends, call `claim_window` before sustained work on an exact window, renew it before expiry, pass the returned owner and token to window-scoped tools, and call `release_window_claim` in finally-style cleanup. The server derives claim ownership from host-provided task metadata.
+4. Treat shared and companion window claims plus focus/input leases as authoritative. The MCP server mechanically enforces live claims across registered backends.
+5. Keep claim and lease tokens private to their owning task. Follow the applicable validation, renewal, recovery, and cleanup sequence exactly. Hyprland continues to use its companion claim tools during migration.
 
 ## Observe and target
 

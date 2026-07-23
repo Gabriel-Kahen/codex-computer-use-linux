@@ -21,6 +21,10 @@ EXPECTED_TOOLS = {
     "get_app_state",
     "list_windows",
     "focused_window",
+    "claim_window",
+    "list_window_claims",
+    "renew_window_claim",
+    "release_window_claim",
     "screenshot",
     "activate_window",
     "move_window",
@@ -90,6 +94,7 @@ READ_ONLY_TOOLS = {
     "get_app_state",
     "list_windows",
     "focused_window",
+    "list_window_claims",
 }
 
 DESTRUCTIVE_MUTATING_TOOLS = {
@@ -111,12 +116,17 @@ IDEMPOTENT_TOOLS = READ_ONLY_TOOLS | {
     "activate_window",
     "move_window",
     "resize_window",
+    "release_window_claim",
 }
 
 OPEN_WORLD_TOOLS = EXPECTED_TOOLS - {
     "doctor",
     "setup_accessibility",
     "setup_window_targeting",
+    "claim_window",
+    "list_window_claims",
+    "renew_window_claim",
+    "release_window_claim",
 }
 
 
@@ -306,6 +316,21 @@ def main() -> int:
                 raise AssertionError(f"{name} is missing semantic element selectors: {sorted(SEMANTIC_SELECTORS - props)}")
             if name == "run_action_batch" and props != {"window_id", "actions", "owner_thread_id", "claim_token"}:
                 raise AssertionError(f"{name} exposes unexpected parameters: {sorted(props)}")
+            if name == "claim_window" and props != {"window_id", "lease_seconds"}:
+                raise AssertionError(f"{name} exposes unexpected parameters: {sorted(props)}")
+            if name in {"renew_window_claim", "release_window_claim"} and "owner_thread_id" in props:
+                raise AssertionError(f"{name} must derive its owner from request metadata")
+            if name == "release_window_claim" and props != {"claim_token"}:
+                raise AssertionError(f"{name} exposes unexpected parameters: {sorted(props)}")
+            schema_props = (tool.get("inputSchema") or {}).get("properties") or {}
+            if name in {"claim_window", "renew_window_claim"}:
+                lease = schema_props.get("lease_seconds") or {}
+                if lease.get("minimum") != 5 or lease.get("maximum") != 300:
+                    raise AssertionError(f"{name} must publish the 5..300 second lease bound")
+            if name in {"renew_window_claim", "release_window_claim"}:
+                token = schema_props.get("claim_token") or {}
+                if token.get("minLength") != 1 or token.get("maxLength") != 256:
+                    raise AssertionError(f"{name} must publish the 1..256 token length bound")
             if name == "run_action_batch_and_observe" and props != {
                 "window_id",
                 "actions",

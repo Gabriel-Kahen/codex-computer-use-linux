@@ -220,19 +220,7 @@ impl Coordinator {
     }
 
     fn prepare_state_dir(&self) -> Result<(), String> {
-        if !self.state_dir.exists() {
-            fs::create_dir_all(&self.state_dir)
-                .map_err(|error| format!("failed to create claim state directory: {error}"))?;
-        }
-        validate_private_directory(&self.state_dir, "claim state directory")?;
-        fs::set_permissions(&self.state_dir, fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("failed to secure claim state directory: {error}"))?;
-        let lock_dir = self.state_dir.join("window-locks");
-        fs::create_dir_all(&lock_dir)
-            .map_err(|error| format!("failed to create claim lock directory: {error}"))?;
-        validate_private_directory(&lock_dir, "claim lock directory")?;
-        fs::set_permissions(lock_dir, fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("failed to secure claim lock directory: {error}"))
+        prepare_state_dir(&self.state_dir)
     }
 
     pub(crate) fn binding_key(&self) -> String {
@@ -316,6 +304,22 @@ impl Coordinator {
     }
 }
 
+pub(crate) fn prepare_state_dir(state_dir: &Path) -> Result<(), String> {
+    if !state_dir.exists() {
+        fs::create_dir_all(state_dir)
+            .map_err(|error| format!("failed to create claim state directory: {error}"))?;
+    }
+    validate_private_directory(state_dir, "claim state directory")?;
+    fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("failed to secure claim state directory: {error}"))?;
+    let lock_dir = state_dir.join("window-locks");
+    fs::create_dir_all(&lock_dir)
+        .map_err(|error| format!("failed to create claim lock directory: {error}"))?;
+    validate_private_directory(&lock_dir, "claim lock directory")?;
+    fs::set_permissions(lock_dir, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("failed to secure claim lock directory: {error}"))
+}
+
 pub(crate) async fn acquire_mutation_guards(
     window_id: Option<u64>,
     context: &ClaimContext,
@@ -384,7 +388,7 @@ pub(crate) async fn acquire_mutation_guards_with(
     Ok(Some(guards))
 }
 
-fn open_lock(path: &Path) -> Result<File, String> {
+pub(crate) fn open_lock(path: &Path) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create claim lock directory: {error}"))?;
@@ -409,7 +413,7 @@ fn open_lock(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-fn validate_context(context: &ClaimContext) -> Result<(), String> {
+pub(crate) fn validate_context(context: &ClaimContext) -> Result<(), String> {
     if context.owner_thread_id.as_ref().is_some_and(|owner| {
         owner.is_empty()
             || owner.chars().count() > MAX_OWNER_CHARS
@@ -437,7 +441,10 @@ fn authorize(claim: Option<&LiveClaim>, context: &ClaimContext) -> Result<(), St
     match claim {
         Some(claim)
             if context.owner_thread_id.as_deref() == Some(&claim.owner_thread_id)
-                && context.claim_token.as_deref() == Some(&claim.claim_token) =>
+                && context
+                    .claim_token
+                    .as_deref()
+                    .is_some_and(|token| constant_time_eq(token, &claim.claim_token)) =>
         {
             Ok(())
         }
@@ -447,6 +454,17 @@ fn authorize(claim: Option<&LiveClaim>, context: &ClaimContext) -> Result<(), St
         }
         None => Ok(()),
     }
+}
+
+pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(
+            left.as_bytes().get(index).copied().unwrap_or(0)
+                ^ right.as_bytes().get(index).copied().unwrap_or(0),
+        );
+    }
+    difference == 0
 }
 
 fn claim_is_live(claim: &Claim) -> bool {
@@ -461,7 +479,7 @@ fn protocol_claim_is_live(claim: &ClaimRecord) -> bool {
         > now_ms()
 }
 
-fn read_claim_state(path: &Path) -> Result<Option<Vec<u8>>, String> {
+pub(crate) fn read_claim_state(path: &Path) -> Result<Option<Vec<u8>>, String> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -522,7 +540,7 @@ fn now() -> f64 {
         .as_secs_f64()
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
