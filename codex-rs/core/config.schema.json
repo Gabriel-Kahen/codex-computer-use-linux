@@ -1736,6 +1736,11 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "supports_standalone_web_search": {
+          "default": false,
+          "description": "Whether this provider supports the standalone web-search endpoint.",
+          "type": "boolean"
+        },
         "supports_websockets": {
           "default": false,
           "description": "Whether this provider supports the Responses API WebSocket transport.",
@@ -1819,6 +1824,10 @@
         },
         "usage_hint_text": {
           "type": "string"
+        },
+        "wait_agent_enabled": {
+          "description": "Expose the multi-agent v2 `wait_agent` tool.",
+          "type": "boolean"
         }
       },
       "type": "object"
