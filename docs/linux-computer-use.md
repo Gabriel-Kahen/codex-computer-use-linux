@@ -17,6 +17,13 @@ keeping the generic backend independently maintainable.
 5. `codex-rs/` owns the agent runtime. Future native work belongs there when it
    concerns approvals, scheduling, leases, recovery, or tool orchestration.
 
+The generic MCP server owns the backend-neutral claim lifecycle for supported
+window backends. Host task metadata is the owner authority; claim tokens remain
+private capabilities and are never returned by status listing. Agents should
+list active ownership, claim before sustained exact-window work, renew before
+expiry, and release in finally-style cleanup. Hyprland remains companion-owned
+until its versioned journal migration lands separately.
+
 ## Source policy
 
 `agent-sh/computer-use-linux` is the primary generic upstream.

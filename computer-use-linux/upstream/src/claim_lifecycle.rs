@@ -3,8 +3,8 @@ use crate::claim_coordination::{
 };
 use crate::coordination_identity::{self, CoordinationScope};
 use crate::coordination_protocol::{
-    ClaimRecord, ClaimSession, ClaimState, ClaimWindow, MAX_LEASE_SECONDS, MIN_LEASE_SECONDS,
-    PROTOCOL_VERSION,
+    ClaimRecord, ClaimSession, ClaimState, ClaimWindow, DesktopBackend, WindowIdentity,
+    MAX_LEASE_SECONDS, MIN_LEASE_SECONDS, PROTOCOL_VERSION,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use fs2::FileExt;
@@ -23,10 +23,11 @@ pub(crate) struct ClaimReceipt {
 }
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub(crate) struct ListedClaim {
-    window_id: String,
-    owner_thread_id: String,
-    owned_by_caller: bool,
-    expires_at_ms: u64,
+    pub(crate) window_id: u64,
+    pub(crate) stable_window_id: String,
+    pub(crate) owner_thread_id: String,
+    pub(crate) owned_by_caller: bool,
+    pub(crate) expires_at_ms: u64,
 }
 enum Mutation {
     Claim { lease_seconds: u32 },
@@ -81,39 +82,62 @@ pub(crate) async fn list_window_claims(
     if scope.legacy_hyprland_binding.is_some() {
         return Err("Hyprland claims remain companion-owned during migration".to_string());
     }
-    tokio::task::spawn_blocking(move || {
-        prepare_state_dir(&scope.state_dir)?;
-        let lock = open_lock(&scope.state_dir.join("window-claims.lock"))?;
-        FileExt::lock_shared(&lock).map_err(|error| format!("failed to lock claims: {error}"))?;
-        let state = load_state(&scope.state_dir)?;
-        let mut claims = state
-            .sessions
-            .get(&scope.session.key())
-            .into_iter()
-            .flat_map(|session| session.claims.iter())
-            .filter(|(key, claim)| {
-                cursor.as_ref().is_none_or(|cursor| *key > cursor)
-                    && claim_deadline(claim) > now_ms()
-            })
-            .take(9)
-            .map(|(key, claim)| {
-                (
-                    key.clone(),
-                    ListedClaim {
-                        window_id: claim.window.identity.id.clone(),
-                        owner_thread_id: claim.owner_thread_id.clone(),
-                        owned_by_caller: claim.owner_thread_id == owner,
-                        expires_at_ms: claim_deadline(claim),
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let next = (claims.len() > 8).then(|| claims[7].0.clone());
-        claims.truncate(8);
-        Ok((claims.into_iter().map(|(_, claim)| claim).collect(), next))
-    })
-    .await
-    .map_err(|error| format!("window claim listing failed: {error}"))?
+    tokio::task::spawn_blocking(move || list_locked(&scope, &owner, cursor.as_deref()))
+        .await
+        .map_err(|error| format!("window claim listing failed: {error}"))?
+}
+fn list_locked(
+    scope: &CoordinationScope,
+    owner: &str,
+    cursor: Option<&str>,
+) -> Result<(Vec<ListedClaim>, Option<String>), String> {
+    prepare_state_dir(&scope.state_dir)?;
+    let lock = open_lock(&scope.state_dir.join("window-claims.lock"))?;
+    FileExt::lock_shared(&lock).map_err(|error| format!("failed to lock claims: {error}"))?;
+    let state = load_state(&scope.state_dir)?;
+    let now = now_ms();
+    let mut claims = state
+        .sessions
+        .get(&scope.session.key())
+        .into_iter()
+        .flat_map(|session| session.claims.iter())
+        .filter(|(key, _)| cursor.is_none_or(|cursor| key.as_str() > cursor))
+        .filter(|(_, claim)| claim_deadline(claim) > now)
+        .take(9)
+        .map(|(key, claim)| {
+            let window_id = public_window_id(&claim.window.identity)?;
+            Ok((
+                key.clone(),
+                ListedClaim {
+                    window_id,
+                    stable_window_id: claim.window.identity.id.clone(),
+                    owner_thread_id: claim.owner_thread_id.clone(),
+                    owned_by_caller: claim.owner_thread_id == owner,
+                    expires_at_ms: claim_deadline(claim),
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let next = (claims.len() > 8).then(|| claims[7].0.clone());
+    claims.truncate(8);
+    Ok((claims.into_iter().map(|(_, claim)| claim).collect(), next))
+}
+fn public_window_id(window: &WindowIdentity) -> Result<u64, String> {
+    match window.backend {
+        DesktopBackend::Plasma => Ok(crate::windowing::backends::kwin::kwin_window_id_from_uuid(
+            &window.id,
+        )),
+        DesktopBackend::Cosmic
+        | DesktopBackend::Gnome
+        | DesktopBackend::Hyprland
+        | DesktopBackend::I3
+        | DesktopBackend::Niri
+        | DesktopBackend::X11 => window
+            .id
+            .strip_prefix("0x")
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .ok_or("window claim contains an invalid public window identity".to_string()),
+    }
 }
 async fn mutate(window_id: u64, owner: String, mutation: Mutation) -> Result<ClaimReceipt, String> {
     let scope = coordination_identity::resolve(Some(window_id)).await?;
@@ -401,7 +425,7 @@ mod tests {
         DesktopBackend, IdentityAttribute, SessionIdentity, WindowIdentity,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
-    fn scope() -> CoordinationScope {
+    fn scope_with_backend(backend: DesktopBackend, id: &str) -> CoordinationScope {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         CoordinationScope {
             state_dir: std::env::temp_dir().join(format!(
@@ -410,7 +434,7 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             )),
             session: SessionIdentity {
-                backend: DesktopBackend::Gnome,
+                backend,
                 uid: unsafe { libc::geteuid() },
                 attributes: BTreeMap::from([(
                     "bus_id".to_string(),
@@ -418,12 +442,18 @@ mod tests {
                 )]),
             },
             window: Some(WindowIdentity {
-                backend: DesktopBackend::Gnome,
-                id: "window-42".to_string(),
+                backend,
+                id: id.to_string(),
                 process: None,
             }),
             legacy_hyprland_binding: None,
         }
+    }
+    fn scope_with_window(id: &str) -> CoordinationScope {
+        scope_with_backend(DesktopBackend::Gnome, id)
+    }
+    fn scope() -> CoordinationScope {
+        scope_with_window("window-42")
     }
     fn claim(scope: &CoordinationScope, owner: &str) -> Result<ClaimReceipt, String> {
         mutate_locked(
@@ -454,6 +484,52 @@ mod tests {
         let second = claim(&scope, "owner-a").unwrap();
         assert_eq!(second.fencing_token, Some(2));
         load_state(&scope.state_dir).unwrap().validate().unwrap();
+        fs::remove_dir_all(scope.state_dir).unwrap();
+    }
+
+    #[test]
+    fn listing_is_bounded_classified_and_token_redacted() {
+        let first_scope = scope_with_window("0xa");
+        let token = claim(&first_scope, "owner-a").unwrap().claim_token.unwrap();
+        for index in 0..9 {
+            let mut scope = first_scope.clone();
+            scope.window.as_mut().unwrap().id = format!("0x{:x}", index + 0x10);
+            claim(&scope, "owner-b").unwrap();
+        }
+
+        let (first_page, next_cursor) = list_locked(&first_scope, "owner-a", None).unwrap();
+        let (second_page, final_cursor) =
+            list_locked(&first_scope, "owner-a", next_cursor.as_deref()).unwrap();
+        let claims = first_page.iter().chain(&second_page).collect::<Vec<_>>();
+        let serialized = serde_json::to_string(&claims).unwrap();
+
+        assert_eq!(first_page.len(), 8);
+        assert!(next_cursor.is_some());
+        assert_eq!(claims.len(), 10);
+        assert_eq!(final_cursor, None);
+        assert_eq!(
+            claims.iter().filter(|claim| claim.owned_by_caller).count(),
+            1
+        );
+        assert!(!serialized.contains(&token));
+        fs::remove_dir_all(first_scope.state_dir).unwrap();
+    }
+
+    #[test]
+    fn plasma_listing_correlates_stable_and_public_window_ids() {
+        let stable_id = "9f3d4a3a-07f2-4fa4-9db8-051e86265c02";
+        let scope = scope_with_backend(DesktopBackend::Plasma, stable_id);
+        claim(&scope, "owner-a").unwrap();
+
+        let (claims, next_cursor) = list_locked(&scope, "owner-a", None).unwrap();
+
+        assert_eq!(next_cursor, None);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(
+            claims[0].window_id,
+            crate::windowing::backends::kwin::kwin_window_id_from_uuid(stable_id)
+        );
+        assert_eq!(claims[0].stable_window_id, stable_id);
         fs::remove_dir_all(scope.state_dir).unwrap();
     }
 }
