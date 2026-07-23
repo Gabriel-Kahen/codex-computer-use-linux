@@ -66,12 +66,13 @@ TOOLS = [
     },
     {
         "name": "claim_session_window",
-        "description": "Exclusively claim one real window for this Codex task. Claims are fenced by the host-provided task identity, expire automatically, and are renewed by calling this tool again from the same task.",
+        "description": "Exclusively claim one real window for this Codex task. Claims are fenced by the host-provided task identity, expire automatically, and can be renewed by calling this tool with the current claim token.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "window": {"type": "string", "minLength": 1, "maxLength": MAX_WINDOW_TEXT_CHARS, "description": "Window address, exact-capture identifier, exact class, or title substring."},
                 "lease_seconds": {"type": "integer", "minimum": 5, "maximum": 300, "default": 60},
+                "claim_token": {"type": "string", "minLength": 1, "maxLength": coordination.MAX_CLAIM_TOKEN_LENGTH, "description": "Required current token when renewing an active claim."},
             },
             "required": ["window"],
         },
@@ -1445,6 +1446,7 @@ def call_tool(
             window,
             owner,
             lease_seconds,
+            claim_token_from(arguments),
             reservation_owner=lambda: coordinate_reservation_owner(window),
             after_claim=lambda claim: rebind_coordinate_claim(window, owner, claim),
         )

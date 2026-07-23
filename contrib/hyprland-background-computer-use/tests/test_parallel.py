@@ -61,6 +61,7 @@ class ParallelBackendTests(TestCase):
             "class": "demo",
             "title": address,
             "pid": int(capture_id),
+            "process_start_time": int(capture_id),
             "workspace": 1,
             "size": [100, 100],
             "xwayland": xwayland,

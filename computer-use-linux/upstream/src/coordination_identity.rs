@@ -61,7 +61,7 @@ pub(crate) async fn resolve(window_id: Option<u64>) -> Result<CoordinationScope,
         None => None,
     };
     let legacy_hyprland_binding = (backend == DesktopBackend::Hyprland)
-        .then(|| legacy_hyprland_binding(uid))
+        .then(|| legacy_hyprland_binding(&session))
         .transpose()?;
     Ok(CoordinationScope {
         state_dir,
@@ -259,18 +259,22 @@ fn required_env(name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{name} is unavailable"))
 }
 
-fn legacy_hyprland_binding(uid: u32) -> Result<BTreeMap<String, serde_json::Value>, String> {
-    let wayland_display = env::var("WAYLAND_DISPLAY")
-        .ok()
-        .map_or(serde_json::Value::Null, serde_json::Value::String);
-    let runtime_dir = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{uid}"));
+pub(crate) fn legacy_hyprland_binding(
+    session: &SessionIdentity,
+) -> Result<BTreeMap<String, serde_json::Value>, String> {
+    let text = |key| match session.attributes.get(key) {
+        Some(IdentityAttribute::Text(value)) => Ok(value.clone()),
+        _ => Err(format!("Hyprland session identity lacks {key}")),
+    };
+    let runtime_dir =
+        env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{}", session.uid));
     Ok(BTreeMap::from([
         (
             "hyprland_instance".to_string(),
-            required_env("HYPRLAND_INSTANCE_SIGNATURE")?.into(),
+            text("hyprland_instance")?.into(),
         ),
-        ("uid".to_string(), uid.into()),
-        ("wayland_display".to_string(), wayland_display),
+        ("uid".to_string(), session.uid.into()),
+        ("wayland_display".to_string(), text("wayland_display")?.into()),
         ("xdg_runtime_dir".to_string(), runtime_dir.into()),
     ]))
 }

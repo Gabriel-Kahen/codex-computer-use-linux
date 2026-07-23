@@ -1,3 +1,4 @@
+import json
 import multiprocessing
 import stat
 import threading
@@ -24,6 +25,7 @@ WINDOW = {
     "class": "demo",
     "title": "Demo",
     "pid": 123,
+    "process_start_time": 456,
     "workspace": 1,
     "xwayland": False,
 }
@@ -74,17 +76,58 @@ class ClaimStoreTests(TestCase):
 
     def test_same_owner_renews_without_changing_the_fencing_token(self) -> None:
         first = coordination.claim_window(BINDING, WINDOW, "thread-a", 30, now=1000)
-        renewed = coordination.claim_window(BINDING, WINDOW, "thread-a", 60, now=1010)
+        with self.assertRaisesRegex(ValueError, "current claim_token is required"):
+            coordination.claim_window(BINDING, WINDOW, "thread-a", 60, now=1010)
+        renewed = coordination.claim_window(
+            BINDING, WINDOW, "thread-a", 60, first["claim_token"], now=1010
+        )
 
         self.assertEqual(first["claim_token"], renewed["claim_token"])
         self.assertFalse(first["renewed"])
         self.assertTrue(renewed["renewed"])
         self.assertEqual(renewed["expires_at"], 1070)
+        self.assertEqual((first["fencing_token"], renewed["fencing_token"]), (1, 1))
+
+    def test_v2_state_uses_canonical_session_window_keys(self) -> None:
+        coordination.claim_window(BINDING, WINDOW, "thread-a", now=1000)
+        state = json.loads(coordination.CLAIMS_FILE.read_text())
+        session = state["sessions"][coordination.session_key(BINDING)]
+        claim = session["claims"][coordination.protocol_window_key(BINDING, WINDOW)]
+        self.assertEqual((state["version"], claim["window"]["identity"]["id"]), (2, "0x1"))
+        claim["window"].pop("summary")
+        coordination._validate_state(state)
+
+    def test_live_v1_state_fails_closed_and_expired_v1_migrates_one_way(self) -> None:
+        legacy_claim = {
+            "owner_thread_id": "legacy-owner", "claim_token": "legacy-token",
+            "claimed_at": time.time(), "expires_at": time.time() + 60,
+            "lease_seconds": 60, "window": {"address": "0x1"},
+        }
+        legacy = {
+            "version": 1,
+            "sessions": {"legacy": {"binding": BINDING, "claims": {"capture:42": legacy_claim}}},
+        }
+        coordination.atomic_write_json(coordination.CLAIMS_FILE, legacy)
+        with self.assertRaisesRegex(RuntimeError, "version-1 claims are still active"):
+            coordination.claim_window(BINDING, WINDOW, "thread-a")
+        legacy_claim.pop("expires_at")
+        coordination.atomic_write_json(coordination.CLAIMS_FILE, legacy)
+        with self.assertRaisesRegex(RuntimeError, "legacy window claim state is malformed"):
+            coordination.claim_window(BINDING, WINDOW, "thread-a")
+        legacy_claim["expires_at"] = 0
+        coordination.atomic_write_json(coordination.CLAIMS_FILE, legacy)
+        coordination.claim_window(BINDING, WINDOW, "thread-a", now=1000)
+
+        self.assertEqual(
+            json.loads(coordination.CLAIMS_FILE.read_text())["version"], 2
+        )
 
     def test_capture_identity_rotation_keeps_one_address_claim(self) -> None:
         first = coordination.claim_window(BINDING, WINDOW, "thread-a", now=1000)
         replacement = {**WINDOW, "capture_id": "43"}
-        renewed = coordination.claim_window(BINDING, replacement, "thread-a", now=1001)
+        renewed = coordination.claim_window(
+            BINDING, replacement, "thread-a", claim_token=first["claim_token"], now=1001
+        )
 
         self.assertEqual(renewed["claim_token"], first["claim_token"])
         self.assertEqual(len(coordination.list_claims(BINDING, now=1002)), 1)
@@ -158,6 +201,7 @@ class ClaimStoreTests(TestCase):
 
         self.assertNotEqual(first["claim_token"], second["claim_token"])
         self.assertEqual(second["owner_thread_id"], "thread-b")
+        self.assertEqual((first["fencing_token"], second["fencing_token"]), (1, 2))
 
     def test_release_is_idempotent_and_list_does_not_disclose_tokens(self) -> None:
         claim = coordination.claim_window(BINDING, WINDOW, "thread-a", now=1000)
@@ -175,8 +219,8 @@ class ClaimStoreTests(TestCase):
         self.assertNotIn("claim_token", second)
 
     def test_release_rejects_overlong_untrusted_tokens(self) -> None:
-        with self.assertRaisesRegex(ValueError, "1..128"):
-            coordination.release_claim(BINDING, "x" * 129, "thread-a", now=1000)
+        with self.assertRaisesRegex(ValueError, "1..256"):
+            coordination.release_claim(BINDING, "x" * 257, "thread-a", now=1000)
 
     def test_release_waits_for_an_inflight_window_operation(self) -> None:
         claim = coordination.claim_window(BINDING, WINDOW, "thread-a")
