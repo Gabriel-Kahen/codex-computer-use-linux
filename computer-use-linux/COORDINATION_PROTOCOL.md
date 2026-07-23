@@ -75,5 +75,8 @@ must use the canonical identities.
 
 ## Compatibility
 
-Hyprland companions and the generic backend write version 2. During a rolling upgrade they acquire the legacy address lock alongside the canonical window lock, in lexicographic path order.
-A version-1 journal is replaced only after every claim and in-flight deadline is inactive; otherwise lifecycle calls fail closed. No claim is copied between formats. Once version 2 exists it is authoritative, and older writers reject it instead of creating split ownership.
+The existing Hyprland version-1 journal remains authoritative until that
+backend migrates. A migration reader may accept version 1, but a version-2
+writer must never update two journals for the same claim. Once version-2 state
+exists for a session, it is authoritative and older writers must fail with an
+actionable upgrade error.

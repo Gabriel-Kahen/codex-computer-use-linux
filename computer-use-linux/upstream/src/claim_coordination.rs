@@ -308,7 +308,9 @@ pub(crate) fn legacy_window_lock_path(
 ) -> PathBuf {
     let binding_key = digest(&serde_json::to_vec(binding).expect("binding must serialize"));
     let lock_key = digest(format!("{binding_key}\0{key}").as_bytes());
-    state_dir.join("window-locks").join(format!("{lock_key}.lock"))
+    state_dir
+        .join("window-locks")
+        .join(format!("{lock_key}.lock"))
 }
 
 pub(crate) fn prepare_state_dir(state_dir: &Path) -> Result<(), String> {

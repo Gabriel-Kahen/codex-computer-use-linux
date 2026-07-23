@@ -274,7 +274,10 @@ pub(crate) fn legacy_hyprland_binding(
             text("hyprland_instance")?.into(),
         ),
         ("uid".to_string(), session.uid.into()),
-        ("wayland_display".to_string(), text("wayland_display")?.into()),
+        (
+            "wayland_display".to_string(),
+            text("wayland_display")?.into(),
+        ),
         ("xdg_runtime_dir".to_string(), runtime_dir.into()),
     ]))
 }

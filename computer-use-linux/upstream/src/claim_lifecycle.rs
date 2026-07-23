@@ -255,16 +255,11 @@ fn release_locked(state_dir: &Path, owner: String, token: String) -> Result<Clai
     let Some((session_key, window_key, identity, window_id)) = found else {
         return Ok(released_receipt(owner, None));
     };
-    let legacy_binding =
-        (identity.backend == crate::coordination_protocol::DesktopBackend::Hyprland)
+    let legacy_binding = (identity.backend
+        == crate::coordination_protocol::DesktopBackend::Hyprland)
         .then(|| coordination_identity::legacy_hyprland_binding(&identity))
         .transpose()?;
-    let _window_locks = lock_window(
-        state_dir,
-        &window_key,
-        &window_id,
-        legacy_binding.as_ref(),
-    )?;
+    let _window_locks = lock_window(state_dir, &window_key, &window_id, legacy_binding.as_ref())?;
     let journal_lock = open_lock(&journal_path)?;
     FileExt::lock_exclusive(&journal_lock)
         .map_err(|error| format!("failed to lock window claims: {error}"))?;
@@ -304,7 +299,9 @@ fn lock_window(
     window_id: &str,
     legacy_binding: Option<&BTreeMap<String, serde_json::Value>>,
 ) -> Result<Vec<File>, String> {
-    let mut paths = vec![state_dir.join("window-locks").join(format!("{window_key}.lock"))];
+    let mut paths = vec![state_dir
+        .join("window-locks")
+        .join(format!("{window_key}.lock"))];
     if let Some(binding) = legacy_binding {
         paths.push(legacy_window_lock_path(
             state_dir,
@@ -533,7 +530,10 @@ mod tests {
         let inactive = hyprland_scope();
         write_legacy_state(&inactive, 0.0);
         assert_eq!(claim(&inactive, "owner-a").unwrap().fencing_token, Some(1));
-        assert_eq!(load_state(&inactive.state_dir).unwrap().version, PROTOCOL_VERSION);
+        assert_eq!(
+            load_state(&inactive.state_dir).unwrap().version,
+            PROTOCOL_VERSION
+        );
         fs::remove_dir_all(inactive.state_dir).unwrap();
     }
 }
