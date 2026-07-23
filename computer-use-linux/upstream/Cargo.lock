@@ -332,6 +332,7 @@ dependencies = [
  "evdev",
  "fs2",
  "futures-util",
+ "getrandom",
  "image",
  "libc",
  "mimalloc",

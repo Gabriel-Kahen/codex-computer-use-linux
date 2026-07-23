@@ -14,6 +14,7 @@ use crate::atspi_tree::{
 use crate::claim_coordination::{acquire_mutation_guards, ClaimContext, MutationLane};
 #[cfg(test)]
 use crate::claim_coordination::{acquire_mutation_guards_with, Coordinator};
+use crate::claim_lifecycle;
 use crate::desktop_transaction::DesktopTransaction;
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
@@ -55,7 +56,8 @@ use rmcp::{
     handler::server::wrapper::{Json, Parameters},
     model::{CallToolResult, Content},
     schemars::JsonSchema,
-    tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt,
+    service::RequestContext,
+    tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -270,6 +272,116 @@ impl ComputerUseLinux {
     )]
     async fn list_windows(&self) -> Json<ListWindowsOutput> {
         Json(window_list_output().await)
+    }
+
+    #[tool(
+        name = "list_window_claims",
+        description = "List a bounded, token-redacted page of active claims for this desktop session.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_window_claims(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ListWindowClaimsParams>,
+    ) -> Result<Json<ListWindowClaimsOutput>, ErrorData> {
+        let owner =
+            claim_owner(&context).map_err(|error| ErrorData::invalid_params(error, None))?;
+        let (claims, next_cursor) = claim_lifecycle::list_window_claims(owner, params.cursor)
+            .await
+            .map_err(|error| ErrorData::internal_error(error, None))?;
+        Ok(Json(ListWindowClaimsOutput {
+            claims,
+            next_cursor,
+        }))
+    }
+
+    #[tool(
+        name = "claim_window",
+        description = "Claim one exact compositor window for this Codex task and return private credentials for subsequent window-scoped tools.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn claim_window(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ClaimWindowParams>,
+    ) -> Json<ClaimLifecycleOutput> {
+        let owner = match claim_owner(&context) {
+            Ok(owner) => owner,
+            Err(error) => return Json(ClaimLifecycleOutput::error(Some(params.window_id), error)),
+        };
+        Json(ClaimLifecycleOutput::from_result(
+            Some(params.window_id),
+            claim_lifecycle::claim_window(params.window_id, owner, params.lease_seconds).await,
+            "window claim created",
+        ))
+    }
+
+    #[tool(
+        name = "renew_window_claim",
+        description = "Renew this Codex task's live claim for one exact compositor window.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn renew_window_claim(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<RenewWindowClaimParams>,
+    ) -> Json<ClaimLifecycleOutput> {
+        let owner = match claim_owner(&context) {
+            Ok(owner) => owner,
+            Err(error) => return Json(ClaimLifecycleOutput::error(Some(params.window_id), error)),
+        };
+        Json(ClaimLifecycleOutput::from_result(
+            Some(params.window_id),
+            claim_lifecycle::renew_window_claim(
+                params.window_id,
+                owner,
+                params.claim_token,
+                params.lease_seconds,
+            )
+            .await,
+            "window claim renewed",
+        ))
+    }
+
+    #[tool(
+        name = "release_window_claim",
+        description = "Release this Codex task's live claim for one exact compositor window.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn release_window_claim(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<ReleaseWindowClaimParams>,
+    ) -> Json<ClaimLifecycleOutput> {
+        let owner = match claim_owner(&context) {
+            Ok(owner) => owner,
+            Err(error) => return Json(ClaimLifecycleOutput::error(None, error)),
+        };
+        Json(ClaimLifecycleOutput::from_result(
+            None,
+            claim_lifecycle::release_window_claim(owner, params.claim_token).await,
+            "window claim released",
+        ))
     }
 
     #[tool(
@@ -2350,7 +2462,33 @@ enum PostActionObservationResult {
     version = "0.5.0",
     instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/drag through absolute uinput or ydotool, send targeted scroll through ydotool, map targeted logical pointer coordinates through a shared ScreenCast/RemoteDesktop portal session, send untargeted relative scroll and layout-safe key input through that portal, and send literal type_text through KDE clipboard integration on Plasma Wayland. The portal uses selected monitor stream geometry for logical AT-SPI/window coordinates; it still refuses screenshot-derived click, scroll, and drag pixels on ambiguous mixed-scale layouts instead of guessing a transform. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click and scroll, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot results warn when a target window is partially or fully off-screen, and coordinate input outside the captured desktop bounds is rejected; use move_window/resize_window (GNOME Shell extension backend) to bring it fully on-screen before retrying. Coordinate scrolls accept the same window targeting and relative coordinates as click; element-targeted scrolls require observation_id and use verified absolute element bounds. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
-impl ServerHandler for ComputerUseLinux {}
+impl ServerHandler for ComputerUseLinux {
+    async fn call_tool(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !matches!(
+            request.name.as_ref(),
+            "claim_window" | "renew_window_claim" | "release_window_claim"
+        ) {
+            if let Some(arguments) = request.arguments.as_mut() {
+                if arguments.contains_key("owner_thread_id")
+                    || arguments.contains_key("claim_token")
+                {
+                    let owner = claim_owner(&context).ok();
+                    bind_claim_owner(
+                        arguments,
+                        owner.as_deref(),
+                        env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some(),
+                    );
+                }
+            }
+        }
+        let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.mcp_tool_router().call(context).await
+    }
+}
 
 pub async fn serve_mcp() -> Result<()> {
     ComputerUseLinux::default()
@@ -2385,6 +2523,113 @@ struct FocusedWindowOutput {
     error: Option<String>,
     permissions_hint: Option<String>,
     message: String,
+}
+
+fn default_claim_lease_seconds() -> u32 {
+    60
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct ClaimWindowParams {
+    window_id: u64,
+    #[serde(default = "default_claim_lease_seconds")]
+    #[schemars(range(min = 5, max = 300))]
+    lease_seconds: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+struct ListWindowClaimsParams {
+    #[schemars(length(equal = 64))]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ListWindowClaimsOutput {
+    claims: Vec<claim_lifecycle::ListedClaim>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct RenewWindowClaimParams {
+    window_id: u64,
+    #[schemars(length(min = 1, max = 256))]
+    claim_token: String,
+    #[serde(default = "default_claim_lease_seconds")]
+    #[schemars(range(min = 5, max = 300))]
+    lease_seconds: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct ReleaseWindowClaimParams {
+    #[schemars(length(min = 1, max = 256))]
+    claim_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ClaimLifecycleOutput {
+    ok: bool,
+    window_id: Option<u64>,
+    owner_thread_id: Option<String>,
+    claim_token: Option<String>,
+    fencing_token: Option<u64>,
+    expires_at_ms: Option<u64>,
+    message: String,
+}
+
+impl ClaimLifecycleOutput {
+    fn from_result(
+        window_id: Option<u64>,
+        result: std::result::Result<claim_lifecycle::ClaimReceipt, String>,
+        message: &str,
+    ) -> Self {
+        match result {
+            Ok(receipt) => Self {
+                ok: true,
+                window_id,
+                owner_thread_id: Some(receipt.owner_thread_id),
+                claim_token: receipt.claim_token,
+                fencing_token: receipt.fencing_token,
+                expires_at_ms: receipt.expires_at_ms,
+                message: message.to_string(),
+            },
+            Err(error) => Self::error(window_id, error),
+        }
+    }
+
+    fn error(window_id: Option<u64>, message: String) -> Self {
+        Self {
+            ok: false,
+            window_id,
+            owner_thread_id: None,
+            claim_token: None,
+            fencing_token: None,
+            expires_at_ms: None,
+            message,
+        }
+    }
+}
+
+fn claim_owner(context: &RequestContext<RoleServer>) -> Result<String, String> {
+    context
+        .meta
+        .0
+        .get("threadId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|owner| !owner.is_empty())
+        .map(str::to_string)
+        .ok_or("claim tools require host-provided _meta.threadId".to_string())
+}
+
+fn bind_claim_owner(
+    arguments: &mut serde_json::Map<String, serde_json::Value>,
+    host_owner: Option<&str>,
+    allow_legacy_owner: bool,
+) {
+    if let Some(owner) = host_owner {
+        arguments.insert("owner_thread_id".to_string(), owner.into());
+    } else if !allow_legacy_owner {
+        arguments.remove("owner_thread_id");
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]

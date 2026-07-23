@@ -4,6 +4,7 @@ mod action_batch;
 #[path = "atspi_tree.rs"]
 mod atspi_tree_impl;
 mod claim_coordination;
+mod claim_lifecycle;
 mod cli;
 mod coordination_identity;
 #[doc(hidden)]
