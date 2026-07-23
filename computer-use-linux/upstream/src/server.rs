@@ -11,7 +11,9 @@ use crate::atspi_tree::{
     snapshot_compact_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary,
     ActionFingerprint, Bounds, FocusedElementSummary, ValueSetInvocation,
 };
-use crate::claim_coordination::{acquire_mutation_guards, ClaimContext, Coordinator, MutationLane};
+use crate::claim_coordination::{acquire_mutation_guards, ClaimContext, MutationLane};
+#[cfg(test)]
+use crate::claim_coordination::{acquire_mutation_guards_with, Coordinator};
 use crate::desktop_transaction::DesktopTransaction;
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
@@ -62,7 +64,7 @@ use std::{
     os::unix::net::{UnixDatagram, UnixStream},
     path::PathBuf,
     process::{Command, Output, Stdio},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -110,7 +112,8 @@ pub struct ComputerUseLinux {
     /// full-frame capture; used for off-screen window/coordinate warnings.
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
     diagnostics_cache: Arc<Mutex<DiagnosticsCache>>,
-    claim_coordinator: Arc<OnceLock<Option<Coordinator>>>,
+    #[cfg(test)]
+    claim_coordinator: Arc<std::sync::OnceLock<Option<Coordinator>>>,
 }
 
 fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
@@ -3901,11 +3904,12 @@ impl ComputerUseLinux {
     ) -> std::result::Result<Option<crate::claim_coordination::MutationGuards>, String> {
         match mode {
             ClaimGuardMode::Acquire => {
-                let coordinator = self
-                    .claim_coordinator
-                    .get_or_init(Coordinator::from_env)
-                    .clone();
-                acquire_mutation_guards(coordinator, window_id, context, lane).await
+                #[cfg(test)]
+                if let Some(coordinator) = self.claim_coordinator.get().cloned().flatten() {
+                    return acquire_mutation_guards_with(coordinator, window_id, context, lane)
+                        .await;
+                }
+                acquire_mutation_guards(window_id, context, lane).await
             }
             ClaimGuardMode::AlreadyHeld => Ok(None),
         }
@@ -5682,6 +5686,7 @@ mod tests {
     use crate::atspi_tree::{AccessibilityAction, Bounds};
     use crate::windows::{WindowBounds, GNOME_SHELL_EXTENSION_BACKEND};
     use std::io::{BufRead, Write};
+    use std::os::unix::fs::PermissionsExt;
     fn claim_context(owner: &str, token: &str) -> ClaimContext {
         ClaimContext {
             owner_thread_id: Some(owner.to_string()),
@@ -5717,6 +5722,8 @@ mod tests {
         let coordinator = Coordinator {
             state_dir: root.clone(),
             binding,
+            session: None,
+            window: None,
         };
         let session = coordinator.binding_key();
         let state = serde_json::json!({
@@ -5738,6 +5745,11 @@ mod tests {
         std::fs::write(
             root.join("window-claims.json"),
             serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            root.join("window-claims.json"),
+            std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
         let backend = ComputerUseLinux::default();

@@ -345,7 +345,7 @@ fn i3_msg_command() -> Command {
     command
 }
 
-fn i3_socket_path() -> Option<PathBuf> {
+pub(crate) fn i3_socket_path() -> Option<PathBuf> {
     if let Some(value) = env_var("I3SOCK") {
         return Some(PathBuf::from(value));
     }

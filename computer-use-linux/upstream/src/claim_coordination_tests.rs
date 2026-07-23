@@ -1,19 +1,20 @@
 use super::*;
+use crate::coordination_protocol::{DesktopBackend, IdentityAttribute};
 use serde_json::json;
+use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 fn fixture() -> (PathBuf, Coordinator) {
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
     let root = env::temp_dir().join(format!(
         "computer-use-linux-claims-{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
     ));
     let binding = BTreeMap::from([
         ("hyprland_instance".to_string(), json!("instance")),
@@ -24,6 +25,8 @@ fn fixture() -> (PathBuf, Coordinator) {
     let coordinator = Coordinator {
         state_dir: root.clone(),
         binding,
+        session: None,
+        window: None,
     };
     coordinator.prepare_state_dir().unwrap();
     (root, coordinator)
@@ -49,11 +52,49 @@ fn write_claim(coordinator: &Coordinator, expires_at: f64) {
             }
         }
     });
-    fs::write(
-        coordinator.state_dir.join("window-claims.json"),
-        serde_json::to_vec(&state).unwrap(),
-    )
-    .unwrap();
+    write_private_json(coordinator, &state);
+}
+
+fn protocol_fixture() -> (PathBuf, Coordinator) {
+    let (root, mut coordinator) = fixture();
+    coordinator.binding.clear();
+    let session = SessionIdentity {
+        backend: DesktopBackend::Gnome,
+        uid: unsafe { libc::geteuid() },
+        attributes: BTreeMap::from([(
+            "display".to_string(),
+            IdentityAttribute::Text(":0".to_string()),
+        )]),
+    };
+    let window = WindowIdentity {
+        backend: DesktopBackend::Gnome,
+        id: "0x2a".to_string(),
+        process: None,
+    };
+    coordinator.session = Some(session);
+    coordinator.window = Some(window);
+    (root, coordinator)
+}
+
+fn write_protocol_claim(coordinator: &Coordinator) {
+    let session = coordinator.session.clone().unwrap();
+    let window = coordinator.window.clone().unwrap();
+    let renewed_at_ms = now_ms();
+    let state = json!({"version": PROTOCOL_VERSION, "sessions": {session.key(): {
+        "identity": &session, "next_fencing_token": 2, "claims": {window.key(&session): {
+            "owner_thread_id": "owner-v2", "claim_token": "token-v2", "fencing_token": 1,
+            "claimed_at_ms": renewed_at_ms, "renewed_at_ms": renewed_at_ms,
+            "expires_at_ms": renewed_at_ms + 60_000, "lease_seconds": 60,
+            "window": {"identity": &window}
+        }}
+    }}});
+    write_private_json(coordinator, &state);
+}
+
+fn write_private_json(coordinator: &Coordinator, value: &serde_json::Value) {
+    let path = coordinator.state_dir.join("window-claims.json");
+    fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 #[test]
@@ -74,7 +115,7 @@ fn companion_process_lock_serializes_a_competing_client_before_rejection() {
     let mut companion = Command::new("python3")
         .args([
             "-c",
-            "import fcntl,sys; f=open(sys.argv[1], 'a+'); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); input()",
+            "import fcntl,os,sys; f=open(sys.argv[1], 'a+'); os.chmod(sys.argv[1], 0o600); fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); input()",
         ])
         .arg(lock)
         .stdin(Stdio::piped())
@@ -147,6 +188,31 @@ fn expired_claim_does_not_block_a_new_operation() {
     write_claim(&coordinator, now() - 1.0);
     let guard = coordinator
         .acquire(Some(42), &ClaimContext::default())
+        .unwrap();
+    drop(guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn protocol_claim_requires_matching_owner_and_token() {
+    let (root, coordinator) = protocol_fixture();
+    write_protocol_claim(&coordinator);
+    let error = coordinator
+        .acquire(Some(42), &ClaimContext::default())
+        .err()
+        .unwrap();
+    assert_eq!(
+        error,
+        "window is actively claimed by another computer-use agent"
+    );
+    let guard = coordinator
+        .acquire(
+            Some(42),
+            &ClaimContext {
+                owner_thread_id: Some("owner-v2".to_string()),
+                claim_token: Some("token-v2".to_string()),
+            },
+        )
         .unwrap();
     drop(guard);
     fs::remove_dir_all(root).unwrap();
