@@ -1,0 +1,47 @@
+{
+  "version": 2,
+  "sessions": {
+    "b8f42adc1ada5977b883432ff84b34d8a065bcf056c040cb32b0d60e40b8e68d": {
+      "identity": {
+        "backend": "hyprland",
+        "uid": 1000,
+        "attributes": {
+          "hyprland_instance": "instance",
+          "session_label": "démo",
+          "wayland_display": "wayland-1",
+          "xdg_runtime_dir": "/run/user/1000"
+        }
+      },
+      "next_fencing_token": 8,
+      "claims": {
+        "072e2275d7382f5a1e0320c95de3be3cc7295a13713aaa24f1a7911ded631ae4": {
+          "owner_thread_id": "thread-123",
+          "claim_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "fencing_token": 7,
+          "owner_process": {
+            "pid": 4242,
+            "start_time": 987654
+          },
+          "claimed_at_ms": 1000000,
+          "renewed_at_ms": 1000000,
+          "expires_at_ms": 1060000,
+          "lease_seconds": 60,
+          "window": {
+            "identity": {
+              "backend": "hyprland",
+              "id": "address:0x2a-é",
+              "process": {
+                "pid": 777,
+                "start_time": 123456
+              }
+            },
+            "summary": {
+              "app_id": "org.example.Editor",
+              "title": "Example"
+            }
+          }
+        }
+      }
+    }
+  }
+}

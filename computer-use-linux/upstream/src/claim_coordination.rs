@@ -1,3 +1,4 @@
+pub(crate) use crate::coordination_protocol::MutationLane;
 use fs2::FileExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -23,12 +24,6 @@ pub(crate) struct ClaimContext {
 
 pub(crate) struct ClaimGuard {
     _lock: File,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum MutationLane {
-    Window,
-    PhysicalSeat,
 }
 
 pub(crate) struct MutationGuards {
