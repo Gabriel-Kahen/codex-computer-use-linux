@@ -22,6 +22,7 @@ pub const MAX_SUMMARY_FIELDS: usize = 8;
 pub const MAX_SUMMARY_VALUE_CHARS: usize = 256;
 pub const MAX_SERIALIZED_STATE_BYTES: usize = 1_048_576;
 pub const MIN_LEASE_SECONDS: u32 = 5;
+pub const DEFAULT_LEASE_SECONDS: u32 = 60;
 pub const MAX_LEASE_SECONDS: u32 = 300;
 pub const MAX_INFLIGHT_SECONDS: u32 = 300;
 

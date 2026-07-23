@@ -48,7 +48,7 @@ pub mod diagnostics {
     pub use crate::diagnostics_impl::{
         doctor_report, hydrate_session_bus_env, AccessibilityReport, CapabilityMap, Check,
         DoctorReport, InputReport, PlatformReport, PortalReport, PreferredBackends,
-        ReadinessReport, WindowingReport,
+        ReadinessReport, WindowClaimReadiness, WindowingReport,
     };
     pub(crate) use crate::diagnostics_impl::{setup_accessibility_report, SetupReport};
 }

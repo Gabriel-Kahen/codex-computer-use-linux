@@ -86,6 +86,11 @@ const KDE_KLIPPER_SERVICE: &str = "org.kde.klipper";
 const KDE_KLIPPER_PATH: &str = "/klipper";
 const KDE_KLIPPER_INTERFACE: &str = "org.kde.klipper.klipper";
 const READINESS_CACHE_TTL: Duration = Duration::from_secs(2);
+const CLAIM_USE_NEXT_ACTION: &str = "Keep claim_token private, pass it to exact-window tools, renew before expires_at_ms, and release_window_claim during cleanup.";
+const CLAIM_CREATE_RECOVERY: &str = "Stop exact-window work and call list_window_claims once. If listing fails, resolve that error; if a live claim exists, use its retained token or wait for expiry before claiming again.";
+const CLAIM_RENEW_RECOVERY: &str = "Stop exact-window work and call list_window_claims once. If listing fails, resolve that error; otherwise use the current retained token, or wait for expiry and claim again if it was lost.";
+const CLAIM_RELEASE_RECOVERY: &str = "Stop window work. Resolve the reported error before retrying release_window_claim; if a successful list reports the claim absent, cleanup is complete.";
+const HYPRLAND_CLAIM_RECOVERY: &str = "Use the Hyprland same-session companion claim lifecycle; do not retry the shared claim tools during migration.";
 
 #[derive(Clone, Copy)]
 enum ClaimGuardMode {
@@ -288,16 +293,14 @@ impl ComputerUseLinux {
         &self,
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<ListWindowClaimsParams>,
-    ) -> Result<Json<ListWindowClaimsOutput>, ErrorData> {
-        let owner =
-            claim_owner(&context).map_err(|error| ErrorData::invalid_params(error, None))?;
-        let (claims, next_cursor) = claim_lifecycle::list_window_claims(owner, params.cursor)
-            .await
-            .map_err(|error| ErrorData::internal_error(error, None))?;
-        Ok(Json(ListWindowClaimsOutput {
-            claims,
-            next_cursor,
-        }))
+    ) -> Json<ListWindowClaimsOutput> {
+        let owner = match claim_owner(&context) {
+            Ok(owner) => owner,
+            Err(error) => return Json(ListWindowClaimsOutput::error(error)),
+        };
+        Json(ListWindowClaimsOutput::from_result(
+            claim_lifecycle::list_window_claims(owner, params.cursor).await,
+        ))
     }
 
     #[tool(
@@ -317,12 +320,20 @@ impl ComputerUseLinux {
     ) -> Json<ClaimLifecycleOutput> {
         let owner = match claim_owner(&context) {
             Ok(owner) => owner,
-            Err(error) => return Json(ClaimLifecycleOutput::error(Some(params.window_id), error)),
+            Err(error) => {
+                return Json(ClaimLifecycleOutput::error(
+                    Some(params.window_id),
+                    error,
+                    CLAIM_CREATE_RECOVERY,
+                ));
+            }
         };
         Json(ClaimLifecycleOutput::from_result(
             Some(params.window_id),
             claim_lifecycle::claim_window(params.window_id, owner, params.lease_seconds).await,
             "window claim created",
+            CLAIM_USE_NEXT_ACTION,
+            CLAIM_CREATE_RECOVERY,
         ))
     }
 
@@ -343,7 +354,13 @@ impl ComputerUseLinux {
     ) -> Json<ClaimLifecycleOutput> {
         let owner = match claim_owner(&context) {
             Ok(owner) => owner,
-            Err(error) => return Json(ClaimLifecycleOutput::error(Some(params.window_id), error)),
+            Err(error) => {
+                return Json(ClaimLifecycleOutput::error(
+                    Some(params.window_id),
+                    error,
+                    CLAIM_RENEW_RECOVERY,
+                ));
+            }
         };
         Json(ClaimLifecycleOutput::from_result(
             Some(params.window_id),
@@ -355,6 +372,8 @@ impl ComputerUseLinux {
             )
             .await,
             "window claim renewed",
+            CLAIM_USE_NEXT_ACTION,
+            CLAIM_RENEW_RECOVERY,
         ))
     }
 
@@ -375,12 +394,20 @@ impl ComputerUseLinux {
     ) -> Json<ClaimLifecycleOutput> {
         let owner = match claim_owner(&context) {
             Ok(owner) => owner,
-            Err(error) => return Json(ClaimLifecycleOutput::error(None, error)),
+            Err(error) => {
+                return Json(ClaimLifecycleOutput::error(
+                    None,
+                    error,
+                    CLAIM_RELEASE_RECOVERY,
+                ));
+            }
         };
         Json(ClaimLifecycleOutput::from_result(
             None,
             claim_lifecycle::release_window_claim(owner, params.claim_token).await,
             "window claim released",
+            "Cleanup is complete; discard the local claim token.",
+            CLAIM_RELEASE_RECOVERY,
         ))
     }
 
@@ -2460,7 +2487,7 @@ enum PostActionObservationResult {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.5.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/drag through absolute uinput or ydotool, send targeted scroll through ydotool, map targeted logical pointer coordinates through a shared ScreenCast/RemoteDesktop portal session, send untargeted relative scroll and layout-safe key input through that portal, and send literal type_text through KDE clipboard integration on Plasma Wayland. The portal uses selected monitor stream geometry for logical AT-SPI/window coordinates; it still refuses screenshot-derived click, scroll, and drag pixels on ambiguous mixed-scale layouts instead of guessing a transform. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click and scroll, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot results warn when a target window is partially or fully off-screen, and coordinate input outside the captured desktop bounds is rejected; use move_window/resize_window (GNOME Shell extension backend) to bring it fully on-screen before retrying. Coordinate scrolls accept the same window targeting and relative coordinates as click; element-targeted scrolls require observation_id and use verified absolute element bounds. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/drag through absolute uinput or ydotool, send targeted scroll through ydotool, map targeted logical pointer coordinates through a shared ScreenCast/RemoteDesktop portal session, send untargeted relative scroll and layout-safe key input through that portal, and send literal type_text through KDE clipboard integration on Plasma Wayland. The portal uses selected monitor stream geometry for logical AT-SPI/window coordinates; it still refuses screenshot-derived click, scroll, and drag pixels on ambiguous mixed-scale layouts instead of guessing a transform. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. When readiness.window_claims.supports_shared_lifecycle is true, exhaust list_window_claims pages before sustained exact-window work, create a claim, keep its token private, renew before expiry, and release it in finally-style cleanup; lifecycle calls still verify the current session identity, host _meta.threadId is authoritative, and lost tokens cannot be recovered from listing. Hyprland continues to use its same-session companion claims during migration. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click and scroll, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot results warn when a target window is partially or fully off-screen, and coordinate input outside the captured desktop bounds is rejected; use move_window/resize_window (GNOME Shell extension backend) to bring it fully on-screen before retrying. Coordinate scrolls accept the same window targeting and relative coordinates as click; element-targeted scrolls require observation_id and use verified absolute element bounds. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {
     async fn call_tool(
@@ -2526,7 +2553,7 @@ struct FocusedWindowOutput {
 }
 
 fn default_claim_lease_seconds() -> u32 {
-    60
+    crate::coordination_protocol::DEFAULT_LEASE_SECONDS
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -2545,8 +2572,65 @@ struct ListWindowClaimsParams {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct ListWindowClaimsOutput {
+    ok: bool,
     claims: Vec<claim_lifecycle::ListedClaim>,
     next_cursor: Option<String>,
+    owned_by_caller_on_page: usize,
+    message: String,
+    next_action: String,
+}
+
+impl ListWindowClaimsOutput {
+    fn from_result(
+        result: std::result::Result<(Vec<claim_lifecycle::ListedClaim>, Option<String>), String>,
+    ) -> Self {
+        match result {
+            Ok((claims, next_cursor)) => {
+                let owned_by_caller_on_page =
+                    claims.iter().filter(|claim| claim.owned_by_caller).count();
+                let next_action = if next_cursor.is_some() {
+                    "Continue list_window_claims with next_cursor before deciding whether a target is unclaimed or who owns it."
+                } else {
+                    match (claims.is_empty(), owned_by_caller_on_page) {
+                        (true, _) => "Call claim_window before sustained work on an exact window.",
+                        (false, 0) => {
+                            "Choose a different window and claim it before exact-window work, or wait until the foreign claim expires."
+                        }
+                        (false, _) => {
+                            "Use only a locally retained token, renew before expires_at_ms, and release in finally-style cleanup. If the token was lost, wait for expiry before reclaiming."
+                        }
+                    }
+                };
+                Self {
+                    ok: true,
+                    message: format!(
+                        "Returned {} active token-redacted claims; {owned_by_caller_on_page} are owned by this host task.",
+                        claims.len()
+                    ),
+                    claims,
+                    next_cursor,
+                    owned_by_caller_on_page,
+                    next_action: next_action.to_string(),
+                }
+            }
+            Err(error) => Self::error(error),
+        }
+    }
+
+    fn error(error: String) -> Self {
+        let next_action = claim_error_next_action(
+            &error,
+            "Stop exact-window work and resolve the reported coordination-state or session-identity error before retrying list_window_claims.",
+        );
+        Self {
+            ok: false,
+            claims: Vec::new(),
+            next_cursor: None,
+            owned_by_caller_on_page: 0,
+            message: bounded_action_result_message(&error),
+            next_action,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -2574,6 +2658,7 @@ struct ClaimLifecycleOutput {
     fencing_token: Option<u64>,
     expires_at_ms: Option<u64>,
     message: String,
+    next_action: String,
 }
 
 impl ClaimLifecycleOutput {
@@ -2581,6 +2666,8 @@ impl ClaimLifecycleOutput {
         window_id: Option<u64>,
         result: std::result::Result<claim_lifecycle::ClaimReceipt, String>,
         message: &str,
+        success_next_action: &str,
+        error_next_action: &str,
     ) -> Self {
         match result {
             Ok(receipt) => Self {
@@ -2591,12 +2678,14 @@ impl ClaimLifecycleOutput {
                 fencing_token: receipt.fencing_token,
                 expires_at_ms: receipt.expires_at_ms,
                 message: message.to_string(),
+                next_action: success_next_action.to_string(),
             },
-            Err(error) => Self::error(window_id, error),
+            Err(error) => Self::error(window_id, error, error_next_action),
         }
     }
 
-    fn error(window_id: Option<u64>, message: String) -> Self {
+    fn error(window_id: Option<u64>, message: String, next_action: &str) -> Self {
+        let next_action = claim_error_next_action(&message, next_action);
         Self {
             ok: false,
             window_id,
@@ -2604,20 +2693,38 @@ impl ClaimLifecycleOutput {
             claim_token: None,
             fencing_token: None,
             expires_at_ms: None,
-            message,
+            message: bounded_action_result_message(&message),
+            next_action,
         }
     }
 }
 
+fn claim_error_next_action(error: &str, fallback: &str) -> String {
+    if error.contains("Hyprland claims remain") {
+        HYPRLAND_CLAIM_RECOVERY.to_string()
+    } else if error.contains("host-provided _meta.threadId")
+        || error.contains("owner_thread_id must contain")
+    {
+        "Provide valid host task metadata; client-supplied ownership is not accepted.".to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
 fn claim_owner(context: &RequestContext<RoleServer>) -> Result<String, String> {
-    context
+    let owner = context
         .meta
         .0
         .get("threadId")
         .and_then(serde_json::Value::as_str)
         .filter(|owner| !owner.is_empty())
         .map(str::to_string)
-        .ok_or("claim tools require host-provided _meta.threadId".to_string())
+        .ok_or("claim tools require host-provided _meta.threadId".to_string())?;
+    crate::claim_coordination::validate_context(&ClaimContext {
+        owner_thread_id: Some(owner.clone()),
+        claim_token: None,
+    })?;
+    Ok(owner)
 }
 
 fn bind_claim_owner(
@@ -6035,6 +6142,129 @@ mod tests {
         assert!(
             unsupported.is_empty(),
             "unsupported unsigned integer formats: {unsupported:?}"
+        );
+    }
+
+    #[test]
+    fn claim_tool_schemas_are_token_safe_and_actionable() {
+        let tools = ComputerUseLinux::default().mcp_tool_router().list_all();
+        let list = tools
+            .iter()
+            .find(|tool| tool.name == "list_window_claims")
+            .unwrap();
+        let list_input = serde_json::to_value(&list.input_schema).unwrap();
+        let list_output = serde_json::to_string(&list.output_schema).unwrap();
+
+        assert_eq!(
+            list_input["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["cursor"]
+        );
+        assert_eq!(list_input["properties"]["cursor"]["minLength"], 64);
+        assert_eq!(list_input["properties"]["cursor"]["maxLength"], 64);
+        assert!(list_output.contains("stable_window_id"));
+        assert!(list_output.contains("owned_by_caller"));
+        assert!(list_output.contains("next_action"));
+        assert!(!list_output.contains("claim_token"));
+
+        for name in ["claim_window", "renew_window_claim", "release_window_claim"] {
+            let output = serde_json::to_string(
+                &tools
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .unwrap()
+                    .output_schema,
+            )
+            .unwrap();
+            assert!(output.contains("claim_token"), "{name}");
+            assert!(output.contains("expires_at_ms"), "{name}");
+            assert!(output.contains("next_action"), "{name}");
+        }
+    }
+
+    #[test]
+    fn claim_listing_exhausts_pagination_before_recovery_guidance() {
+        let output = ListWindowClaimsOutput::from_result(Ok((
+            vec![claim_lifecycle::ListedClaim {
+                window_id: 42,
+                stable_window_id: "0x2a".to_string(),
+                owner_thread_id: "another-task".to_string(),
+                owned_by_caller: false,
+                expires_at_ms: 1_000,
+            }],
+            Some("a".repeat(64)),
+        )));
+
+        assert!(output.ok);
+        assert!(output.next_cursor.is_some());
+        assert!(output.next_action.contains("with next_cursor"));
+        assert!(!output.next_action.contains("Choose a different window"));
+    }
+
+    #[test]
+    fn claim_failures_are_bounded_and_recoverable() {
+        let adversarial = format!("failed\n{}\u{7}", "é".repeat(600));
+        let list = ListWindowClaimsOutput::error(adversarial.clone());
+        let lifecycle = ClaimLifecycleOutput::error(Some(42), adversarial, CLAIM_RENEW_RECOVERY);
+
+        assert!(!list.ok);
+        assert!(list.claims.is_empty());
+        assert!(list.message.len() <= 512);
+        assert!(!list.message.chars().any(char::is_control));
+        assert!(list.next_action.contains("list_window_claims"));
+        assert!(!lifecycle.ok);
+        assert_eq!(lifecycle.window_id, Some(42));
+        assert_eq!(lifecycle.claim_token, None);
+        assert!(lifecycle.message.len() <= 512);
+        assert!(!lifecycle.message.chars().any(char::is_control));
+        assert_eq!(lifecycle.next_action, CLAIM_RENEW_RECOVERY);
+    }
+
+    #[test]
+    fn claim_recovery_routes_hyprland_and_stops_on_corrupt_state() {
+        let hyprland = ListWindowClaimsOutput::error(
+            "Hyprland claims remain companion-owned during migration".to_string(),
+        );
+        let corrupt = ListWindowClaimsOutput::error(
+            "window claim state is unreadable: invalid data".to_string(),
+        );
+        let lifecycle = ClaimLifecycleOutput::error(
+            Some(42),
+            "Hyprland claims remain owned by the same-session companion during migration"
+                .to_string(),
+            CLAIM_CREATE_RECOVERY,
+        );
+
+        assert_eq!(hyprland.next_action, HYPRLAND_CLAIM_RECOVERY);
+        assert_eq!(lifecycle.next_action, HYPRLAND_CLAIM_RECOVERY);
+        assert!(!hyprland.next_action.contains("list_window_claims"));
+        assert!(corrupt.next_action.contains("Stop exact-window work"));
+        assert!(!corrupt.next_action.contains("host-metadata"));
+    }
+
+    #[test]
+    fn host_task_metadata_overrides_claim_owner_arguments() {
+        let mut arguments = serde_json::Map::from_iter([
+            ("owner_thread_id".to_string(), "untrusted-owner".into()),
+            ("claim_token".to_string(), "private-token".into()),
+        ]);
+
+        bind_claim_owner(&mut arguments, Some("host-task"), false);
+        assert_eq!(
+            arguments,
+            serde_json::Map::from_iter([
+                ("owner_thread_id".to_string(), "host-task".into()),
+                ("claim_token".to_string(), "private-token".into()),
+            ])
+        );
+
+        bind_claim_owner(&mut arguments, None, false);
+        assert_eq!(
+            arguments,
+            serde_json::Map::from_iter([("claim_token".to_string(), "private-token".into())])
         );
     }
 
