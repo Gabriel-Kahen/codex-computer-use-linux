@@ -31,14 +31,17 @@ use codex_connectors::ConnectorRuntimeContext;
 use codex_connectors::ConnectorRuntimeContextKey;
 use codex_connectors::ConnectorRuntimeFetchSource;
 use codex_connectors::ConnectorRuntimeManager;
-use codex_exec_server::EnvironmentManager;
+use codex_exec_server_test_support::environment_manager_without_environments;
 use codex_login::CodexAuth;
 use codex_protocol::ToolName;
 use codex_protocol::mcp::McpServerInfo;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::GranularApprovalConfig;
+use codex_protocol::protocol::McpStartupFailureReason;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rmcp_client::InProcessTransportFactory;
+use codex_rmcp_client::McpAuthState;
+use codex_rmcp_client::McpLoginRequirement;
 use codex_rmcp_client::RmcpClient;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -73,6 +76,76 @@ use tempfile::tempdir;
 use tokio::io::DuplexStream;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+impl McpConnectionSet {
+    fn new_uninitialized(
+        approval_policy: &Constrained<AskForApproval>,
+        permission_profile: &Constrained<PermissionProfile>,
+        prefix_mcp_tool_names: bool,
+    ) -> Self {
+        Self {
+            servers: HashMap::new(),
+            required_servers: Vec::new(),
+            tool_catalog_revision: Arc::new(RwLock::new(0)),
+            codex_apps_tools_override: RwLock::new(None),
+            codex_apps_refresh_lock: Mutex::new(()),
+            tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
+            prefix_mcp_tool_names,
+            non_prefixed_mcp_tool_servers: Vec::new(),
+            elicitation_requests: ElicitationRequestManager::new(
+                approval_policy.value(),
+                permission_profile.get().clone(),
+                /*reviewer*/ None,
+                /*lifecycle*/ None,
+                ElicitationRequestRouter::default(),
+            ),
+        }
+    }
+
+    fn insert_test_client(&mut self, name: impl Into<String>, client: AsyncManagedClient) {
+        let name = name.into();
+        self.servers.insert(
+            name,
+            McpServerView {
+                tool_filter: ToolFilter::default(),
+                connection: Arc::new(McpServerConnection {
+                    identity: None,
+                    client,
+                }),
+                metadata: McpServerMetadata {
+                    environment_id: String::new(),
+                    pollutes_memory: true,
+                    origin: None,
+                    supports_parallel_tool_calls: false,
+                    default_tools_approval_mode: None,
+                    tool_approval_modes: HashMap::new(),
+                },
+                tool_timeout: None,
+            },
+        );
+    }
+
+    fn test_client(&self, name: &str) -> &AsyncManagedClient {
+        &self.servers[name].connection.client
+    }
+
+    fn set_test_server_metadata(&mut self, name: &str, metadata: McpServerMetadata) {
+        self.servers
+            .get_mut(name)
+            .expect("test server exists")
+            .metadata = metadata;
+    }
+
+    fn shares_test_connection_with(&self, other: &Self, name: &str) -> bool {
+        let Some(left) = self.servers.get(name) else {
+            return false;
+        };
+        let Some(right) = other.servers.get(name) else {
+            return false;
+        };
+        Arc::ptr_eq(&left.connection, &right.connection)
+    }
+}
 
 fn create_test_tool(server_name: &str, tool_name: &str) -> ToolInfo {
     ToolInfo {
@@ -240,6 +313,36 @@ impl InProcessTransportFactory for MutableToolsTransportFactory {
                     .waiting()
                     .await
                     .expect("mutable MCP tools server completes");
+            });
+            Ok(client_stream)
+        }
+        .boxed()
+    }
+}
+
+struct DisconnectingToolsTransportFactory {
+    server: MutableToolsServer,
+    disconnect: CancellationToken,
+}
+
+impl InProcessTransportFactory for DisconnectingToolsTransportFactory {
+    fn open(&self) -> BoxFuture<'static, io::Result<DuplexStream>> {
+        let server = self.server.clone();
+        let disconnect = self.disconnect.clone();
+        async move {
+            let (client_stream, server_stream) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                let server = server
+                    .serve(server_stream)
+                    .await
+                    .expect("serve disconnecting MCP tools");
+                let cancellation = server.cancellation_token();
+                tokio::select! {
+                    () = disconnect.cancelled() => cancellation.cancel(),
+                    result = server.waiting() => {
+                        result.expect("disconnecting MCP server should complete");
+                    }
+                }
             });
             Ok(client_stream)
         }
@@ -704,13 +807,76 @@ fn test_normalize_tools_short_non_duplicated_names() {
     ];
 
     let model_tools =
-        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true);
+        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true, &[]);
 
     assert_eq!(
         model_tool_names(&model_tools),
         HashSet::from([
             ToolName::namespaced("mcp__server1", "tool1"),
             ToolName::namespaced("mcp__server1", "tool2")
+        ])
+    );
+}
+
+#[test]
+fn test_normalize_tools_omits_prefix_only_for_selected_servers() {
+    let tools = vec![
+        create_test_tool("history", "search"),
+        create_test_tool("notes", "read"),
+        create_test_tool("calendar", "list"),
+    ];
+
+    let model_tools = normalize_tools_for_model_with_prefix(
+        tools,
+        /*prefix_mcp_tool_names*/ true,
+        &["history".to_string(), "notes".to_string()],
+    );
+
+    assert_eq!(
+        model_tool_names(&model_tools),
+        HashSet::from([
+            ToolName::namespaced("history", "search"),
+            ToolName::namespaced("notes", "read"),
+            ToolName::namespaced("mcp__calendar", "list"),
+        ])
+    );
+}
+
+#[test]
+fn test_normalize_tools_selects_raw_server_name() {
+    let mut tool = create_test_tool("codex_apps", "search");
+    tool.callable_namespace = "codex_apps__calendar".to_string();
+
+    let model_tools = normalize_tools_for_model_with_prefix(
+        vec![tool],
+        /*prefix_mcp_tool_names*/ true,
+        &["codex_apps".to_string()],
+    );
+
+    assert_eq!(
+        model_tool_names(&model_tools),
+        HashSet::from([ToolName::namespaced("codex_apps__calendar", "search")])
+    );
+}
+
+#[test]
+fn test_normalize_tools_global_feature_omits_prefix_for_every_server() {
+    let tools = vec![
+        create_test_tool("history", "search"),
+        create_test_tool("calendar", "list"),
+    ];
+
+    let model_tools = normalize_tools_for_model_with_prefix(
+        tools,
+        /*prefix_mcp_tool_names*/ false,
+        &["history".to_string()],
+    );
+
+    assert_eq!(
+        model_tool_names(&model_tools),
+        HashSet::from([
+            ToolName::namespaced("history", "search"),
+            ToolName::namespaced("calendar", "list"),
         ])
     );
 }
@@ -723,7 +889,7 @@ fn test_normalize_tools_duplicated_names_skipped() {
     ];
 
     let model_tools =
-        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true);
+        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true, &[]);
 
     // Only the first tool should remain, the second is skipped
     assert_eq!(
@@ -748,7 +914,7 @@ fn test_normalize_tools_long_names_same_server() {
     ];
 
     let model_tools =
-        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true);
+        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true, &[]);
 
     assert_eq!(model_tools.len(), 2);
 
@@ -771,7 +937,7 @@ fn test_normalize_tools_sanitizes_invalid_characters() {
     let tools = vec![create_test_tool("server.one", "tool.two-three")];
 
     let model_tools =
-        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true);
+        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true, &[]);
 
     assert_eq!(model_tools.len(), 1);
     let tool = model_tools.into_iter().next().expect("one tool");
@@ -802,7 +968,7 @@ fn test_normalize_tools_keeps_hyphenated_mcp_tools_callable() {
     let tools = vec![create_test_tool("music-studio", "get-strudel-guide")];
 
     let model_tools =
-        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true);
+        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true, &[]);
 
     assert_eq!(model_tools.len(), 1);
     let tool = model_tools.into_iter().next().expect("one tool");
@@ -823,7 +989,7 @@ fn test_normalize_tools_disambiguates_sanitized_namespace_collisions() {
     ];
 
     let model_tools =
-        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true);
+        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true, &[]);
 
     assert_eq!(model_tools.len(), 2);
     let mut namespaces = model_tools
@@ -854,7 +1020,7 @@ fn test_normalize_tools_disambiguates_sanitized_tool_name_collisions() {
     ];
 
     let model_tools =
-        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true);
+        normalize_tools_for_model_with_prefix(tools, /*prefix_mcp_tool_names*/ true, &[]);
 
     assert_eq!(model_tools.len(), 2);
     let raw_tool_names = model_tools
@@ -1178,7 +1344,7 @@ async fn hard_refresh_keeps_binding_override_local_when_shared_cache_loses_race(
 #[tokio::test(start_paused = true)]
 async fn tool_catalog_cache_sanitizes_tools_and_tracks_environment_generation() {
     let cache = McpToolCatalogCache::default();
-    let environment_manager = Arc::new(EnvironmentManager::without_environments());
+    let environment_manager = Arc::new(environment_manager_without_environments());
     let replace_environment = |url: &str| {
         environment_manager
             .upsert_environment(
@@ -1250,7 +1416,7 @@ async fn tool_catalog_cache_sanitizes_tools_and_tracks_environment_generation() 
 fn tool_catalog_cache_bypasses_remote_sourced_environment_variables() {
     let cache = McpToolCatalogCache::default();
     let runtime_context = McpRuntimeContext::new(
-        Arc::new(EnvironmentManager::without_environments()),
+        Arc::new(environment_manager_without_environments()),
         PathBuf::from("/tmp"),
     );
     let config: McpServerConfig = serde_json::from_value(serde_json::json!({
@@ -2126,7 +2292,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
             tx_event: None,
             startup_cancellation_token: cancel_token.clone(),
             runtime_context: McpRuntimeContext::new(
-                Arc::new(EnvironmentManager::without_environments()),
+                Arc::new(environment_manager_without_environments()),
                 PathBuf::from("/tmp"),
             ),
             codex_apps_tools_cache: ConnectorRuntimeManager::<ToolInfo>::default(),
@@ -2367,7 +2533,7 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
 
 fn reusable_server_runtime_context() -> McpRuntimeContext {
     McpRuntimeContext::new(
-        Arc::new(EnvironmentManager::without_environments()),
+        Arc::new(environment_manager_without_environments()),
         PathBuf::from("/tmp"),
     )
 }
@@ -2652,6 +2818,80 @@ async fn reconciliation_reuses_ready_server_when_startup_timeout_changes() {
     let reconciled = reconcile_reusable_server(&previous, config, runtime_context).await;
 
     assert!(previous.shares_test_connection_with(&reconciled, "docs"));
+}
+
+#[tokio::test]
+async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
+    let runtime_context = reusable_server_runtime_context();
+    let config = reusable_server_config("http://127.0.0.1:1");
+    let mut previous = manager_with_reusable_ready_server(
+        &config,
+        &runtime_context,
+        vec![create_test_tool("docs", "search")],
+    )
+    .await;
+    let disconnect = CancellationToken::new();
+    let client = Arc::new(
+        RmcpClient::new_in_process_client(Arc::new(DisconnectingToolsTransportFactory {
+            server: MutableToolsServer {
+                tools: Arc::new(tokio::sync::RwLock::new(vec![Tool::new(
+                    "search",
+                    "search",
+                    Arc::new(JsonObject::default()),
+                )])),
+                block_tool_listing: Arc::new(AtomicBool::new(false)),
+            },
+            disconnect: disconnect.clone(),
+        }))
+        .await?,
+    );
+    client
+        .initialize(
+            InitializeRequestParams::new(
+                ClientCapabilities::default(),
+                Implementation::new("codex-test", "0.0.0-test"),
+            )
+            .with_protocol_version(ProtocolVersion::V_2025_06_18),
+            /*timeout*/ None,
+            Box::new(|_, _| async { Err(anyhow!("unexpected elicitation")) }.boxed()),
+        )
+        .await?;
+    let view = previous
+        .servers
+        .get_mut("docs")
+        .expect("test server should exist");
+    let mut connected_client = view.connection.client().await?;
+    connected_client.client = Arc::clone(&client);
+    view.connection = Arc::new(McpServerConnection {
+        identity: Some(reusable_server_identity(&config, &runtime_context)),
+        client: AsyncManagedClient {
+            client: futures::future::ready(Ok(connected_client))
+                .boxed()
+                .shared(),
+            is_codex_apps_mcp_server: false,
+            cached_server_info: None,
+            codex_apps_tools_cache_context: None,
+            tool_catalog_cache_context: None,
+            startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            startup_reconnect: None,
+            cancel_token: CancellationToken::new(),
+        },
+    });
+
+    assert!(!client.is_closed().await);
+    disconnect.cancel();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !client.is_closed().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("closed MCP transport should be detected");
+
+    let reconciled = reconcile_reusable_server(&previous, config, runtime_context).await;
+
+    assert!(!previous.shares_test_connection_with(&reconciled, "docs"));
+    Ok(())
 }
 
 #[tokio::test]
