@@ -2,8 +2,8 @@
 
 The generic engine under `upstream/` is based on
 [`agent-sh/computer-use-linux`](https://github.com/agent-sh/computer-use-linux)
-at commit `c278cde7f644550ca7a1ade165e393844a321364` (tree
-`7478a875b972c40eda925bd870148cedcf7f6815`). Avi Fenesh created the original
+at commit `8cc1fafb78d9df047ca89a1974735c1a2bbc5060` (tree
+`89108bc0d5123177c7d1a3b4f55f9e0a901ea25b`). Avi Fenesh created the original
 implementation, with subsequent contributions from both the standalone and
 `codex-desktop-linux` communities.
 
@@ -23,6 +23,11 @@ this repository came from its commit
   `eed9c0c8215655f73cf6313b0efdead81ec700ce`; and
 - the Codex Chrome host/runtime through the desktop subtree change
   `8494ee9ff73e233403ecf1fbf683c3e27bf99896`.
+
+The desktop subtree change
+`89a11cd8d50a68f31ab45e34cd98a565498fb10b` was reviewed but not ported:
+its Codex Desktop pet-cursor socket is product-specific UI feedback rather
+than generic MCP backend behavior.
 
 The machine-readable record is [`UPSTREAM.toml`](UPSTREAM.toml). The update
 script three-way merges primary changes and never overwrites unresolved local
