@@ -2080,7 +2080,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "press_key",
-        description = "Press a key or key-combination on the keyboard, optionally after focusing a target window or terminal selector. Key grammar (case-insensitive; hyphens/spaces ignored): combos join with '+', e.g. Ctrl+L or Ctrl+Shift+T. Modifiers: ctrl/control, alt/option, shift, meta/super/cmd/command. Named keys: enter/return, escape/esc, tab, backspace, delete/del, space, home, end, pageup, pagedown, arrowleft/left, arrowright/right, arrowup/up, arrowdown/down, f1-f12. Plus single US letters a-z and digits 0-9. Anything else returns an error (never silently dropped). Note: compositor-level shortcuts (e.g. Super+Up) may be consumed by GNOME before reaching the app.",
+        description = "Press a key or key-combination on the keyboard, optionally after focusing a target window or terminal selector. Key grammar (case-insensitive; hyphens/spaces ignored): combos join with '+', e.g. Ctrl+L or Ctrl+Shift+T. Modifiers: ctrl/control, alt/option, shift, meta/super/cmd/command. Named keys: enter/return, escape/esc, tab, backspace, delete/del, space, home, end, pageup, pagedown, arrowleft/left, arrowright/right, arrowup/up, arrowdown/down, f1-f12. Plus single US letters a-z and digits 0-9. Anything else returns an error (never silently dropped). On Wayland, chords are sent through an active remote desktop portal keyboard session when one is available (or when ydotool is absent), falling back to ydotool otherwise. Note: compositor-level shortcuts (e.g. Super+Up) may be consumed by GNOME before reaching the app.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2138,6 +2138,48 @@ impl ComputerUseLinux {
                 });
             }
         };
+        let Some((chord_modifiers, chord_key)) = key_chord(&params.key) else {
+            return Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "press_key".to_string(),
+                message: "Unsupported key. Use names like Enter, Escape, Tab, ArrowLeft, Super, Ctrl+L, or a single US keyboard letter/digit.".to_string(),
+                received,
+            });
+        };
+        if self.should_prefer_portal_keyboard_for_chords() {
+            match self.ensure_portal_keyboard_session().await {
+                Ok(Some(session)) => {
+                    let modifiers: Vec<i32> =
+                        chord_modifiers.iter().map(|m| i32::from(*m)).collect();
+                    match press_keycode_chord(&session, &modifiers, i32::from(chord_key)).await {
+                        Ok(()) => {
+                            let notes = self.input_landing_notes(focus.as_ref(), false).await;
+                            return Json(with_notes(
+                                successful_action_with_focus(
+                                    "press_key",
+                                    "Action sent through the remote desktop portal.",
+                                    received,
+                                    focus,
+                                ),
+                                notes,
+                            ));
+                        }
+                        Err(error) => {
+                            self.clear_portal_keyboard_session();
+                            return Json(action_result_with_focus(
+                                "press_key",
+                                Err(format!("{error:#}")),
+                                received,
+                                focus,
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {}
+            }
+        }
         let Some(key_events) = key_sequence(&params.key) else {
             return Json(ActionOutput {
                 ok: false,
@@ -2147,6 +2189,41 @@ impl ComputerUseLinux {
                 received,
             });
         };
+        // X11: prefer xdotool/XTEST. ydotool's raw evdev scancodes get
+        // re-mapped by the active XKB layout on X11, so named keys and chords
+        // arrive as stray glyphs instead of real key events (issue #58).
+        if self.should_prefer_xdotool_keyboard() {
+            if let Some(spec) = xdotool_key_spec(&params.key) {
+                let args = vec!["key".to_string(), "--clearmodifiers".to_string(), spec];
+                match run_xdotool(&args).await {
+                    Ok(output) => {
+                        let mut result = action_result_with_focus(
+                            "press_key",
+                            Ok(vec![output]),
+                            received,
+                            focus.clone(),
+                        );
+                        result.message = "Action sent through xdotool (X11 XTEST).".to_string();
+                        if result.ok && focus.is_some() {
+                            let notes = self.input_landing_notes(focus.as_ref(), false).await;
+                            result = with_notes(result, notes);
+                        }
+                        return Json(result);
+                    }
+                    Err(error) if error.can_fallback_to_ydotool() => {}
+                    Err(error) => {
+                        return Json(action_result_with_focus(
+                            "press_key",
+                            Err(format!(
+                                "xdotool failed after input may have been delivered, so the action was not replayed through ydotool: {error:#}"
+                            )),
+                            received,
+                            focus,
+                        ));
+                    }
+                }
+            }
+        }
         let mut args = vec!["key".to_string()];
         args.extend(key_events);
         let result = run_ydotool(&args).await.map(|output| vec![output]);
@@ -2282,6 +2359,44 @@ impl ComputerUseLinux {
                     },
                     Ok(None) => {}
                     Err(_) => {}
+                }
+            }
+        }
+        // X11: xdotool type resolves keysyms against the live XKB layout.
+        // ydotool's raw scancodes get re-mapped by X11 and mangle symbols and
+        // digits (`_` → `%`, `1` → `+`) even on a plain US layout (issue #58).
+        if self.should_prefer_xdotool_keyboard() {
+            let args = vec![
+                "type".to_string(),
+                "--clearmodifiers".to_string(),
+                "--".to_string(),
+                params.text.clone(),
+            ];
+            match run_xdotool(&args).await {
+                Ok(output) => {
+                    let mut result = action_result_with_focus(
+                        "type_text",
+                        Ok(vec![output]),
+                        received,
+                        focus.clone(),
+                    );
+                    result.message = "Action sent through xdotool (X11 XTEST).".to_string();
+                    if result.ok && focus.is_some() {
+                        let notes = self.input_landing_notes(focus.as_ref(), true).await;
+                        result = with_notes(result, notes);
+                    }
+                    return Json(result);
+                }
+                Err(error) if error.can_fallback_to_ydotool() => {}
+                Err(error) => {
+                    return Json(action_result_with_focus(
+                        "type_text",
+                        Err(format!(
+                            "xdotool failed after input may have been delivered, so text was not replayed through ydotool: {error:#}"
+                        )),
+                        received,
+                        focus,
+                    ));
                 }
             }
         }
@@ -3762,9 +3877,52 @@ impl ComputerUseLinux {
             )
     }
 
+    /// Portal keyboard policy for `press_key` chords. Unlike literal text
+    /// (where KDE prefers the clipboard paste backend), key chords have no
+    /// clipboard route, so the portal keyboard session is preferred on ANY
+    /// Wayland session — including Plasma. An already-active keyboard
+    /// session (e.g. established by a KDE clipboard paste) is reused even
+    /// when ydotool is available, so the consent the user already granted
+    /// keeps covering key chords; otherwise the portal is preferred only
+    /// when ydotool is absent or the portal is forced.
+    fn should_prefer_portal_keyboard_for_chords(&self) -> bool {
+        if env_flag_enabled("COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD") {
+            return false;
+        }
+        if !self.is_wayland_session() {
+            return false;
+        }
+        if self.cached_portal_keyboard_session().is_some()
+            || env_flag_enabled("COMPUTER_USE_LINUX_FORCE_PORTAL_KEYBOARD")
+        {
+            return true;
+        }
+        ydotool_socket().is_none()
+    }
+
     fn should_prefer_kde_clipboard_text_backend(&self) -> bool {
         !env_flag_enabled("COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD")
             && self.is_kde_wayland_session()
+    }
+
+    /// Keyboard policy for X11 sessions: prefer `xdotool` (XTEST).
+    ///
+    /// ydotool writes raw evdev scancodes to a virtual uinput device. On X11
+    /// the server then re-interprets them through the active XKB layout, so
+    /// `press_key "Return"` and chords like `ctrl+a` land as stray characters,
+    /// and literal text can mangle symbols/digits (issue #58). XTEST resolves
+    /// keysyms against the live layout instead.
+    ///
+    /// `COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD=1` opts out;
+    /// `COMPUTER_USE_LINUX_FORCE_XDOTOOL_KEYBOARD=1` forces it on.
+    fn should_prefer_xdotool_keyboard(&self) -> bool {
+        if env_flag_enabled("COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD") {
+            return false;
+        }
+        if env_flag_enabled("COMPUTER_USE_LINUX_FORCE_XDOTOOL_KEYBOARD") {
+            return xdotool_available();
+        }
+        !self.is_wayland_session() && env_var_non_empty("DISPLAY") && xdotool_available()
     }
 
     fn is_kde_wayland_session(&self) -> bool {
@@ -4943,6 +5101,12 @@ fn env_flag_enabled(key: &str) -> bool {
     env::var(key).ok().as_deref() == Some("1")
 }
 
+fn env_var_non_empty(key: &str) -> bool {
+    env::var(key)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Return the base64 payload of a `data:` URL (or the original string if bare).
 fn data_url_payload(data_url: &str) -> String {
     data_url
@@ -5764,6 +5928,139 @@ fn ydotool_output_error(output: Output) -> String {
     command_output_error("ydotool", output)
 }
 
+/// X11 keyboard input runs through `xdotool` (XTEST) instead of ydotool.
+///
+/// ydotool injects raw evdev keycodes into a virtual uinput device. Under X11
+/// the server re-interprets those scancodes through the active XKB layout, so
+/// named keys and chords land as unrelated glyphs and literal text can mangle
+/// symbols/digits (`_` → `%`, `1` → `+`). XTEST resolves keysyms against the
+/// live layout, which is what X11 clients actually expect. See issue #58.
+async fn run_xdotool(args: &[String]) -> std::result::Result<Output, PortalActionError> {
+    let mut command = TokioCommand::new("xdotool");
+    command.args(args);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    match command.spawn() {
+        Ok(child) => match wait_for_ydotool_output(child).await {
+            Ok(output) if output.status.success() => Ok(output),
+            Ok(output) => Err(PortalActionError::MayHaveDelivered(anyhow::anyhow!(
+                command_output_error("xdotool", output)
+            ))),
+            Err(error) => Err(PortalActionError::MayHaveDelivered(anyhow::anyhow!(error))),
+        },
+        Err(error) => Err(PortalActionError::PreDispatch(anyhow::anyhow!(
+            "failed to run xdotool: {error}"
+        ))),
+    }
+}
+
+/// True when `xdotool` can drive this session: an X11 session with `DISPLAY`
+/// set and the binary present. `COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD=1`
+/// opts out; `COMPUTER_USE_LINUX_FORCE_XDOTOOL_KEYBOARD=1` forces it on.
+fn xdotool_available() -> bool {
+    which_in_path("xdotool")
+}
+
+fn which_in_path(binary: &str) -> bool {
+    let Ok(path) = env::var("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(binary);
+        std::fs::metadata(&candidate)
+            .map(|meta| meta.is_file())
+            .unwrap_or(false)
+    })
+}
+
+/// Map our key grammar onto an `xdotool key` spec such as `ctrl+a`, `Return`,
+/// or `shift+F5`. Returns `None` for keys the grammar does not accept, so the
+/// caller keeps its existing "never silently dropped" error.
+fn xdotool_key_spec(key: &str) -> Option<String> {
+    let parts = key
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let (key_part, modifier_parts) = parts.split_last()?;
+
+    // Validate through the same evdev grammar so both backends accept exactly
+    // the same input set.
+    key_chord(key)?;
+
+    let mut spec = Vec::new();
+    for part in modifier_parts {
+        spec.push(xdotool_modifier_name(part)?.to_string());
+    }
+
+    if modifier_parts.is_empty() {
+        if let Some(bare) = xdotool_modifier_keysym(key_part) {
+            return Some(bare.to_string());
+        }
+    }
+    spec.push(xdotool_keysym_name(key_part)?);
+    Some(spec.join("+"))
+}
+
+fn xdotool_modifier_name(key: &str) -> Option<&'static str> {
+    match normalize_key(key).as_str() {
+        "ctrl" | "control" => Some("ctrl"),
+        "alt" | "option" => Some("alt"),
+        "shift" => Some("shift"),
+        "meta" | "super" | "cmd" | "command" => Some("super"),
+        _ => None,
+    }
+}
+
+/// Standalone keysym for a bare modifier press (`press_key "Super"`).
+fn xdotool_modifier_keysym(key: &str) -> Option<&'static str> {
+    match normalize_key(key).as_str() {
+        "ctrl" | "control" => Some("ctrl"),
+        "alt" | "option" => Some("alt"),
+        "shift" => Some("shift"),
+        "meta" | "super" | "cmd" | "command" => Some("super"),
+        _ => None,
+    }
+}
+
+fn xdotool_keysym_name(key: &str) -> Option<String> {
+    let normalized = normalize_key(key);
+    let named = match normalized.as_str() {
+        "enter" | "return" => "Return",
+        "escape" | "esc" => "Escape",
+        "tab" => "Tab",
+        "backspace" => "BackSpace",
+        "delete" | "del" => "Delete",
+        "space" => "space",
+        "home" => "Home",
+        "end" => "End",
+        "pageup" | "page_up" => "Page_Up",
+        "pagedown" | "page_down" => "Page_Down",
+        "arrowleft" | "left" => "Left",
+        "arrowright" | "right" => "Right",
+        "arrowup" | "up" => "Up",
+        "arrowdown" | "down" => "Down",
+        "f1" => "F1",
+        "f2" => "F2",
+        "f3" => "F3",
+        "f4" => "F4",
+        "f5" => "F5",
+        "f6" => "F6",
+        "f7" => "F7",
+        "f8" => "F8",
+        "f9" => "F9",
+        "f10" => "F10",
+        "f11" => "F11",
+        "f12" => "F12",
+        value if value.len() == 1 && value.as_bytes()[0].is_ascii_alphanumeric() => {
+            return Some(value.to_string());
+        }
+        _ => return None,
+    };
+    Some(named.to_string())
+}
+
 fn command_output_error(command: &str, output: Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -5853,7 +6150,10 @@ fn mouse_button_code(button: Option<&str>) -> String {
     .to_string()
 }
 
-fn key_sequence(key: &str) -> Option<Vec<String>> {
+/// Parse a chord like `Ctrl+Shift+P` into raw evdev codes: the held
+/// modifiers plus the final key. A bare modifier (`Super`) parses as a
+/// chord with no held modifiers whose key is the modifier itself.
+fn key_chord(key: &str) -> Option<(Vec<u16>, u16)> {
     let parts = key
         .split('+')
         .map(str::trim)
@@ -5862,7 +6162,7 @@ fn key_sequence(key: &str) -> Option<Vec<String>> {
     let (key_part, modifier_parts) = parts.split_last()?;
     if modifier_parts.is_empty() {
         if let Some(modifier) = modifier_keycode(key_part) {
-            return Some(vec![format!("{modifier}:1"), format!("{modifier}:0")]);
+            return Some((Vec::new(), modifier));
         }
     }
     let mut modifiers = Vec::new();
@@ -5870,7 +6170,11 @@ fn key_sequence(key: &str) -> Option<Vec<String>> {
         modifiers.push(modifier_keycode(part)?);
     }
     let keycode = keycode(key_part)?;
+    Some((modifiers, keycode))
+}
 
+fn key_sequence(key: &str) -> Option<Vec<String>> {
+    let (modifiers, keycode) = key_chord(key)?;
     let mut events = Vec::new();
     for modifier in &modifiers {
         events.push(format!("{modifier}:1"));
@@ -7891,19 +8195,40 @@ mod tests {
         backend.cache_desktop_size(100, 80);
 
         let Json(output) = backend
-            .drag(Parameters(DragParams {
-                claim: ClaimContext::default(),
-                start_x: 20,
-                start_y: 20,
-                end_x: 100,
-                end_y: 40,
-                ..Default::default()
-            }))
+            .drag_unlocked(
+                DragParams {
+                    claim: ClaimContext::default(),
+                    start_x: 20,
+                    start_y: 20,
+                    end_x: i32::MAX,
+                    end_y: i32::MAX,
+                    ..Default::default()
+                },
+                ClaimGuardMode::AlreadyHeld,
+            )
             .await;
 
         assert!(!output.ok);
-        assert!(output.message.contains("Invalid drag end point"));
-        assert!(output.message.contains("no input was sent"));
+        assert!(
+            output.message.contains("Invalid drag end point"),
+            "{}",
+            output.message
+        );
+        assert!(
+            output.message.contains("no input was sent"),
+            "{}",
+            output.message
+        );
+    }
+
+    #[test]
+    fn key_chord_splits_modifiers_and_key() {
+        assert_eq!(key_chord("Ctrl+Shift+P"), Some((vec![29, 42], 25)));
+        assert_eq!(key_chord("Ctrl+S"), Some((vec![29], 31)));
+        assert_eq!(key_chord("Enter"), Some((vec![], 28)));
+        // A bare modifier is a chord with no held modifiers.
+        assert_eq!(key_chord("Super"), Some((vec![], 125)));
+        assert_eq!(key_chord("NotAKey"), None);
     }
 
     #[test]
@@ -8028,6 +8353,52 @@ mod tests {
             key_sequence("Super"),
             Some(vec!["125:1".to_string(), "125:0".to_string()])
         );
+    }
+
+    #[test]
+    fn xdotool_key_spec_maps_named_keys_to_x11_keysyms() {
+        assert_eq!(xdotool_key_spec("Return"), Some("Return".to_string()));
+        assert_eq!(xdotool_key_spec("enter"), Some("Return".to_string()));
+        assert_eq!(xdotool_key_spec("Escape"), Some("Escape".to_string()));
+        assert_eq!(xdotool_key_spec("backspace"), Some("BackSpace".to_string()));
+        assert_eq!(xdotool_key_spec("PageUp"), Some("Page_Up".to_string()));
+        assert_eq!(xdotool_key_spec("ArrowLeft"), Some("Left".to_string()));
+        assert_eq!(xdotool_key_spec("f5"), Some("F5".to_string()));
+        assert_eq!(xdotool_key_spec("space"), Some("space".to_string()));
+    }
+
+    #[test]
+    fn xdotool_key_spec_maps_chords_with_modifier_prefixes() {
+        assert_eq!(xdotool_key_spec("ctrl+a"), Some("ctrl+a".to_string()));
+        assert_eq!(xdotool_key_spec("Ctrl+S"), Some("ctrl+s".to_string()));
+        assert_eq!(
+            xdotool_key_spec("Ctrl+Shift+P"),
+            Some("ctrl+shift+p".to_string())
+        );
+        assert_eq!(
+            xdotool_key_spec("Meta+Return"),
+            Some("super+Return".to_string())
+        );
+        assert_eq!(xdotool_key_spec("Alt+F4"), Some("alt+F4".to_string()));
+    }
+
+    #[test]
+    fn xdotool_key_spec_maps_bare_modifier_to_single_keysym() {
+        assert_eq!(xdotool_key_spec("Super"), Some("super".to_string()));
+        assert_eq!(xdotool_key_spec("ctrl"), Some("ctrl".to_string()));
+    }
+
+    /// The xdotool path must accept exactly the keys the evdev grammar accepts,
+    /// so switching backends can never silently widen or narrow the surface.
+    #[test]
+    fn xdotool_key_spec_rejects_everything_key_chord_rejects() {
+        for key in ["NotAKey", "", "ctrl+", "ctrl+NotAKey", "f13", "hyper+a"] {
+            assert_eq!(
+                xdotool_key_spec(key).is_some(),
+                key_chord(key).is_some(),
+                "backend grammars diverged for {key:?}"
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- X11 keyboard input now goes through `xdotool` (XTEST) instead of ydotool.
+  ydotool injects raw evdev scancodes into a virtual uinput device, which X11
+  re-interprets through the active XKB layout. XTEST resolves keysyms against
+  the live layout. Wayland behavior is unchanged, and ydotool remains the
+  fallback when `xdotool` is missing or fails.
+- Portal `scroll` direction on KDE Plasma Wayland now inverts vertical discrete
+  axis steps so `direction: "up"|"down"` matches viewport motion.
+
 ### Added
 - Niri window discovery now connects directly to `NIRI_SOCKET`, consumes the
   compositor's complete initial event-stream state, and applies incremental
@@ -391,6 +400,7 @@ pages; also bumps the MCP server's advertised version string to match.
 
 [Unreleased]: https://github.com/Gabriel-Kahen/codex-computer-use-linux/compare/v0.5.0...HEAD
 [0.5.0]: https://github.com/Gabriel-Kahen/codex-computer-use-linux/compare/v0.4.1...v0.5.0
+[0.4.2]: https://github.com/agent-sh/computer-use-linux/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/agent-sh/computer-use-linux/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/agent-sh/computer-use-linux/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/agent-sh/computer-use-linux/compare/v0.3.0...v0.3.1

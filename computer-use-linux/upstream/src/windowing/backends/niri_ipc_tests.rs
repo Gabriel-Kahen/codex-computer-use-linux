@@ -119,6 +119,7 @@ fn reconnects_after_socket_replacement_while_old_stream_is_active() {
 
     fs::remove_file(&socket_path).unwrap();
     let second_listener = UnixListener::bind(&socket_path).unwrap();
+    let (release_second_tx, release_second_rx) = mpsc::channel();
     let second_server = thread::spawn(move || {
         let (stream, _) = second_listener.accept().unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -133,6 +134,9 @@ fn reconnects_after_socket_replacement_while_old_stream_is_active() {
         )
         .unwrap();
         writer.flush().unwrap();
+        release_second_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
     });
     release_first_tx.send(()).unwrap();
 
@@ -147,6 +151,7 @@ fn reconnects_after_socket_replacement_while_old_stream_is_active() {
         }
         assert!(Instant::now() < deadline, "client did not reconnect");
     }
+    release_second_tx.send(()).unwrap();
     client.stop();
     first_server.join().unwrap();
     second_server.join().unwrap();
