@@ -63,15 +63,6 @@ use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use tracing::warn;
 
-#[cfg(test)]
-use codex_config::Constrained;
-#[cfg(test)]
-use codex_protocol::protocol::McpStartupFailureReason;
-#[cfg(test)]
-use codex_rmcp_client::McpAuthState;
-#[cfg(test)]
-use codex_rmcp_client::McpLoginRequirement;
-
 pub(crate) struct McpServerConnection {
     identity: Option<McpServerConnectionIdentity>,
     client: AsyncManagedClient,
@@ -90,6 +81,9 @@ impl McpServerConnection {
             return None;
         }
         let client = self.client.client().await.ok()?;
+        if client.client.is_closed().await {
+            return None;
+        }
         let Ok(desired_credentials) = desired.oauth_credentials() else {
             return Some(client);
         };
@@ -155,6 +149,7 @@ pub(crate) struct McpConnectionSet {
     codex_apps_refresh_lock: Mutex<()>,
     tool_plugin_provenance: Arc<ToolPluginProvenance>,
     prefix_mcp_tool_names: bool,
+    non_prefixed_mcp_tool_servers: Vec<String>,
     elicitation_requests: ElicitationRequestManager,
 }
 
@@ -191,6 +186,7 @@ impl McpConnectionSet {
         let initial_permission_profile = config.permission_profile.clone();
         let codex_home = config.codex_home.clone();
         let prefix_mcp_tool_names = config.prefix_mcp_tool_names;
+        let non_prefixed_mcp_tool_servers = config.non_prefixed_mcp_tool_servers.clone();
         let client_elicitation_capability = config.client_elicitation_capability.clone();
         let tool_plugin_provenance = crate::mcp::tool_plugin_provenance(&config);
         let auth = auth.as_ref();
@@ -467,6 +463,7 @@ impl McpConnectionSet {
             codex_apps_refresh_lock: Mutex::new(()),
             tool_plugin_provenance,
             prefix_mcp_tool_names,
+            non_prefixed_mcp_tool_servers,
             elicitation_requests: elicitation_requests.clone(),
         };
         let summary_publication_gate = publication_gate;
@@ -514,30 +511,6 @@ impl McpConnectionSet {
         manager
     }
 
-    #[cfg(test)]
-    fn new_uninitialized_with_permission_profile(
-        approval_policy: &Constrained<AskForApproval>,
-        permission_profile: &PermissionProfile,
-        prefix_mcp_tool_names: bool,
-    ) -> Self {
-        Self {
-            servers: HashMap::new(),
-            required_servers: Vec::new(),
-            tool_catalog_revision: Arc::new(RwLock::new(0)),
-            codex_apps_tools_override: RwLock::new(None),
-            codex_apps_refresh_lock: Mutex::new(()),
-            tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
-            prefix_mcp_tool_names,
-            elicitation_requests: ElicitationRequestManager::new(
-                approval_policy.value(),
-                permission_profile.clone(),
-                /*reviewer*/ None,
-                /*lifecycle*/ None,
-                ElicitationRequestRouter::default(),
-            ),
-        }
-    }
-
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         Self {
             servers: HashMap::new(),
@@ -547,6 +520,7 @@ impl McpConnectionSet {
             codex_apps_refresh_lock: Mutex::new(()),
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             prefix_mcp_tool_names,
+            non_prefixed_mcp_tool_servers: Vec::new(),
             elicitation_requests: ElicitationRequestManager::new(
                 AskForApproval::Never,
                 PermissionProfile::default(),
@@ -681,67 +655,6 @@ impl McpConnectionSet {
             }
         }
         server_infos
-    }
-
-    #[cfg(test)]
-    fn new_uninitialized(
-        approval_policy: &Constrained<AskForApproval>,
-        permission_profile: &Constrained<PermissionProfile>,
-        prefix_mcp_tool_names: bool,
-    ) -> Self {
-        Self::new_uninitialized_with_permission_profile(
-            approval_policy,
-            permission_profile.get(),
-            prefix_mcp_tool_names,
-        )
-    }
-
-    #[cfg(test)]
-    fn insert_test_client(&mut self, name: impl Into<String>, client: AsyncManagedClient) {
-        let name = name.into();
-        self.servers.insert(
-            name,
-            McpServerView {
-                tool_filter: ToolFilter::default(),
-                connection: Arc::new(McpServerConnection {
-                    identity: None,
-                    client,
-                }),
-                metadata: McpServerMetadata {
-                    environment_id: String::new(),
-                    pollutes_memory: true,
-                    origin: None,
-                    supports_parallel_tool_calls: false,
-                    default_tools_approval_mode: None,
-                    tool_approval_modes: HashMap::new(),
-                },
-                tool_timeout: None,
-            },
-        );
-    }
-
-    #[cfg(test)]
-    fn test_client(&self, name: &str) -> &AsyncManagedClient {
-        &self.servers[name].connection.client
-    }
-
-    #[cfg(test)]
-    fn set_test_server_metadata(&mut self, name: &str, metadata: McpServerMetadata) {
-        self.servers
-            .get_mut(name)
-            .expect("test server exists")
-            .metadata = metadata;
-    }
-
-    #[cfg(test)]
-    fn shares_test_connection_with(&self, other: &Self, name: &str) -> bool {
-        let Some(left) = self.servers.get(name) else {
-            return false;
-        };
-        let Some(right) = other.servers.get(name) else {
-            return false;
-        };
-        Arc::ptr_eq(&left.connection, &right.connection)
     }
 }
 

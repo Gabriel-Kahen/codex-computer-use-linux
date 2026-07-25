@@ -48,6 +48,7 @@ use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHand
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
+use crate::tools::handlers::tool_search_spec::ToolSearchSourceListing;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::hosted_spec::WebSearchToolOptions;
 use crate::tools::hosted_spec::create_web_search_tool;
@@ -146,6 +147,7 @@ struct CoreToolPlanContext<'a> {
     tool_runtimes: &'a [PlannedRuntime],
     tool_suggest_candidates: Option<&'a crate::tools::router::ToolSuggestCandidates>,
     extension_tool_executors: &'a [Arc<dyn ToolExecutor<ExtensionToolCall>>],
+    wait_for_environment_tool_config: Option<&'a Arc<crate::WaitForEnvironmentToolConfig>>,
     dynamic_tools: &'a [DynamicToolSpec],
     tool_search_handler_cache: &'a ToolSearchHandlerCache,
     default_agent_type_description: &'a str,
@@ -182,6 +184,7 @@ fn build_tool_specs_and_registry(
         tool_runtimes,
         tool_suggest_candidates,
         extension_tool_executors,
+        wait_for_environment_tool_config,
         dynamic_tools,
     } = params;
     let default_agent_type_description =
@@ -193,6 +196,7 @@ fn build_tool_specs_and_registry(
         tool_runtimes: &tool_runtimes,
         tool_suggest_candidates: tool_suggest_candidates.as_ref(),
         extension_tool_executors: &extension_tool_executors,
+        wait_for_environment_tool_config: wait_for_environment_tool_config.as_ref(),
         dynamic_tools,
         tool_search_handler_cache,
         default_agent_type_description: &default_agent_type_description,
@@ -489,6 +493,22 @@ fn build_code_mode_executors(
         code_mode_nested_tool_specs.push(spec);
     }
 
+    if turn_context.model_info.use_responses_lite {
+        let code_mode_tool_names =
+            collect_code_mode_exec_prompt_tool_definitions(code_mode_nested_tool_specs.iter())
+                .into_iter()
+                .map(|tool| {
+                    (
+                        codex_code_mode::normalize_code_mode_identifier(&tool.name),
+                        tool.tool_name,
+                    )
+                })
+                .collect();
+        turn_context
+            .turn_metadata_state
+            .set_code_mode_tool_names(code_mode_tool_names);
+    }
+
     let namespace_descriptions = code_mode_namespace_descriptions(&exec_prompt_tool_specs);
     let mut enabled_tools =
         collect_code_mode_exec_prompt_tool_definitions(exec_prompt_tool_specs.iter());
@@ -713,10 +733,20 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.environments);
 
-    planned_tools.add(PlanHandler);
+    if turn_context.config.update_plan_enabled {
+        planned_tools.add(PlanHandler);
+    }
 
     if features.enabled(Feature::DeferredExecutor) {
-        planned_tools.add(WaitForEnvironmentHandler);
+        planned_tools.add(
+            context
+                .wait_for_environment_tool_config
+                .map(Arc::as_ref)
+                .map_or_else(
+                    WaitForEnvironmentHandler::default,
+                    WaitForEnvironmentHandler::new,
+                ),
+        );
     }
 
     if turn_context.config.experimental_request_user_input_enabled {
@@ -948,7 +978,18 @@ fn append_tool_search_executor(
         return;
     }
 
-    let handler: PlannedRuntime = context.tool_search_handler_cache.get_or_build(search_infos);
+    let source_listing = if turn_context
+        .config
+        .features
+        .enabled(Feature::DeferredToolWorldState)
+    {
+        ToolSearchSourceListing::Omit
+    } else {
+        ToolSearchSourceListing::Include
+    };
+    let handler: PlannedRuntime = context
+        .tool_search_handler_cache
+        .get_or_build(search_infos, source_listing);
     planned_tools.add_arc(handler);
 }
 
