@@ -228,10 +228,7 @@ impl Coordinator {
     }
 
     fn window_lock_path(&self, key: &str) -> PathBuf {
-        let lock_key = digest(format!("{}\0{key}", self.binding_key()).as_bytes());
-        self.state_dir
-            .join("window-locks")
-            .join(format!("{lock_key}.lock"))
+        legacy_window_lock_path(&self.state_dir, &self.binding, key)
     }
 
     fn live_claims(&self) -> Result<Vec<LiveClaim>, String> {
@@ -302,6 +299,18 @@ impl Coordinator {
                     .collect()
             }))
     }
+}
+
+pub(crate) fn legacy_window_lock_path(
+    state_dir: &Path,
+    binding: &BTreeMap<String, serde_json::Value>,
+    key: &str,
+) -> PathBuf {
+    let binding_key = digest(&serde_json::to_vec(binding).expect("binding must serialize"));
+    let lock_key = digest(format!("{binding_key}\0{key}").as_bytes());
+    state_dir
+        .join("window-locks")
+        .join(format!("{lock_key}.lock"))
 }
 
 pub(crate) fn prepare_state_dir(state_dir: &Path) -> Result<(), String> {
@@ -469,6 +478,19 @@ pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
 
 fn claim_is_live(claim: &Claim) -> bool {
     claim.inflight_until.unwrap_or(0.0).max(claim.expires_at) > now()
+}
+
+pub(crate) fn legacy_state_has_live_claims(bytes: &[u8]) -> Result<bool, String> {
+    let state: LegacyClaimState = serde_json::from_slice(bytes)
+        .map_err(|error| format!("legacy window claim state is unreadable: {error}"))?;
+    if state.version != 1 {
+        return Err("window claim state has an unsupported format".to_string());
+    }
+    Ok(state
+        .sessions
+        .values()
+        .flat_map(|session| session.claims.values())
+        .any(claim_is_live))
 }
 
 fn protocol_claim_is_live(claim: &ClaimRecord) -> bool {

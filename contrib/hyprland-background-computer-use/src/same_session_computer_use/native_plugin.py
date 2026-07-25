@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -28,12 +29,23 @@ def run(args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProces
 
 @contextmanager
 def file_guard(path: Path):
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_DIR.chmod(0o700)
     path.parent.mkdir(parents=True, exist_ok=True)
+    parent = os.lstat(path.parent)
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid():
+        raise RuntimeError(
+            "coordination directory must be owned by the current user and not be a symlink"
+        )
     path.parent.chmod(0o700)
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    os.chmod(path, 0o600)
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        os.close(descriptor)
+        raise RuntimeError("coordination lock must be a regular file owned by the current user")
+    os.fchmod(descriptor, 0o600)
     with os.fdopen(descriptor, "a+") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:

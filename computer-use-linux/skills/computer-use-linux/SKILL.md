@@ -17,7 +17,7 @@ Operate the user's real desktop session. Reuse existing application processes, p
    - EWMH Xorg: `$x11-background-computer-use:x11-same-session-computer-use`
 3. For non-Hyprland backends, exhaust `list_window_claims` pages by following `next_cursor` before deciding ownership, then call `claim_window` before sustained work on an exact window, retain its returned token privately, renew before `expires_at_ms`, pass the token to window-scoped tools, and call `release_window_claim` in finally-style cleanup. The server derives claim ownership from host-provided task metadata.
 4. Treat shared and companion window claims plus focus/input leases as authoritative. The MCP server mechanically enforces live claims across registered backends.
-5. Keep claim and lease tokens private to their owning task. Listing deliberately redacts tokens: if this task owns a live claim but its token was lost, stop exact-window work and wait for `expires_at_ms` before reclaiming; if another task owns it, choose another window or wait. Hyprland continues to use its companion claim tools during migration.
+5. Keep claim and lease tokens private to their owning task. Listing deliberately redacts tokens: if this task owns a live claim but its token was lost, stop exact-window work and wait for `expires_at_ms` before reclaiming; if another task owns it, choose another window or wait. Hyprland companion and generic claim tools share the same version-2 ownership state.
 
 ## Observe and target
 
