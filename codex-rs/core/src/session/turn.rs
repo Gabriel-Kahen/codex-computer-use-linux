@@ -76,6 +76,7 @@ use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
+use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
@@ -87,6 +88,7 @@ use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
@@ -168,7 +170,7 @@ pub(crate) async fn run_turn(
     )
     .await
     {
-        if matches!(err, CodexErr::TurnAborted) {
+        if matches!(err.details(), CodexErrorDetails::TurnAborted) {
             run_hooks_and_record_inputs(&sess, &turn_context, &input).await;
             return Err(err);
         }
@@ -185,7 +187,7 @@ pub(crate) async fn run_turn(
         .await
     {
         Ok(step_context) => step_context,
-        Err(err @ CodexErr::TurnAborted) => {
+        Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
             run_hooks_and_record_inputs(&sess, &turn_context, &input).await;
             return Err(err);
         }
@@ -405,7 +407,7 @@ pub(crate) async fn run_turn(
                     )
                     .await
                     {
-                        if matches!(err, CodexErr::TurnAborted) {
+                        if matches!(err.details(), CodexErrorDetails::TurnAborted) {
                             return Err(err);
                         }
                         let error = err.to_codex_protocol_error();
@@ -473,10 +475,15 @@ pub(crate) async fn run_turn(
                 }
                 continue;
             }
-            Err(err @ CodexErr::TurnAborted) => {
+            Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
                 return Err(err);
             }
-            Err(codex_error @ CodexErr::InvalidImageRequest()) => {
+            Err(codex_error)
+                if matches!(
+                    codex_error.details(),
+                    CodexErrorDetails::InvalidImageRequest()
+                ) =>
+            {
                 sess.track_turn_codex_error(turn_context.as_ref(), &codex_error);
                 let error = CodexErrorInfo::BadRequest;
                 sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
@@ -1222,18 +1229,20 @@ async fn run_sampling_request(
             Ok(output) => {
                 return Ok((output, original_input.unwrap_or(prompt.input)));
             }
-            Err(CodexErr::ContextWindowExceeded) => {
-                sess.set_total_tokens_full(&turn_context).await;
-                return Err(CodexErr::ContextWindowExceeded);
-            }
-            Err(CodexErr::UsageLimitReached(e)) => {
-                let rate_limits = e.rate_limits.clone();
-                if let Some(rate_limits) = rate_limits {
-                    sess.update_rate_limits(&turn_context, *rate_limits).await;
+            Err(err) => match err.details() {
+                CodexErrorDetails::ContextWindowExceeded => {
+                    sess.set_total_tokens_full(&turn_context).await;
+                    return Err(err);
                 }
-                return Err(CodexErr::UsageLimitReached(e));
-            }
-            Err(err) => err,
+                CodexErrorDetails::UsageLimitReached(e) => {
+                    let rate_limits = e.rate_limits.clone();
+                    if let Some(rate_limits) = rate_limits {
+                        sess.update_rate_limits(&turn_context, *rate_limits).await;
+                    }
+                    return Err(err);
+                }
+                _ => err,
+            },
         };
 
         if original_input.is_none() {
@@ -1271,6 +1280,7 @@ pub(crate) async fn built_tools(
     turn_context: &TurnContext,
     environments: &TurnEnvironmentSnapshot,
     mcp: &codex_mcp::McpBinding,
+    step_store: &ExtensionData,
 ) -> (Vec<ToolInfo>, Arc<ToolRouter>) {
     let all_mcp_tools = mcp.tools().to_vec();
     let loaded_plugins = sess
@@ -1388,7 +1398,11 @@ pub(crate) async fn built_tools(
         ToolRouterParams {
             tool_runtimes: mcp_tool_runtimes,
             tool_suggest_candidates,
-            extension_tool_executors: extension_tool_executors(sess),
+            extension_tool_executors: extension_tool_executors(sess, step_store),
+            wait_for_environment_tool_config: sess
+                .services
+                .thread_extension_data
+                .get::<crate::WaitForEnvironmentToolConfig>(),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
         },
         &sess.services.tool_search_handler_cache,
@@ -2074,7 +2088,9 @@ async fn try_run_sampling_request(
             .await
         {
             Ok(event) => event,
-            Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
+            Err(codex_async_utils::CancelErr::Cancelled) => {
+                break Err(CodexErr::TurnAborted);
+            }
         };
 
         let event = match event {
@@ -2083,7 +2099,6 @@ async fn try_run_sampling_request(
             None => {
                 break Err(CodexErr::Stream(
                     "stream closed before response.completed".into(),
-                    None,
                 ));
             }
         };

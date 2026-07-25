@@ -1,3 +1,4 @@
+use crate::coordination_protocol::{DEFAULT_LEASE_SECONDS, MAX_LEASE_SECONDS, MIN_LEASE_SECONDS};
 use crate::input_policy::{
     effective_pointer_input_backends, PointerInputBackends, PointerInputOverrides,
 };
@@ -129,6 +130,9 @@ pub struct InputReport {
     pub ydotoold: Check,
     pub ydotool_socket: Check,
     pub uinput: Check,
+    /// X11 XTEST keyboard backend. Preferred over ydotool on X11 sessions,
+    /// where raw evdev scancodes are re-mapped by the active XKB layout.
+    pub xdotool: Check,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -144,8 +148,19 @@ pub struct ReadinessReport {
     /// Whether any development input path, including portal keyboard input, is
     /// available. Retained for compatibility with existing doctor consumers.
     pub can_send_development_input: bool,
+    pub window_claims: WindowClaimReadiness,
     pub recommended_next_step: String,
     pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, JsonSchema)]
+pub struct WindowClaimReadiness {
+    pub supports_shared_lifecycle: bool,
+    pub owner_source: String,
+    pub default_lease_seconds: u32,
+    pub min_lease_seconds: u32,
+    pub max_lease_seconds: u32,
+    pub recommended_next_step: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -239,6 +254,9 @@ fn capability_map(
     }
     if pointer_input.ydotool {
         input_backends.push("ydotool".to_string());
+    }
+    if input.xdotool.ok && !session_is_wayland_env() {
+        input_backends.push("xdotool".to_string());
     }
 
     let mut screenshot_backends = Vec::new();
@@ -690,6 +708,7 @@ fn input_report() -> InputReport {
         ydotoold: process_check("ydotoold"),
         ydotool_socket: ydotool_socket_check(),
         uinput: read_write_path_check(Path::new("/dev/uinput")),
+        xdotool: command_path_check("xdotool"),
     }
 }
 
@@ -708,6 +727,7 @@ fn readiness_report(
     let can_focus_windows = windowing.can_focus_windows;
     let can_send_coordinate_input = can_send_coordinate_input(input, pointer_overrides);
     let can_send_development_input = can_send_coordinate_input || portals.remote_desktop.ok;
+    let window_claims = window_claim_readiness(windowing);
 
     if !can_build_accessibility_tree {
         blockers.push(
@@ -769,8 +789,28 @@ fn readiness_report(
         can_focus_windows,
         can_send_coordinate_input,
         can_send_development_input,
+        window_claims,
         recommended_next_step,
         blockers,
+    }
+}
+
+fn window_claim_readiness(windowing: &WindowingReport) -> WindowClaimReadiness {
+    let supports_shared_lifecycle = windowing.can_list_windows && !windowing.hyprland.ok;
+    let recommended_next_step = if !windowing.can_list_windows {
+        "Enable window targeting, then call list_window_claims before sustained exact-window work."
+    } else if windowing.hyprland.ok {
+        "Use the Hyprland same-session companion's claim lifecycle during migration."
+    } else {
+        "Backend support is available. Call list_window_claims before exact-window work; lifecycle tools will verify the current session identity, then claim, renew before expiry, and release in finally-style cleanup."
+    };
+    WindowClaimReadiness {
+        supports_shared_lifecycle,
+        owner_source: "host_task_metadata".to_string(),
+        default_lease_seconds: DEFAULT_LEASE_SECONDS,
+        min_lease_seconds: MIN_LEASE_SECONDS,
+        max_lease_seconds: MAX_LEASE_SECONDS,
+        recommended_next_step: recommended_next_step.to_string(),
     }
 }
 
@@ -871,6 +911,21 @@ fn user_id() -> Option<String> {
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn command_path_check(command: &str) -> Check {
+    command_check("sh", &["-c", &format!("command -v {command}")])
+}
+
+/// True when this looks like a Wayland session. Used to avoid advertising the
+/// X11-only `xdotool` backend on Wayland, where XTEST does not reach clients.
+fn session_is_wayland_env() -> bool {
+    match std::env::var("XDG_SESSION_TYPE") {
+        Ok(value) => value.eq_ignore_ascii_case("wayland"),
+        Err(_) => std::env::var("WAYLAND_DISPLAY")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+    }
 }
 
 fn process_check(process_name: &str) -> Check {
@@ -1156,6 +1211,7 @@ mod tests {
             ydotoold,
             ydotool_socket,
             uinput,
+            xdotool: Check::fail("missing xdotool"),
         }
     }
 
@@ -1286,6 +1342,29 @@ mod tests {
         assert!(readiness.can_focus_apps);
         assert!(readiness.can_focus_windows);
         assert!(readiness.blockers.is_empty());
+        assert!(readiness.window_claims.supports_shared_lifecycle);
+        assert_eq!(
+            readiness.window_claims,
+            WindowClaimReadiness {
+                supports_shared_lifecycle: true,
+                owner_source: "host_task_metadata".to_string(),
+                default_lease_seconds: 60,
+                min_lease_seconds: 5,
+                max_lease_seconds: 300,
+                recommended_next_step: "Backend support is available. Call list_window_claims before exact-window work; lifecycle tools will verify the current session identity, then claim, renew before expiry, and release in finally-style cleanup.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn readiness_routes_hyprland_to_companion_claims() {
+        let mut windowing = windowing_report(true, true);
+        windowing.hyprland = Check::ok("Hyprland is available");
+
+        let claims = window_claim_readiness(&windowing);
+
+        assert!(!claims.supports_shared_lifecycle);
+        assert!(claims.recommended_next_step.contains("Hyprland"));
     }
 
     #[test]

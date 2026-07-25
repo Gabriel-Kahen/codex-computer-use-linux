@@ -2,15 +2,15 @@
 name = "agent-sh/computer-use-linux"
 repository = "https://github.com/agent-sh/computer-use-linux.git"
 ref = "main"
-rev = "c278cde7f644550ca7a1ade165e393844a321364"
-tree = "7478a875b972c40eda925bd870148cedcf7f6815"
+rev = "8cc1fafb78d9df047ca89a1974735c1a2bbc5060"
+tree = "89108bc0d5123177c7d1a3b4f55f9e0a901ea25b"
 directory = "upstream"
 
 [secondary]
 name = "ilysenko/codex-desktop-linux"
 repository = "https://github.com/ilysenko/codex-desktop-linux.git"
 ref = "main"
-rev = "8494ee9ff73e233403ecf1fbf683c3e27bf99896"
+rev = "89a11cd8d50a68f31ab45e34cd98a565498fb10b"
 path = "computer-use-linux"
 
 [[local_patches]]
@@ -28,3 +28,8 @@ source = "ilysenko/codex-desktop-linux@197d8bad470d5e3bda0b96eabaebc7cb972e20d6"
 [[local_patches]]
 name = "GNOME extension screenshot and reload detection"
 source = "ilysenko/codex-desktop-linux@eed9c0c8215655f73cf6313b0efdead81ec700ce"
+
+[[reviewed_not_ported]]
+name = "Codex Desktop pet cursor feedback"
+source = "ilysenko/codex-desktop-linux@89a11cd8d50a68f31ab45e34cd98a565498fb10b"
+reason = "Product-specific desktop UI feedback does not belong in the generic MCP backend."

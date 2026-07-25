@@ -113,9 +113,9 @@ def merge_text(local: bytes, base: bytes, remote: bytes) -> tuple[bytes, bool]:
             paths[2].as_posix(),
             check=False,
         )
-        if result.returncode > 1:
+        if result.returncode not in range(128):
             raise RuntimeError(result.stderr.decode().strip())
-        return result.stdout, result.returncode == 1
+        return result.stdout, result.returncode != 0
 
 
 def update_pin(old: str, new: str, tree: str) -> None:

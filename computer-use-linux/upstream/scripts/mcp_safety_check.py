@@ -287,6 +287,7 @@ def main() -> int:
         for required in [
             "Begin every turn that uses Computer Use by calling get_app_state",
             "Use list_windows/focused_window before targeted keyboard input",
+            "exhaust list_window_claims pages before sustained exact-window work",
             "Tools with readOnlyHint=false may mutate local desktop or application state",
             "refuse targeted input if focus cannot be verified",
         ]:
@@ -318,6 +319,8 @@ def main() -> int:
                 raise AssertionError(f"{name} exposes unexpected parameters: {sorted(props)}")
             if name == "claim_window" and props != {"window_id", "lease_seconds"}:
                 raise AssertionError(f"{name} exposes unexpected parameters: {sorted(props)}")
+            if name == "list_window_claims" and props != {"cursor"}:
+                raise AssertionError(f"{name} exposes unexpected parameters: {sorted(props)}")
             if name in {"renew_window_claim", "release_window_claim"} and "owner_thread_id" in props:
                 raise AssertionError(f"{name} must derive its owner from request metadata")
             if name == "release_window_claim" and props != {"claim_token"}:
@@ -331,6 +334,27 @@ def main() -> int:
                 token = schema_props.get("claim_token") or {}
                 if token.get("minLength") != 1 or token.get("maxLength") != 256:
                     raise AssertionError(f"{name} must publish the 1..256 token length bound")
+            if name == "list_window_claims":
+                cursor = schema_props.get("cursor") or {}
+                if cursor.get("minLength") != 64 or cursor.get("maxLength") != 64:
+                    raise AssertionError(f"{name} must publish the exact 64-character cursor bound")
+                output_schema = json.dumps(tool.get("outputSchema") or {}, sort_keys=True)
+                if "claim_token" in output_schema:
+                    raise AssertionError(f"{name} output schema exposes claim tokens")
+                for field in [
+                    "window_id",
+                    "stable_window_id",
+                    "owned_by_caller",
+                    "owned_by_caller_on_page",
+                    "next_action",
+                ]:
+                    if field not in output_schema:
+                        raise AssertionError(f"{name} output schema is missing {field!r}")
+            if name in {"claim_window", "renew_window_claim", "release_window_claim"}:
+                output_schema = json.dumps(tool.get("outputSchema") or {}, sort_keys=True)
+                for field in ["claim_token", "expires_at_ms", "next_action"]:
+                    if field not in output_schema:
+                        raise AssertionError(f"{name} output schema is missing {field!r}")
             if name == "run_action_batch_and_observe" and props != {
                 "window_id",
                 "actions",
@@ -369,6 +393,17 @@ def main() -> int:
         for section in ["platform", "accessibility", "windowing", "input", "portals", "readiness"]:
             if section not in report:
                 raise AssertionError(f"doctor report missing {section!r}: {report.keys()}")
+        claim_readiness = (report.get("readiness") or {}).get("window_claims") or {}
+        if claim_readiness.get("owner_source") != "host_task_metadata":
+            raise AssertionError(f"doctor claim readiness has the wrong owner source: {claim_readiness!r}")
+        if "supports_shared_lifecycle" not in claim_readiness:
+            raise AssertionError(f"doctor claim readiness is missing backend support: {claim_readiness!r}")
+        if (
+            claim_readiness.get("min_lease_seconds"),
+            claim_readiness.get("default_lease_seconds"),
+            claim_readiness.get("max_lease_seconds"),
+        ) != (5, 60, 300):
+            raise AssertionError(f"doctor claim readiness has incorrect lease bounds: {claim_readiness!r}")
     finally:
         client.close()
 

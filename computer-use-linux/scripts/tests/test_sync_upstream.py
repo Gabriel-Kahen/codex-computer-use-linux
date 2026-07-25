@@ -33,6 +33,17 @@ class MergeTextTests(unittest.TestCase):
         self.assertIn(b"LOCAL", merged)
         self.assertIn(b"REMOTE", merged)
 
+    def test_marks_multiple_overlapping_changes_as_conflicts(self):
+        separator = b"same\n" * 10
+        merged, conflicted = sync_upstream.merge_text(
+            b"LOCAL ONE\n" + separator + b"LOCAL TWO\n",
+            b"base one\n" + separator + b"base two\n",
+            b"REMOTE ONE\n" + separator + b"REMOTE TWO\n",
+        )
+
+        self.assertTrue(conflicted)
+        self.assertEqual(merged.count(b"<<<<<<<"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

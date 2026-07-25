@@ -72,17 +72,20 @@ If the binary is not on `PATH`, use the absolute path (typically `~/.local/bin/c
 2. If `can_build_accessibility_tree` is false, run `setup` and restart the target app.
 3. If `can_query_windows` is false on GNOME Wayland, run `setup-window-targeting` and ask the user to log out and back in if setup says the shell extension needs a reload.
 4. Before targeted input, call `list_windows` or `focused_window` and verify the intended window by title, app id, pid, or wm class.
-5. Prefer `get_app_state` with `observation_mode: "adaptive"`, echoing `checkpoint_id` as `base_checkpoint_id`. Separately preserve its `observation_id` and pass that ID with element-targeted `click` and `scroll`, `perform_action`, and `set_value` calls that use its indices or semantic selectors.
-6. Use coordinates only when the UI surface has no useful accessibility tree.
-7. For text input, prefer `type_text` with a target selector (`window_id`, `pid`, `app_id`, `wm_class`, `title`, `tty`, `terminal_pid`, `terminal_command`, or `terminal_cwd`) rather than relying on current focus.
-8. Use `run_action_batch` to avoid round trips for a short sequence against one exact `window_id`, such as `Ctrl+L` → type text → `Enter`, or click a field → type text → `Enter`. A batch is fail-fast and may contain at most one click, first, because clicks can invalidate later coordinates or element indices.
-9. After mutating actions, re-check state with `get_app_state`, `focused_window`, or an app-specific readback.
+5. When `readiness.window_claims.supports_shared_lifecycle` is true, exhaust `list_window_claims` pages by following `next_cursor` before deciding ownership, then call `claim_window` before sustained exact-window work. Keep the returned token private, pass it to window-scoped tools, renew before `expires_at_ms`, and call `release_window_claim` in finally-style cleanup. Claim ownership comes only from host task metadata. On Hyprland, use its same-session companion claim lifecycle instead.
+6. If listing shows a claim owned by this task but its token was lost, stop and wait for expiry before reclaiming; listing never returns tokens. If another task owns the window, choose another window or wait.
+7. Prefer `get_app_state` with `observation_mode: "adaptive"`, echoing `checkpoint_id` as `base_checkpoint_id`. Separately preserve its `observation_id` and pass that ID with element-targeted `click` and `scroll`, `perform_action`, and `set_value` calls that use its indices or semantic selectors.
+8. Use coordinates only when the UI surface has no useful accessibility tree.
+9. For text input, prefer `type_text` with a target selector (`window_id`, `pid`, `app_id`, `wm_class`, `title`, `tty`, `terminal_pid`, `terminal_command`, or `terminal_cwd`) rather than relying on current focus.
+10. Use `run_action_batch` to avoid round trips for a short sequence against one exact `window_id`, such as `Ctrl+L` → type text → `Enter`, or click a field → type text → `Enter`. A batch is fail-fast and may contain at most one click, first, because clicks can invalidate later coordinates or element indices.
+11. After mutating actions, re-check state with `get_app_state`, `focused_window`, or an app-specific readback.
 
 ## Pitfalls
 
 - Already-running GTK, Qt, and Electron apps may need a restart after AT-SPI is enabled.
 - GNOME may show a portal prompt on the first screenshot or `get_app_state` call with screenshots enabled.
 - Desktop input is stateful. Avoid concurrent tool calls against this MCP server.
+- Never leave a live claim active while waiting for user input; release it first.
 - An action batch is sequential and fail-fast, not transactional; successful earlier actions are not rolled back when a later action fails.
 - `click`, `drag`, `press_key`, `type_text`, `perform_action`, and `set_value` can change real application state.
 - `ydotoold` should run as a per-user service with its socket under `/run/user/$UID`, not as a system-wide service.
@@ -103,6 +106,7 @@ Ready output should have:
 - `can_query_windows: true`
 - `can_send_development_input: true`
 - `can_send_coordinate_input: true`
+- `window_claims.supports_shared_lifecycle: true` outside Hyprland
 - `blockers: []`
 
 Then test with your agent by calling the `doctor` tool or asking the agent to list desktop windows.
