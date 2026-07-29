@@ -46,12 +46,12 @@ class RepositorySmokeTests(TestCase):
         responses = {response["id"]: response for response in map(json.loads, proc.stdout.splitlines())}
 
         self.assertEqual(responses[1]["result"]["protocolVersion"], "2025-11-25")
-        self.assertEqual(responses[1]["result"]["serverInfo"]["version"], "0.2.0")
+        self.assertEqual(responses[1]["result"]["serverInfo"]["version"], "0.3.0")
         self.assertIn("separate Computer Use plugin", responses[1]["result"]["instructions"])
         self.assertEqual(responses[3]["result"], {})
         tools = responses[2]["result"]["tools"]
         names = [tool["name"] for tool in tools]
-        self.assertEqual(len(names), 16)
+        self.assertEqual(len(names), 18)
         self.assertEqual(len(names), len(set(names)))
         for tool in tools:
             schema = tool["inputSchema"]
@@ -71,6 +71,14 @@ class RepositorySmokeTests(TestCase):
         self.assertTrue(annotations["send_window_shortcut"]["openWorldHint"])
         self.assertTrue(annotations["begin_coordinate_lease"]["destructiveHint"])
         self.assertFalse(annotations["begin_coordinate_lease"]["openWorldHint"])
+        for name in (
+            "enable_headless_continuity",
+            "disable_headless_continuity",
+        ):
+            self.assertFalse(annotations[name]["readOnlyHint"])
+            self.assertFalse(annotations[name]["destructiveHint"])
+            self.assertTrue(annotations[name]["idempotentHint"])
+            self.assertFalse(annotations[name]["openWorldHint"])
         schemas = {tool["name"]: tool["inputSchema"] for tool in tools}
         for name in (
             "capture_session_window",

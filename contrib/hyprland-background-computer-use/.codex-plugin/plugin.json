@@ -1,7 +1,7 @@
 {
   "name": "same-session-computer-use",
-  "version": "0.2.0",
-  "description": "Add parallel exact background capture and window-targeted input for Codex on Hyprland.",
+  "version": "0.3.0",
+  "description": "Add resilient background capture and window-targeted input for Codex on Hyprland.",
   "author": {
     "name": "Gabe",
     "url": "https://github.com/Gabriel-Kahen"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Hyprland Codex Background Computer Use",
     "shortDescription": "Parallel background control for Hyprland apps.",
-    "longDescription": "Extends the bundled Computer Use plugin on Hyprland with task-owned window claims, exact background capture, targeted shortcuts, and window-local click, scroll, and drag controls. Independent agents can operate different windows concurrently while same-window and broker global-seat operations remain coordinated.",
+    "longDescription": "Extends the bundled Computer Use plugin on Hyprland with task-owned window claims, exact background capture, monitor-off continuity, targeted shortcuts, and window-local click, scroll, and drag controls. Independent agents can operate different windows concurrently while same-window and broker global-seat operations remain coordinated.",
     "developerName": "Gabe",
     "category": "Productivity",
     "capabilities": [

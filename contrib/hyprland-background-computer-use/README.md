@@ -10,6 +10,8 @@ This project lets an automation agent inspect and operate the applications that 
 - Claim windows for individual Codex tasks with expiring, cross-process fencing tokens.
 - Run independent agents against different native Wayland windows concurrently.
 - Capture an exact window on an inactive workspace without focusing or moving it.
+- Keep a session-scoped headless continuity output active so Computer Use remains
+  available while every physical monitor is disconnected.
 - Send address-targeted keyboard shortcuts.
 - Click, scroll, and drag inside background native Wayland windows without moving the physical cursor.
 - Click, scroll, and drag inside background XWayland windows through XWayland's internal XTEST pointer.
@@ -25,6 +27,7 @@ This project lets an automation agent inspect and operate the applications that 
 | Window discovery | `hyprctl clients -j` | None |
 | Claim/list/release | Private atomic broker state | None |
 | Background capture | `grim -T <stableId>` | None |
+| Monitor-off continuity | Persistent broker-owned headless output | None while a physical output is active |
 | Semantic UI actions | AT-SPI | None |
 | Targeted shortcuts | Hyprland address dispatcher | None |
 | Native Wayland pointer actions | Hyprland target-surface extension | None observed |
@@ -42,6 +45,24 @@ The fallback reuses the same application process. It does not create another pro
 Window discovery is paginated and bounds compositor-provided text only when returning it over MCP, preserving full internal titles for reliable matching. PNG captures must pass bounded structural and pixel-stream validation before base64 encoding, and captures larger than 5 MiB are rejected so responses remain below Codex's stdio transport limit. Image results omit `structuredContent` so Codex receives the actual screenshot content blocks.
 
 `get_session_window_capture` is read-only and returns its PNG inline. To persist a capture, use the separately destructive `save_session_window_capture` tool with an absolute `save_path`; it atomically replaces the destination only after a valid capture succeeds. The original `capture_session_window` tool remains as a deprecated compatibility route with its optional `save_path` behavior and destructive annotation.
+
+Exact capture re-resolves the live window immediately before invoking `grim`
+and refuses windows without an active output. This prevents the known
+Hyprland toplevel-export crash when a mapped window has `monitor: -1`.
+
+## Monitor-off continuity
+
+If Computer Use must continue after all physical monitors turn off or
+disconnect, call `enable_headless_continuity` before that happens. It creates
+one fixed, broker-owned `CODEX-CU-CONTINUITY` output for the current Hyprland
+session. Hyprland moves workspaces to that output when the last physical output
+disconnects and returns them when it reconnects, so the same application
+processes and windows remain capturable and actionable.
+
+The output persists across MCP process exits and must be enabled only once per
+Hyprland session. `session_status.headless_continuity` reports its state.
+`disable_headless_continuity` removes only an ownership-journaled output and
+refuses while it is the sole active output.
 
 ## Parallel-agent workflow
 
@@ -109,6 +130,9 @@ codex plugin add same-session-computer-use@codex-computer-use-linux
 
 Start a new Codex task after installation. The repository-owned `computer-use-linux@codex-computer-use-linux` plugin owns AT-SPI semantic actions and focus-dependent global input. This plugin adds task-owned window claims, exact Hyprland window capture, address-targeted shortcuts, native Wayland pointer targeting, XWayland pointer targeting, and the transactional headless-output lease. The generic plugin reads the same claim state and takes the same per-window locks across capture and mutation paths.
 
+For unattended work that must survive the physical monitor turning off, ask
+Codex to enable headless continuity while the monitor is still connected.
+
 Check that Codex sees both plugins:
 
 ```bash
@@ -173,3 +197,8 @@ The included Codex plugin manifest registers this broker. Its skill coordinates 
 Hyprland still has one physical compositor seat. Normal window-local actions bypass that seat, but the compatibility fallback temporarily focuses the leased application and may contend with physical input. It therefore requires explicit acknowledgement and records the owning task, expiring ownership, claim, display, and Hyprland instance before acting. A foreign task cannot recover live work, but may restore an orphan after both owner and claim expiry. While a fallback is active, other XWayland/global-seat work is rejected; unrelated native Wayland windows can continue through their per-window lanes.
 
 The extension refuses input while the session is locked, a physical button is held, a pointer seat grab or constraint is active, or drag-and-drop is in progress. It is not intended to bypass authentication surfaces, anti-cheat systems, or application security controls.
+
+The persistent continuity output is separate from the per-window coordinate
+lease. Enabling it changes the compositor's output topology but does not focus,
+move, or resize a window while a physical output remains connected. Never
+remove it when it is the only active output.

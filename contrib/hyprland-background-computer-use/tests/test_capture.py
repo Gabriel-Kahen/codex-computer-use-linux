@@ -11,7 +11,13 @@ from unittest.mock import patch
 from same_session_computer_use import server
 
 
-WINDOW = {"capture_id": "42", "address": "0x1", "size": [100, 100]}
+WINDOW = {
+    "capture_id": "42",
+    "address": "0x1",
+    "pid": 123,
+    "monitor": 0,
+    "size": [100, 100],
+}
 
 
 def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
@@ -28,6 +34,26 @@ PNG = png()
 
 
 class CaptureSaveTests(TestCase):
+    def test_monitorless_window_never_reaches_grim(self) -> None:
+        orphaned = {**WINDOW, "monitor": -1}
+        with patch.object(
+            server, "resolve_window", return_value=orphaned
+        ), patch.object(server, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "no active output"):
+                server.capture_result({"window": "target"}, selected=WINDOW)
+
+        run.assert_not_called()
+
+    def test_changed_window_identity_never_reaches_grim(self) -> None:
+        replacement = {**WINDOW, "capture_id": "99"}
+        with patch.object(
+            server, "resolve_window", return_value=replacement
+        ), patch.object(server, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                server.capture_result({"window": "target"}, selected=WINDOW)
+
+        run.assert_not_called()
+
     def test_failed_capture_preserves_existing_destination(self) -> None:
         with TemporaryDirectory() as directory:
             destination = Path(directory) / "capture.png"

@@ -9,7 +9,7 @@ Operate the real logged-in session. Never substitute a VM, nested desktop, alter
 
 ## Workflow
 
-1. Call `session_status` and `list_window_claims`, then call `list_session_windows`. Follow `next_cursor` through every bounded page until it is null so windows after the first page are not missed.
+1. Call `session_status` and `list_window_claims`, then call `list_session_windows`. Follow `next_cursor` through every bounded page until it is null so windows after the first page are not missed. If the user explicitly requires Computer Use to continue while every physical monitor is off, call `enable_headless_continuity` before the monitor disconnects and verify `session_status.headless_continuity.enabled`.
 2. Reuse an existing matching window. Preserve its process, profile, login, open documents, workspace, and fullscreen state.
 3. Call `claim_session_window` for that exact window. Keep its `claim_token` private to this task, record the returned `owner_thread_id`, pass the token to every broker capture/action, and renew before `expires_at` if work continues.
 4. Capture inline with the read-only `get_session_window_capture` and the claim token. Use `save_session_window_capture` only when the user needs a PNG written to an absolute path. Neither operation focuses, moves, or raises the window. Do not use the deprecated `capture_session_window` compatibility tool in new workflows.
@@ -30,7 +30,7 @@ Never share a `claim_token` between workers. A claim defaults to 60 seconds; cla
 ## Non-interference rules
 
 - Do not use coordinate clicks, pointer moves, drags, global typing, or focus-changing keyboard injection when an accessibility or targeted-key route exists.
-- Do not move a real window to a headless output merely to capture it; exact capture works on inactive workspaces.
+- Do not move a real window to a temporary headless output merely to capture it; exact capture works on inactive workspaces. The persistent session continuity output is allowed only when the user explicitly requests monitor-off operation.
 - Do not launch another instance of an app when a usable existing instance is present.
 - Treat window addresses and capture IDs as ephemeral. Refresh them before each operation batch.
 - Do not capture, inspect, or mutate a window claimed by another task.
@@ -51,5 +51,11 @@ The same-session broker provides window-local pointer injection without moving H
 Native Wayland events are delivered atomically by a version-matched Hyprland plugin. XWayland events are delivered through XWayland's internal XTEST pointer, which is distinct from Hyprland's physical cursor position.
 
 ## Headless output
+
+`enable_headless_continuity` is the session-wide monitor-off path. Use it only
+after the user explicitly asks for continued operation with all physical
+monitors disconnected. It keeps one broker-owned virtual output active for the
+rest of the Hyprland session, so windows never become monitorless. Do not
+disable it until another output is active; the broker enforces this invariant.
 
 A temporary Hyprland headless output is now an emergency compatibility fallback only. Use it when a client rejects both semantic accessibility actions and targeted pointer injection. Follow [architecture.md](references/architecture.md), obtain explicit interference acknowledgment from the user in the current task, and never treat the tool argument alone as proof of consent. Pass the window's claim token to `begin_coordinate_lease`. Leave `fullscreen_if_needed` enabled unless the task specifically requires the window's original fallback geometry. The broker fullscreens the target over the temporary screen and records its owning task, claim, display, Hyprland instance, and previous state. Only that task may capture, end, or recover the live lease; another task may recover it after ownership and claim expiry if the owner crashes. When using the separate Computer Use plugin for global fallback input, translate screenshot-local coordinates with the `coordinate_space` origin and scale returned by `capture_coordinate_desktop`. Always restore the lease before releasing the window claim, including after failures.
