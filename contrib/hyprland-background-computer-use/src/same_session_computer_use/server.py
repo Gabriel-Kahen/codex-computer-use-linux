@@ -24,7 +24,7 @@ from .native_plugin import plugin_identity
 from .native_plugin import run_target_pointer_action
 
 
-SERVER_INFO = {"name": "same-session-computer-use", "version": "0.2.0"}
+SERVER_INFO = {"name": "same-session-computer-use", "version": "0.3.0"}
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", PROTOCOL_VERSION})
 # Base64 expansion must stay below the rmcp client's 8 MiB stdio line cap.
@@ -41,6 +41,9 @@ MAX_WINDOW_TEXT_CHARS = 512
 # These two paths are retained as the migration source and global migration lock.
 LEASE_FILE = STATE_DIR / "coordinate-lease.json"
 LOCK_FILE = STATE_DIR / "coordinate-lease.lock"
+CONTINUITY_OUTPUT_PREFIX = "CODEX-CU-CONTINUITY-"
+COORDINATE_OUTPUT_PREFIX = "CODEX-CU-"
+CONTINUITY_LOCK_FILE = STATE_DIR / "headless-continuity.lock"
 _SESSION_ATTACHED = False
 _SESSION_ENV_LOCK = threading.Lock()
 _LEASE_GUARD_LOCAL = threading.local()
@@ -99,6 +102,18 @@ TOOLS = [
             },
         },
         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "enable_headless_continuity",
+        "description": "Keep one session-scoped virtual Hyprland output active so windows, captures, and background actions remain available when every physical monitor disconnects. The output persists until explicitly disabled or Hyprland exits.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "disable_headless_continuity",
+        "description": "Remove the session-scoped continuity output. Refuses while it is the only active output so windows are never deliberately orphaned.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     {
         "name": "capture_session_window",
@@ -408,6 +423,142 @@ def lease_file(binding: dict[str, Any] | None = None) -> Path:
 def lease_lock_file(binding: dict[str, Any] | None = None) -> Path:
     key = coordination.binding_key(binding or session_binding())
     return LOCK_FILE.parent / "coordinate-leases" / key / "lease.lock"
+
+
+def continuity_lock_file(binding: dict[str, Any] | None = None) -> Path:
+    key = coordination.binding_key(binding or session_binding())
+    return CONTINUITY_LOCK_FILE.parent / "headless-continuity" / key / "output.lock"
+
+
+def continuity_state_file(binding: dict[str, Any] | None = None) -> Path:
+    key = coordination.binding_key(binding or session_binding())
+    return CONTINUITY_LOCK_FILE.parent / "headless-continuity" / key / "state.json"
+
+
+def load_continuity_state(
+    binding: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    current_binding = binding or session_binding()
+    state = _read_lease(continuity_state_file(current_binding))
+    if state is None:
+        return None
+    if (
+        state.get("version") != 1
+        or state.get("session") != current_binding
+        or not isinstance(state.get("output"), str)
+        or not re.fullmatch(
+            rf"{re.escape(CONTINUITY_OUTPUT_PREFIX)}[0-9a-f]{{8}}",
+            state["output"],
+        )
+    ):
+        raise RuntimeError("headless continuity state does not match this session")
+    return state
+
+
+def continuity_status() -> dict[str, Any]:
+    binding = session_binding()
+    state = load_continuity_state(binding)
+    monitors = hypr_json(["monitors"])
+    output_name = str(state.get("output")) if state else None
+    output = next(
+        (monitor for monitor in monitors if monitor.get("name") == output_name),
+        None,
+    )
+    conflicts = [
+        str(monitor.get("name"))
+        for monitor in monitors
+        if str(monitor.get("name") or "").startswith(CONTINUITY_OUTPUT_PREFIX)
+        and monitor.get("name") != output_name
+    ]
+    durable_outputs = [
+        str(monitor.get("name"))
+        for monitor in monitors
+        if monitor.get("name") != output_name
+        and not str(monitor.get("name") or "").startswith(
+            COORDINATE_OUTPUT_PREFIX
+        )
+    ]
+    owned = state is not None
+    return {
+        "enabled": owned and output is not None,
+        "owned": owned,
+        "conflict": bool(conflicts),
+        "output": output_name,
+        "active_output_count": len(monitors),
+        "durable_output_count": len(durable_outputs),
+        "safe_to_disable": output is not None and bool(durable_outputs),
+    }
+
+
+def enable_headless_continuity() -> dict[str, Any]:
+    binding = session_binding()
+    with file_guard(continuity_lock_file(binding)):
+        current = continuity_status()
+        if current["enabled"]:
+            return {**current, "created": False}
+        if current["conflict"]:
+            raise RuntimeError(
+                "refusing to create continuity beside an unowned continuity output"
+            )
+        output = str(current["output"] or "")
+        if not output:
+            output = f"{CONTINUITY_OUTPUT_PREFIX}{secrets.token_hex(4)}"
+        state = {
+            "version": 1,
+            "session": binding,
+            "output": output,
+            "phase": "creating",
+        }
+        coordination.atomic_write_json(continuity_state_file(binding), state)
+        proc = run(["hyprctl", "output", "create", "headless", output])
+        if proc.returncode:
+            continuity_state_file(binding).unlink(missing_ok=True)
+            raise RuntimeError(
+                proc.stderr.strip()
+                or proc.stdout.strip()
+                or "failed to create headless continuity output"
+            )
+        wait_for_monitor(output, present=True)
+        state["phase"] = "active"
+        coordination.atomic_write_json(continuity_state_file(binding), state)
+        return {**continuity_status(), "created": True}
+
+
+def disable_headless_continuity() -> dict[str, Any]:
+    binding = session_binding()
+    with file_guard(continuity_lock_file(binding)):
+        current = continuity_status()
+        if current["conflict"]:
+            raise RuntimeError(
+                "refusing to remove continuity beside an unowned continuity output"
+            )
+        if not current["owned"]:
+            return {**current, "removed": False}
+        if not current["enabled"]:
+            continuity_state_file(binding).unlink(missing_ok=True)
+            return {**continuity_status(), "removed": False}
+        if not current["safe_to_disable"]:
+            raise RuntimeError(
+                "refusing to remove continuity without another durable output; "
+                "reconnect a physical or persistent monitor first"
+            )
+        current = continuity_status()
+        if not current["safe_to_disable"]:
+            raise RuntimeError(
+                "refusing to remove continuity without another durable output; "
+                "reconnect a physical or persistent monitor first"
+            )
+        output = str(current["output"])
+        proc = run(["hyprctl", "output", "remove", output])
+        if proc.returncode:
+            raise RuntimeError(
+                proc.stderr.strip()
+                or proc.stdout.strip()
+                or "failed to remove headless continuity output"
+            )
+        wait_for_monitor(output, present=False)
+        continuity_state_file(binding).unlink(missing_ok=True)
+        return {**continuity_status(), "removed": True}
 
 
 def _read_lease(path: Path) -> dict[str, Any] | None:
@@ -1198,6 +1349,19 @@ def capture_result(
     arguments: dict[str, Any], *, selected: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     selected = selected or resolve_window(str(arguments["window"]))
+    refreshed = resolve_window(str(selected["address"]))
+    if (
+        refreshed.get("capture_id") != selected.get("capture_id")
+        or refreshed.get("pid") != selected.get("pid")
+    ):
+        raise RuntimeError("selected window identity changed before exact capture")
+    monitor = refreshed.get("monitor")
+    if isinstance(monitor, bool) or not isinstance(monitor, int) or monitor < 0:
+        raise RuntimeError(
+            "refusing exact capture because the window has no active output; "
+            "enable headless continuity and retry"
+        )
+    selected = refreshed
     requested_path = arguments.get("save_path")
     if requested_path:
         output = Path(str(requested_path)).expanduser()
@@ -1242,7 +1406,23 @@ def status() -> dict[str, Any]:
         checks[binary] = shutil.which(binary) is not None
     build_requirements = plugin_build_requirements()
     native_buildable = all(build_requirements.values())
-    exact_count = sum(1 for window in combine_windows() if window.get("capture_id")) if checks["hyprctl"] and checks["grim"] else 0
+    exact_count = sum(
+        1
+        for window in combine_windows()
+        if window.get("capture_id")
+        and isinstance(window.get("monitor"), int)
+        and not isinstance(window.get("monitor"), bool)
+        and window["monitor"] >= 0
+    ) if checks["hyprctl"] and checks["grim"] else 0
+    continuity = continuity_status() if checks["hyprctl"] else {
+        "enabled": False,
+        "owned": False,
+        "conflict": False,
+        "output": None,
+        "active_output_count": 0,
+        "durable_output_count": 0,
+        "safe_to_disable": False,
+    }
     plugin_loaded = False
     safety_status = None
     if checks["hyprctl"]:
@@ -1322,6 +1502,7 @@ def status() -> dict[str, Any]:
             "background_semantic_actions": "requires the separate Computer Use plugin and an enabled AT-SPI session",
         },
         "exact_window_count": exact_count,
+        "headless_continuity": continuity,
         "claim_lease_seconds": {"default": 60, "minimum": 5, "maximum": 300},
         "raw_pointer_note": "Hyprland still has one physical pointer seat. Different native Wayland windows have independent broker lanes; this broker serializes its XWayland and fallback input, but separate same-user processes do not share that lock. The physical cursor, keyboard focus, and workspace are preserved by normal targeted actions.",
     }
@@ -1404,6 +1585,10 @@ def call_tool(
     name: str, arguments: dict[str, Any], owner_thread_id: str | None = None
 ) -> dict[str, Any]:
     if name == "session_status": return text_result(status())
+    if name == "enable_headless_continuity":
+        return text_result(enable_headless_continuity())
+    if name == "disable_headless_continuity":
+        return text_result(disable_headless_continuity())
     if name == "list_session_windows":
         limit = arguments.get("limit")
         if limit is None:

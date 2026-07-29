@@ -610,6 +610,19 @@ class StatusTests(TestCase):
             patch.object(server, "combine_windows", return_value=[]),
             patch.object(
                 server,
+                "continuity_status",
+                return_value={
+                    "enabled": False,
+                    "owned": False,
+                    "conflict": False,
+                    "output": None,
+                    "active_output_count": 1,
+                    "durable_output_count": 1,
+                    "safe_to_disable": False,
+                },
+            ),
+            patch.object(
+                server,
                 "run",
                 side_effect=lambda *_args, **_kwargs: next(responses),
             ),
@@ -619,7 +632,7 @@ class StatusTests(TestCase):
         self.assertEqual(
             result["versions"],
             {
-                "companion": "0.2.0",
+                "companion": "0.3.0",
                 "native_extension_expected": native_plugin.NATIVE_PLUGIN_VERSION,
                 "native_extension_loaded": native_plugin.NATIVE_PLUGIN_VERSION,
                 "native_source_sha256_expected": expected["source_sha256"],
@@ -670,6 +683,19 @@ class StatusTests(TestCase):
             patch.object(server, "combine_windows", return_value=[]),
             patch.object(
                 server,
+                "continuity_status",
+                return_value={
+                    "enabled": False,
+                    "owned": False,
+                    "conflict": False,
+                    "output": None,
+                    "active_output_count": 1,
+                    "durable_output_count": 1,
+                    "safe_to_disable": False,
+                },
+            ),
+            patch.object(
+                server,
                 "run",
                 side_effect=lambda *_args, **_kwargs: next(responses),
             ),
@@ -698,7 +724,24 @@ class StatusTests(TestCase):
         with (
             patch.object(server.shutil, "which", return_value="/bin/tool"),
             patch.object(server, "plugin_build_requirements", return_value=requirements),
-            patch.object(server, "combine_windows", return_value=[{"capture_id": "42"}]),
+            patch.object(
+                server,
+                "combine_windows",
+                return_value=[{"capture_id": "42", "monitor": 0}],
+            ),
+            patch.object(
+                server,
+                "continuity_status",
+                return_value={
+                    "enabled": False,
+                    "owned": False,
+                    "conflict": False,
+                    "output": None,
+                    "active_output_count": 1,
+                    "durable_output_count": 1,
+                    "safe_to_disable": False,
+                },
+            ),
             patch.object(server, "run", return_value=completed([], "no plugins loaded")),
         ):
             result = server.status()
@@ -729,7 +772,7 @@ class StatusTests(TestCase):
                 "note": "Availability is unknown because semantic actions are provided by a separate MCP server.",
             },
         )
-        self.assertEqual(result["versions"]["companion"], "0.2.0")
+        self.assertEqual(result["versions"]["companion"], "0.3.0")
         self.assertEqual(
             result["versions"]["native_extension_expected"],
             native_plugin.NATIVE_PLUGIN_VERSION,

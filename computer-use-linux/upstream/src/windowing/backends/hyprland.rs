@@ -276,6 +276,12 @@ fn exact_capture_id_from_clients(
             window.window_id
         );
     }
+    if client.monitor.is_none_or(|monitor| monitor < 0) {
+        bail!(
+            "Hyprland window 0x{:x} has no active output; enable headless continuity before exact capture",
+            window.window_id
+        );
+    }
     Ok(client.stable_id.map(|id| id.to_string()))
 }
 
@@ -552,7 +558,7 @@ mod tests {
 
     #[test]
     fn resolves_capture_id_and_rejects_reused_window_address() {
-        let clients = r#"[{"address":"0x1234","stableId":73,"mapped":true,"class":"org.example.Editor","pid":4242}]"#;
+        let clients = r#"[{"address":"0x1234","stableId":73,"mapped":true,"monitor":0,"class":"org.example.Editor","pid":4242}]"#;
         let mut windows = parse_hyprland_clients(clients).unwrap();
         let window = windows.pop().unwrap();
         let mut clients: Vec<HyprlandClient> = serde_json::from_str(clients).unwrap();
@@ -578,6 +584,19 @@ mod tests {
         assert!(error
             .to_string()
             .contains("changed stable capture identity"));
+    }
+
+    #[test]
+    fn rejects_monitorless_window_before_exact_capture() {
+        let clients = r#"[{"address":"0x1234","stableId":73,"mapped":true,"monitor":0,"class":"org.example.Editor","pid":4242}]"#;
+        let mut windows = parse_hyprland_clients(clients).unwrap();
+        let window = windows.pop().unwrap();
+        let mut live_clients: Vec<HyprlandClient> = serde_json::from_str(clients).unwrap();
+        live_clients[0].monitor = Some(-1);
+
+        let error = exact_capture_id_from_clients(&window, &live_clients).unwrap_err();
+
+        assert!(error.to_string().contains("has no active output"));
     }
 
     #[test]

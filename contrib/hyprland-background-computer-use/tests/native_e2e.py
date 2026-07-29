@@ -277,6 +277,61 @@ def main() -> int:
                 )
 
             server._SESSION_ATTACHED = True
+            physical_output = hypr_json(inner, "monitors")[0]["name"]
+            continuity = server.enable_headless_continuity()
+            if continuity.get("enabled") is not True:
+                raise RuntimeError(
+                    f"headless continuity did not become active: {continuity}"
+                )
+            continuity_output = continuity["output"]
+            disabled = run(
+                [
+                    "hyprctl",
+                    "eval",
+                    f"hl.monitor({{ output = {json.dumps(physical_output)}, disabled = true }})",
+                ],
+                inner,
+            )
+            if disabled.returncode or "ok" not in disabled.stdout.lower():
+                raise RuntimeError(
+                    disabled.stderr.strip() or disabled.stdout.strip()
+                )
+
+            def only_continuity_output() -> bool:
+                names = {
+                    monitor.get("name")
+                    for monitor in hypr_json(inner, "monitors")
+                }
+                if names != {continuity_output}:
+                    raise RuntimeError(f"active outputs are {sorted(names)}")
+                return True
+
+            wait_for(
+                "physical output disable",
+                only_continuity_output,
+            )
+            target = wait_for(
+                "target migration to continuity output",
+                lambda: (
+                    candidate
+                    if (
+                        (candidate := find_window(inner, "codex-e2e-target"))
+                        and int(candidate.get("monitor", -1)) >= 0
+                    )
+                    else None
+                ),
+            )
+            sentinel = wait_for(
+                "sentinel migration to continuity output",
+                lambda: (
+                    candidate
+                    if (
+                        (candidate := find_window(inner, "codex-e2e-sentinel"))
+                        and int(candidate.get("monitor", -1)) >= 0
+                    )
+                    else None
+                ),
+            )
             selected = server.resolve_window(target["address"])
             capture = server.capture_result(
                 {"window": target["address"]},
@@ -291,6 +346,8 @@ def main() -> int:
                     f"exact target capture center was {center}, not target magenta"
                 )
 
+            server.ensure_native_input_safe()
+            time.sleep(0.3)
             before = {
                 "focus": hypr_json(inner, "activewindow").get("address"),
                 "workspace": hypr_json(inner, "activeworkspace").get("id"),
@@ -321,7 +378,7 @@ def main() -> int:
                 "left",
                 "1",
                 "click",
-                str(size[0] + 1),
+                str(size[0] + 10_000),
                 str(size[1] / 2),
                 "left",
                 "1",
@@ -372,9 +429,95 @@ def main() -> int:
                 raise RuntimeError(
                     f"background actions changed compositor state: before={before}, after={after}"
                 )
+            verified = server.capture_result(
+                {"window": target["address"]},
+                selected=server.resolve_window(target["address"]),
+            )
+            verified_png = base64.b64decode(
+                verified["content"][1]["data"], validate=True
+            )
+            verified_center = png_center_rgb(verified_png)
+            if not (
+                verified_center[0] >= 250
+                and verified_center[1] <= 5
+                and verified_center[2] >= 250
+            ):
+                raise RuntimeError(
+                    f"post-action monitor-off capture center was {verified_center}"
+                )
+            if hyprland.poll() is not None:
+                raise RuntimeError("Hyprland exited during monitor-off Computer Use")
+            for title, expected in (
+                ("codex-e2e-target", target["pid"]),
+                ("codex-e2e-sentinel", sentinel["pid"]),
+            ):
+                current = find_window(inner, title)
+                if current is None or current.get("pid") != expected:
+                    raise RuntimeError(
+                        f"{title} did not preserve its process while monitor-off"
+                    )
+
+            enabled = run(
+                [
+                    "hyprctl",
+                    "eval",
+                    (
+                        "hl.monitor({ "
+                        f"output = {json.dumps(physical_output)}, "
+                        'mode = "800x600@60", position = "0x0", scale = 1 })'
+                    ),
+                ],
+                inner,
+            )
+            if enabled.returncode:
+                raise RuntimeError(
+                    enabled.stderr.strip() or enabled.stdout.strip()
+                )
+            physical_monitor = wait_for(
+                "physical output re-enable",
+                lambda: next(
+                    (
+                        monitor
+                        for monitor in hypr_json(inner, "monitors")
+                        if monitor.get("name") == physical_output
+                    ),
+                    None,
+                ),
+            )
+            physical_monitor_id = int(physical_monitor["id"])
+            for title in ("codex-e2e-target", "codex-e2e-sentinel"):
+                wait_for(
+                    f"{title} return to physical output",
+                    lambda title=title: (
+                        candidate
+                        if (
+                            (candidate := find_window(inner, title))
+                            and int(candidate.get("monitor", -1))
+                            == physical_monitor_id
+                        )
+                        else None
+                    ),
+                )
+            continuity = server.disable_headless_continuity()
+            if continuity.get("removed") is not True:
+                raise RuntimeError(
+                    f"headless continuity was not removed: {continuity}"
+                )
+            wait_for(
+                "continuity output removal",
+                lambda: {
+                    monitor.get("name")
+                    for monitor in hypr_json(inner, "monitors")
+                }
+                == {physical_output},
+            )
+            server.capture_result(
+                {"window": target["address"]},
+                selected=server.resolve_window(target["address"]),
+            )
 
             print(
-                "real Hyprland capture, plugin load, targeted click, native batch, and targeted shortcut passed"
+                "monitor-off capture, process continuity, targeted click, native batch, and targeted shortcut passed"
             )
             return 0
         except Exception:
