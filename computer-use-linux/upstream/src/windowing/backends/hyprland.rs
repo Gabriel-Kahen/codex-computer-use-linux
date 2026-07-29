@@ -591,12 +591,10 @@ mod tests {
         let clients = r#"[{"address":"0x1234","stableId":73,"mapped":true,"monitor":0,"class":"org.example.Editor","pid":4242}]"#;
         let mut windows = parse_hyprland_clients(clients).unwrap();
         let window = windows.pop().unwrap();
-        let mut live_clients: Vec<HyprlandClient> =
-            serde_json::from_str(clients).unwrap();
+        let mut live_clients: Vec<HyprlandClient> = serde_json::from_str(clients).unwrap();
         live_clients[0].monitor = Some(-1);
 
-        let error =
-            exact_capture_id_from_clients(&window, &live_clients).unwrap_err();
+        let error = exact_capture_id_from_clients(&window, &live_clients).unwrap_err();
 
         assert!(error.to_string().contains("has no active output"));
     }
