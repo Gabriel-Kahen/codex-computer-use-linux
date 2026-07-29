@@ -54,7 +54,7 @@ Hyprland toplevel-export crash when a mapped window has `monitor: -1`.
 
 If Computer Use must continue after all physical monitors turn off or
 disconnect, call `enable_headless_continuity` before that happens. It creates
-one fixed, broker-owned `CODEX-CU-CONTINUITY` output for the current Hyprland
+one randomly named, broker-owned continuity output for the current Hyprland
 session. Hyprland moves workspaces to that output when the last physical output
 disconnects and returns them when it reconnects, so the same application
 processes and windows remain capturable and actionable.

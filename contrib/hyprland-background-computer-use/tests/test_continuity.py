@@ -13,6 +13,7 @@ BINDING = {
     "wayland_display": "wayland-1",
     "hyprland_instance": "instance",
 }
+OUTPUT = f"{server.CONTINUITY_OUTPUT_PREFIX}deadbeef"
 
 
 class HeadlessContinuityTests(TestCase):
@@ -27,7 +28,7 @@ class HeadlessContinuityTests(TestCase):
 
             def run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
                 commands.append(args)
-                monitors.append({"name": server.CONTINUITY_OUTPUT})
+                monitors.append({"name": OUTPUT})
                 return subprocess.CompletedProcess(args, 0, "", "")
 
             with (
@@ -36,6 +37,7 @@ class HeadlessContinuityTests(TestCase):
                 patch.object(server, "continuity_lock_file", return_value=lock_path),
                 patch.object(server, "hypr_json", side_effect=lambda _: list(monitors)),
                 patch.object(server, "wait_for_monitor"),
+                patch.object(server.secrets, "token_hex", return_value="deadbeef"),
                 patch.object(server, "run", side_effect=run),
             ):
                 created = server.enable_headless_continuity()
@@ -52,7 +54,7 @@ class HeadlessContinuityTests(TestCase):
                         "output",
                         "create",
                         "headless",
-                        server.CONTINUITY_OUTPUT,
+                        OUTPUT,
                     ]
                 ],
             )
@@ -68,7 +70,7 @@ class HeadlessContinuityTests(TestCase):
                 patch.object(
                     server,
                     "hypr_json",
-                    return_value=[{"name": server.CONTINUITY_OUTPUT}],
+                    return_value=[{"name": OUTPUT}],
                 ),
                 patch.object(server, "run") as run,
             ):
@@ -85,7 +87,7 @@ class HeadlessContinuityTests(TestCase):
                 {
                     "version": 1,
                     "session": BINDING,
-                    "output": server.CONTINUITY_OUTPUT,
+                    "output": OUTPUT,
                     "phase": "active",
                 },
             )
@@ -96,11 +98,11 @@ class HeadlessContinuityTests(TestCase):
                 patch.object(
                     server,
                     "hypr_json",
-                    return_value=[{"name": server.CONTINUITY_OUTPUT}],
+                    return_value=[{"name": OUTPUT}],
                 ),
                 patch.object(server, "run") as run,
             ):
-                with self.assertRaisesRegex(RuntimeError, "only active output"):
+                with self.assertRaisesRegex(RuntimeError, "durable output"):
                     server.disable_headless_continuity()
 
             run.assert_not_called()
@@ -114,13 +116,13 @@ class HeadlessContinuityTests(TestCase):
                 {
                     "version": 1,
                     "session": BINDING,
-                    "output": server.CONTINUITY_OUTPUT,
+                    "output": OUTPUT,
                     "phase": "active",
                 },
             )
             monitors = [
                 {"name": "HDMI-A-1"},
-                {"name": server.CONTINUITY_OUTPUT},
+                {"name": OUTPUT},
             ]
 
             def run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
@@ -141,5 +143,31 @@ class HeadlessContinuityTests(TestCase):
             self.assertFalse(result["enabled"])
             self.assertFalse(state_path.exists())
             run.assert_called_once_with(
-                ["hyprctl", "output", "remove", server.CONTINUITY_OUTPUT]
+                ["hyprctl", "output", "remove", OUTPUT]
             )
+
+    def test_disable_ignores_temporary_coordinate_lease_output(self) -> None:
+        with TemporaryDirectory() as directory:
+            state_path, lock_path = self.paths(Path(directory))
+            server.coordination.atomic_write_json(
+                state_path,
+                {
+                    "version": 1,
+                    "session": BINDING,
+                    "output": OUTPUT,
+                    "phase": "active",
+                },
+            )
+            monitors = [{"name": OUTPUT}, {"name": "CODEX-CU-temporary"}]
+            with (
+                patch.object(server, "session_binding", return_value=BINDING),
+                patch.object(server, "continuity_state_file", return_value=state_path),
+                patch.object(server, "continuity_lock_file", return_value=lock_path),
+                patch.object(server, "hypr_json", return_value=monitors),
+                patch.object(server, "run") as run,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "durable output"):
+                    server.disable_headless_continuity()
+
+            run.assert_not_called()
+            self.assertTrue(state_path.is_file())

@@ -276,7 +276,7 @@ fn exact_capture_id_from_clients(
             window.window_id
         );
     }
-    if !client.monitor.is_some_and(|monitor| monitor >= 0) {
+    if client.monitor.is_none_or(|monitor| monitor < 0) {
         bail!(
             "Hyprland window 0x{:x} has no active output; enable headless continuity before exact capture",
             window.window_id

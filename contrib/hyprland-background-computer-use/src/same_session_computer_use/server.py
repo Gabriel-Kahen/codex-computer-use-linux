@@ -41,7 +41,8 @@ MAX_WINDOW_TEXT_CHARS = 512
 # These two paths are retained as the migration source and global migration lock.
 LEASE_FILE = STATE_DIR / "coordinate-lease.json"
 LOCK_FILE = STATE_DIR / "coordinate-lease.lock"
-CONTINUITY_OUTPUT = "CODEX-CU-CONTINUITY"
+CONTINUITY_OUTPUT_PREFIX = "CODEX-CU-CONTINUITY-"
+COORDINATE_OUTPUT_PREFIX = "CODEX-CU-"
 CONTINUITY_LOCK_FILE = STATE_DIR / "headless-continuity.lock"
 _SESSION_ATTACHED = False
 _SESSION_ENV_LOCK = threading.Lock()
@@ -444,7 +445,11 @@ def load_continuity_state(
     if (
         state.get("version") != 1
         or state.get("session") != current_binding
-        or state.get("output") != CONTINUITY_OUTPUT
+        or not isinstance(state.get("output"), str)
+        or not re.fullmatch(
+            rf"{re.escape(CONTINUITY_OUTPUT_PREFIX)}[0-9a-f]{{8}}",
+            state["output"],
+        )
     ):
         raise RuntimeError("headless continuity state does not match this session")
     return state
@@ -454,18 +459,34 @@ def continuity_status() -> dict[str, Any]:
     binding = session_binding()
     state = load_continuity_state(binding)
     monitors = hypr_json(["monitors"])
+    output_name = str(state.get("output")) if state else None
     output = next(
-        (monitor for monitor in monitors if monitor.get("name") == CONTINUITY_OUTPUT),
+        (monitor for monitor in monitors if monitor.get("name") == output_name),
         None,
     )
+    conflicts = [
+        str(monitor.get("name"))
+        for monitor in monitors
+        if str(monitor.get("name") or "").startswith(CONTINUITY_OUTPUT_PREFIX)
+        and monitor.get("name") != output_name
+    ]
+    durable_outputs = [
+        str(monitor.get("name"))
+        for monitor in monitors
+        if monitor.get("name") != output_name
+        and not str(monitor.get("name") or "").startswith(
+            COORDINATE_OUTPUT_PREFIX
+        )
+    ]
     owned = state is not None
     return {
         "enabled": owned and output is not None,
         "owned": owned,
-        "conflict": output is not None and not owned,
-        "output": CONTINUITY_OUTPUT,
+        "conflict": bool(conflicts),
+        "output": output_name,
         "active_output_count": len(monitors),
-        "safe_to_disable": output is not None and len(monitors) > 1,
+        "durable_output_count": len(durable_outputs),
+        "safe_to_disable": output is not None and bool(durable_outputs),
     }
 
 
@@ -477,18 +498,19 @@ def enable_headless_continuity() -> dict[str, Any]:
             return {**current, "created": False}
         if current["conflict"]:
             raise RuntimeError(
-                f"refusing to adopt unowned Hyprland output {CONTINUITY_OUTPUT}"
+                "refusing to create continuity beside an unowned continuity output"
             )
+        output = str(current["output"] or "")
+        if not output:
+            output = f"{CONTINUITY_OUTPUT_PREFIX}{secrets.token_hex(4)}"
         state = {
             "version": 1,
             "session": binding,
-            "output": CONTINUITY_OUTPUT,
+            "output": output,
             "phase": "creating",
         }
         coordination.atomic_write_json(continuity_state_file(binding), state)
-        proc = run(
-            ["hyprctl", "output", "create", "headless", CONTINUITY_OUTPUT]
-        )
+        proc = run(["hyprctl", "output", "create", "headless", output])
         if proc.returncode:
             continuity_state_file(binding).unlink(missing_ok=True)
             raise RuntimeError(
@@ -496,7 +518,7 @@ def enable_headless_continuity() -> dict[str, Any]:
                 or proc.stdout.strip()
                 or "failed to create headless continuity output"
             )
-        wait_for_monitor(CONTINUITY_OUTPUT, present=True)
+        wait_for_monitor(output, present=True)
         state["phase"] = "active"
         coordination.atomic_write_json(continuity_state_file(binding), state)
         return {**continuity_status(), "created": True}
@@ -508,30 +530,33 @@ def disable_headless_continuity() -> dict[str, Any]:
         current = continuity_status()
         if current["conflict"]:
             raise RuntimeError(
-                f"refusing to remove unowned Hyprland output {CONTINUITY_OUTPUT}"
+                "refusing to remove continuity beside an unowned continuity output"
             )
         if not current["owned"]:
             return {**current, "removed": False}
         if not current["enabled"]:
             continuity_state_file(binding).unlink(missing_ok=True)
             return {**continuity_status(), "removed": False}
-        if current["active_output_count"] <= 1:
+        if not current["safe_to_disable"]:
             raise RuntimeError(
-                "refusing to remove the only active output; reconnect another monitor first"
+                "refusing to remove continuity without another durable output; "
+                "reconnect a physical or persistent monitor first"
             )
         current = continuity_status()
-        if current["active_output_count"] <= 1:
+        if not current["safe_to_disable"]:
             raise RuntimeError(
-                "refusing to remove the only active output; reconnect another monitor first"
+                "refusing to remove continuity without another durable output; "
+                "reconnect a physical or persistent monitor first"
             )
-        proc = run(["hyprctl", "output", "remove", CONTINUITY_OUTPUT])
+        output = str(current["output"])
+        proc = run(["hyprctl", "output", "remove", output])
         if proc.returncode:
             raise RuntimeError(
                 proc.stderr.strip()
                 or proc.stdout.strip()
                 or "failed to remove headless continuity output"
             )
-        wait_for_monitor(CONTINUITY_OUTPUT, present=False)
+        wait_for_monitor(output, present=False)
         continuity_state_file(binding).unlink(missing_ok=True)
         return {**continuity_status(), "removed": True}
 
@@ -1393,8 +1418,9 @@ def status() -> dict[str, Any]:
         "enabled": False,
         "owned": False,
         "conflict": False,
-        "output": CONTINUITY_OUTPUT,
+        "output": None,
         "active_output_count": 0,
+        "durable_output_count": 0,
         "safe_to_disable": False,
     }
     plugin_loaded = False

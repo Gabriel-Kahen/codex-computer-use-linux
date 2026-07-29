@@ -283,6 +283,7 @@ def main() -> int:
                 raise RuntimeError(
                     f"headless continuity did not become active: {continuity}"
                 )
+            continuity_output = continuity["output"]
             disabled = run(
                 [
                     "hyprctl",
@@ -301,7 +302,7 @@ def main() -> int:
                     monitor.get("name")
                     for monitor in hypr_json(inner, "monitors")
                 }
-                if names != {server.CONTINUITY_OUTPUT}:
+                if names != {continuity_output}:
                     raise RuntimeError(f"active outputs are {sorted(names)}")
                 return True
 
@@ -472,18 +473,48 @@ def main() -> int:
                 raise RuntimeError(
                     enabled.stderr.strip() or enabled.stdout.strip()
                 )
-            wait_for(
+            physical_monitor = wait_for(
                 "physical output re-enable",
-                lambda: any(
-                    monitor.get("name") == physical_output
-                    for monitor in hypr_json(inner, "monitors")
+                lambda: next(
+                    (
+                        monitor
+                        for monitor in hypr_json(inner, "monitors")
+                        if monitor.get("name") == physical_output
+                    ),
+                    None,
                 ),
             )
+            physical_monitor_id = int(physical_monitor["id"])
+            for title in ("codex-e2e-target", "codex-e2e-sentinel"):
+                wait_for(
+                    f"{title} return to physical output",
+                    lambda title=title: (
+                        candidate
+                        if (
+                            (candidate := find_window(inner, title))
+                            and int(candidate.get("monitor", -1))
+                            == physical_monitor_id
+                        )
+                        else None
+                    ),
+                )
             continuity = server.disable_headless_continuity()
             if continuity.get("removed") is not True:
                 raise RuntimeError(
                     f"headless continuity was not removed: {continuity}"
                 )
+            wait_for(
+                "continuity output removal",
+                lambda: {
+                    monitor.get("name")
+                    for monitor in hypr_json(inner, "monitors")
+                }
+                == {physical_output},
+            )
+            server.capture_result(
+                {"window": target["address"]},
+                selected=server.resolve_window(target["address"]),
+            )
 
             print(
                 "monitor-off capture, process continuity, targeted click, native batch, and targeted shortcut passed"
