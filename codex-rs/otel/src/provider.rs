@@ -39,6 +39,8 @@ use opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProces
 use opentelemetry_semantic_conventions as semconv;
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::io;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -63,6 +65,11 @@ pub struct OtelProvider {
     shutdown_started: AtomicBool,
 }
 
+struct ShutdownWorker {
+    provider: ManuallyDrop<OtelProvider>,
+    completed_tx: tokio::sync::oneshot::Sender<()>,
+}
+
 impl OtelProvider {
     /// Flushes and shuts down configured exporters at most once.
     pub fn shutdown(&self) {
@@ -78,6 +85,51 @@ impl OtelProvider {
         }
         if let Some(logger) = &self.logger {
             let _ = logger.shutdown();
+        }
+    }
+
+    /// Shuts down exporters on a detached thread within an external time budget.
+    pub async fn shutdown_with_timeout(self, timeout: Duration) -> io::Result<()> {
+        self.shutdown_with_timeout_and_spawner(timeout, |worker| {
+            std::thread::Builder::new()
+                .name("codex-otel-shutdown".to_string())
+                .spawn(move || {
+                    let provider = ManuallyDrop::into_inner(worker.provider);
+                    provider.shutdown();
+                    drop(provider);
+                    let _ = worker.completed_tx.send(());
+                })
+        })
+        .await
+    }
+
+    async fn shutdown_with_timeout_and_spawner<F>(
+        self,
+        timeout: Duration,
+        spawn: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce(ShutdownWorker) -> io::Result<std::thread::JoinHandle<()>>,
+    {
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        // A failed spawn drops its closure on the caller. Keep the provider
+        // from synchronously running its potentially blocking destructor.
+        let worker = ShutdownWorker {
+            provider: ManuallyDrop::new(self),
+            completed_tx,
+        };
+        let _shutdown_worker = spawn(worker)?;
+
+        match tokio::time::timeout(timeout, completed_rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "telemetry shutdown worker stopped before completing",
+            )),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "telemetry shutdown exceeded its time budget",
+            )),
         }
     }
 
@@ -111,7 +163,7 @@ impl OtelProvider {
                 settings.environment.clone(),
                 settings.service_name.clone(),
                 settings.service_version.clone(),
-                metric_exporter,
+                settings.metrics_exporter.clone(),
             );
             if settings.runtime_metrics {
                 config = config.with_runtime_reader();
@@ -462,6 +514,12 @@ mod shutdown_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::API_CALL_COUNT_METRIC;
+    use crate::metrics::API_CALL_DURATION_METRIC;
+    use crate::metrics::MetricsExporter;
+    use crate::metrics::TOOL_CALL_COUNT_METRIC;
+    use crate::metrics::TOOL_CALL_DURATION_METRIC;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
@@ -526,6 +584,39 @@ mod tests {
         assert!(is_trace_safe_target("codex_otel.trace_safe.summary"));
         assert!(!is_trace_safe_target("codex_otel.log_only"));
         assert!(!is_trace_safe_target("codex_otel.network_proxy"));
+    }
+
+    #[test]
+    fn statsig_runtime_only_metrics_are_not_exported() -> Result<(), Box<dyn Error>> {
+        let exporter = InMemoryMetricExporter::default();
+        let mut config = MetricsConfig::otlp(
+            "test",
+            "codex-cli",
+            env!("CARGO_PKG_VERSION"),
+            OtelExporter::Statsig,
+        );
+        config.exporter = MetricsExporter::InMemory(exporter.clone());
+        let metrics = MetricsClient::new(config)?;
+
+        metrics.counter(API_CALL_COUNT_METRIC, /*inc*/ 1, &[])?;
+        metrics.record_duration(API_CALL_DURATION_METRIC, Duration::from_millis(100), &[])?;
+        metrics.counter(TOOL_CALL_COUNT_METRIC, /*inc*/ 1, &[])?;
+        metrics.record_duration(TOOL_CALL_DURATION_METRIC, Duration::from_millis(25), &[])?;
+        metrics.counter("codex.turns", /*inc*/ 1, &[])?;
+        metrics.shutdown()?;
+
+        let exported_metrics = exporter.get_finished_metrics()?;
+        let mut names: Vec<_> = exported_metrics
+            .iter()
+            .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .map(opentelemetry_sdk::metrics::data::Metric::name)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names, vec!["codex.turns"]);
+
+        Ok(())
     }
 
     fn test_otel_settings() -> OtelSettings {
