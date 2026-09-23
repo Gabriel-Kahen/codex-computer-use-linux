@@ -24,10 +24,13 @@ concurrency:
 
 jobs:
   shared-ci:
+    if: startsWith(github.ref, 'refs/tags/computer-use-v')
     uses: ./.github/workflows/computer-use-ci.yml
   stock-codex:
+    if: startsWith(github.ref, 'refs/tags/computer-use-v')
     uses: ./.github/workflows/stock-codex-compat.yml
   hyprland:
+    if: startsWith(github.ref, 'refs/tags/computer-use-v')
     uses: ./.github/workflows/hyprland-native-e2e.yml
 
   metadata:
@@ -75,6 +78,18 @@ jobs:
   build:
     name: Build bundle (${{ matrix.target }})
     needs: [metadata, shared-ci, stock-codex, hyprland]
+    # PRs already run these workflows as required standalone checks. A release
+    # tag must pass them here on its exact commit before any bundle is built.
+    if: >-
+      ${{ !cancelled() && needs.metadata.result == 'success' &&
+          ((github.event_name == 'pull_request' &&
+            needs.shared-ci.result == 'skipped' &&
+            needs.stock-codex.result == 'skipped' &&
+            needs.hyprland.result == 'skipped') ||
+           (startsWith(github.ref, 'refs/tags/computer-use-v') &&
+            needs.shared-ci.result == 'success' &&
+            needs.stock-codex.result == 'success' &&
+            needs.hyprland.result == 'success')) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     strategy:
