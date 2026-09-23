@@ -16,7 +16,12 @@ updates:
       day: monday
     open-pull-requests-limit: 5
     groups:
+      # AT-SPI crates share event types and must move together, including 0.x bumps.
+      atspi-family:
+        patterns: ["atspi", "atspi-*"]
+        update-types: [major, minor, patch]
       engine-compatible:
+        exclude-patterns: ["atspi", "atspi-*"]
         update-types: [minor, patch]
   - package-ecosystem: cargo
     directory: /computer-use-linux/codex-integration/chrome-host
