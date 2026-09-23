@@ -308,6 +308,8 @@ def main() -> int:
             description = tool.get("description") or ""
             assert_no_injection_text(f"{name} description", description)
             assert_tool_annotations(tool)
+            if name in {"get_app_state", "run_action_batch_and_observe"} and tool.get("outputSchema") is not None:
+                raise AssertionError(f"{name} must support content-only image results for stock Codex")
             props = schema_properties(tool)
             if "env" in props or "shell" in props or "command" in props:
                 raise AssertionError(f"{name} exposes a raw process-control parameter: {sorted(props)}")

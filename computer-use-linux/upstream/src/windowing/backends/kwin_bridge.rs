@@ -375,6 +375,22 @@ pub(super) fn script_source(
         }};
     }}
 
+    function workspaceGeometry() {{
+        var rect = null;
+        try {{
+            rect = workspace.virtualScreenGeometry;
+        }} catch (error) {{}}
+        if (rect === null || rect === undefined) {{
+            return null;
+        }}
+        return {{
+            x: read(rect, "x"),
+            y: read(rect, "y"),
+            width: read(rect, "width"),
+            height: read(rect, "height")
+        }};
+    }}
+
     function firstDesktop(window) {{
         var desktops = read(window, "desktops");
         if (!Array.isArray(desktops) || desktops.length === 0) {{
@@ -390,6 +406,19 @@ pub(super) fn script_source(
         }}
         if (read(window, "x11Client")) {{
             return "x11";
+        }}
+        var objectDescription = serialize(window);
+        if (typeof objectDescription === "string") {{
+            var separator = objectDescription.indexOf("(");
+            var objectClass = (separator >= 0
+                ? objectDescription.slice(0, separator)
+                : objectDescription).trim();
+            if (objectClass === "KWin::XdgToplevelWindow") {{
+                return "wayland";
+            }}
+            if (objectClass === "KWin::X11Window") {{
+                return "x11";
+            }}
         }}
         return null;
     }}
@@ -474,6 +503,7 @@ pub(super) fn script_source(
         callDBus(serviceName, objectPath, iface, "ReceiveWindows", JSON.stringify({{
             backend: "kwin",
             pluginName: pluginName,
+            desktopGeometry: workspaceGeometry(),
             windows: serialized
         }}));
     }}
@@ -481,7 +511,7 @@ pub(super) fn script_source(
     [
         "windowAdded", "windowRemoved", "windowActivated", "activeWindowChanged",
         "clientAdded", "clientRemoved", "clientActivated", "activeClientChanged",
-        "currentDesktopChanged", "currentActivityChanged"
+        "currentDesktopChanged", "currentActivityChanged", "virtualScreenGeometryChanged"
     ].forEach(function(name) {{
         connectSignal(workspace, name, publishWindows);
     }});

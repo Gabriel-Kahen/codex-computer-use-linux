@@ -317,7 +317,10 @@ fn canonical_json(value: &impl Serialize) -> Vec<u8> {
 }
 
 fn digest(value: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(value))
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Serialize)]

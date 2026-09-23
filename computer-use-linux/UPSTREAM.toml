@@ -2,8 +2,8 @@
 name = "agent-sh/computer-use-linux"
 repository = "https://github.com/agent-sh/computer-use-linux.git"
 ref = "main"
-rev = "8cc1fafb78d9df047ca89a1974735c1a2bbc5060"
-tree = "89108bc0d5123177c7d1a3b4f55f9e0a901ea25b"
+rev = "ac7582dfcf907a204a9e1527da62d9ebb2676932"
+tree = "709592481ef7a59ae8d447f3d61717199d436a5f"
 directory = "upstream"
 
 [secondary]
@@ -33,3 +33,20 @@ source = "ilysenko/codex-desktop-linux@eed9c0c8215655f73cf6313b0efdead81ec700ce"
 name = "Codex Desktop pet cursor feedback"
 source = "ilysenko/codex-desktop-linux@89a11cd8d50a68f31ab45e34cd98a565498fb10b"
 reason = "Product-specific desktop UI feedback does not belong in the generic MCP backend."
+
+[[local_patches]]
+name = "Observation-bound input, shared claims, adaptive capture and desktop transactions"
+source = "Gabriel-Kahen/codex-computer-use-linux-legacy"
+
+[[local_patches]]
+name = "Unified portal session and persistent native compositor integrations"
+source = "Gabriel-Kahen/codex-computer-use-linux-legacy"
+
+[[local_patches]]
+name = "MCP content-only image results for stock Codex compatibility"
+source = "Gabriel-Kahen/codex-computer-use-linux"
+
+[[reviewed_not_ported]]
+name = "Optional generic shell and completion-notification MCP tools"
+source = "agent-sh/computer-use-linux@ac7582dfcf907a204a9e1527da62d9ebb2676932"
+reason = "The desktop engine retains its existing tool contract; stock Codex supplies shell execution and task completion. Upstream Pi/npm artifacts are vendored provenance, not a separately supported distribution here."

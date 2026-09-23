@@ -17,6 +17,8 @@ IFS=$'\n\t'
 # -----------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+OS_RELEASE_FILE="${COMPUTER_USE_LINUX_OS_RELEASE_FILE:-/etc/os-release}"
+UINPUT_DEVICE="${COMPUTER_USE_LINUX_UINPUT_DEVICE:-/dev/uinput}"
 BIN_NAME="computer-use-linux"
 COSMIC_HELPER_NAME="computer-use-linux-cosmic"
 INSTALL_DIR="${HOME}/.local/bin"
@@ -64,6 +66,7 @@ SKIP_YDOTOOL=0
 SKIP_GNOME_EXT=0
 SKIP_DOCTOR=0
 FORCE_UNKNOWN_DISTRO=0
+PACKAGE_MANAGER_OVERRIDE=""
 
 usage() {
     cat <<EOF
@@ -77,7 +80,7 @@ Steps (run in order, each idempotent):
   3. Install rustup toolchain
   4. cargo build --release  →  ~/.local/bin/${BIN_NAME} and ${COSMIC_HELPER_NAME}
   5. Enable AT-SPI toolkit accessibility (GNOME)
-  6. Install + enable ydotoold systemd --user service
+  6. Install + enable ydotoold systemd --user service when available
   7. Pack/install/enable GNOME Shell extension (Wayland + GNOME)
   8. Run \`${BIN_NAME} doctor\` and report readiness
 
@@ -86,10 +89,11 @@ Flags:
   --skip-rust             skip rustup install
   --skip-build            skip cargo build (assumes target/release/${BIN_NAME} and ${COSMIC_HELPER_NAME} exist)
   --skip-atspi            skip toolkit-accessibility gsetting
-  --skip-ydotool          skip ydotoold systemd unit
+  --skip-ydotool          skip ydotoold user-service setup
   --skip-gnome-extension  skip GNOME Shell extension install
   --skip-doctor           skip the final readiness check
-  --force-unknown-distro  treat unrecognised distros as Debian-family (apt)
+  --force-unknown-distro  use the one supported package manager found on PATH
+  --package-manager NAME  force apt, dnf, or pacman for system packages
   -h, --help              show this help and exit
 EOF
 }
@@ -104,11 +108,22 @@ while [[ $# -gt 0 ]]; do
         --skip-gnome-extension) SKIP_GNOME_EXT=1 ;;
         --skip-doctor)          SKIP_DOCTOR=1 ;;
         --force-unknown-distro) FORCE_UNKNOWN_DISTRO=1 ;;
+        --package-manager)
+            [[ $# -ge 2 ]] || die "--package-manager requires apt, dnf, or pacman"
+            PACKAGE_MANAGER_OVERRIDE="$2"
+            shift
+            ;;
+        --package-manager=*)    PACKAGE_MANAGER_OVERRIDE="${1#*=}" ;;
         -h|--help)              usage; exit 0 ;;
         *)                      usage; die "unknown flag: $1" ;;
     esac
     shift
 done
+
+case "${PACKAGE_MANAGER_OVERRIDE}" in
+    ""|apt|dnf|pacman) ;;
+    *) die "unsupported package manager '${PACKAGE_MANAGER_OVERRIDE}' (expected apt, dnf, or pacman)" ;;
+esac
 
 # -----------------------------------------------------------------------------
 # Step 1: distro + display server detection
@@ -116,6 +131,35 @@ done
 
 DISTRO_FAMILY=""
 PKG_MANAGER=""
+SESSION_TYPE=""
+X11_KEYBOARD_BACKEND_REQUIRED=0
+
+set_package_manager() {
+    case "$1" in
+        apt)    DISTRO_FAMILY="debian"; PKG_MANAGER="apt" ;;
+        dnf)    DISTRO_FAMILY="fedora"; PKG_MANAGER="dnf" ;;
+        pacman) DISTRO_FAMILY="arch"; PKG_MANAGER="pacman" ;;
+        *) return 1 ;;
+    esac
+}
+
+package_manager_available() {
+    case "$1" in
+        apt)    command -v apt-get >/dev/null 2>&1 ;;
+        dnf)    command -v dnf >/dev/null 2>&1 ;;
+        pacman) command -v pacman >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+available_package_managers() {
+    local manager
+    for manager in apt dnf pacman; do
+        if package_manager_available "${manager}"; then
+            printf '%s\n' "${manager}"
+        fi
+    done
+}
 
 detect_distro() {
     log_section "Step 1/9 — detect environment"
@@ -124,45 +168,94 @@ detect_distro() {
         die "this script only supports Linux (got $(uname -s)). macOS/*BSD are not supported."
     fi
 
-    if [[ ! -r /etc/os-release ]]; then
-        die "/etc/os-release missing — cannot detect distro."
+    if [[ ! -r "${OS_RELEASE_FILE}" ]]; then
+        die "${OS_RELEASE_FILE} missing — cannot detect distro."
     fi
 
+    local ID="" ID_LIKE="" PRETTY_NAME=""
     # shellcheck disable=SC1091
-    . /etc/os-release
+    . "${OS_RELEASE_FILE}"
     local id_like="${ID_LIKE:-} ${ID:-}"
 
-    case " ${id_like} " in
-        *" debian "*|*" ubuntu "*)
-            DISTRO_FAMILY="debian"; PKG_MANAGER="apt" ;;
-        *" fedora "*|*" rhel "*|*" centos "*)
-            DISTRO_FAMILY="fedora"; PKG_MANAGER="dnf" ;;
-        *" arch "*|*" archlinux "*|*" manjaro "*|*" endeavouros "*)
-            DISTRO_FAMILY="arch"; PKG_MANAGER="pacman" ;;
-        *)
-            if [[ ${FORCE_UNKNOWN_DISTRO} -eq 1 ]]; then
-                log_warn "unknown distro '${ID:-?}' — forcing debian/apt path"
-                DISTRO_FAMILY="debian"; PKG_MANAGER="apt"
-            else
-                log_fail "unsupported distro: ${ID:-unknown} (${PRETTY_NAME:-?})"
-                log_info "supported families: debian/ubuntu, fedora, arch"
-                log_info "re-run with --force-unknown-distro to attempt apt-based install"
-                exit 1
-            fi ;;
-    esac
-    log_ok "distro family: ${DISTRO_FAMILY} (pkg manager: ${PKG_MANAGER})"
+    if [[ -n "${PACKAGE_MANAGER_OVERRIDE}" ]]; then
+        set_package_manager "${PACKAGE_MANAGER_OVERRIDE}"
+        log_warn "using requested package manager: ${PACKAGE_MANAGER_OVERRIDE}"
+    else
+        case " ${id_like} " in
+            *" debian "*|*" ubuntu "*)
+                set_package_manager apt ;;
+            *" fedora "*|*" rhel "*|*" centos "*)
+                set_package_manager dnf ;;
+            *" arch "*|*" archlinux "*|*" manjaro "*|*" endeavouros "*|*" artix "*|*" artixlinux "*)
+                set_package_manager pacman ;;
+            *)
+                if [[ ${FORCE_UNKNOWN_DISTRO} -eq 1 ]]; then
+                    if [[ ${SKIP_SYSTEM_DEPS} -eq 1 ]]; then
+                        DISTRO_FAMILY="unknown"
+                        log_warn "unknown distro '${ID:-?}' — system package installation is skipped"
+                    else
+                        local available=()
+                        mapfile -t available < <(available_package_managers)
+                        if [[ ${#available[@]} -ne 1 ]]; then
+                            log_fail "cannot choose a package manager for '${ID:-unknown}'"
+                            log_info "found: ${available[*]:-none}; pass --package-manager apt|dnf|pacman"
+                            return 1
+                        fi
+                        set_package_manager "${available[0]}"
+                        log_warn "unknown distro '${ID:-?}' — using detected ${PKG_MANAGER}"
+                    fi
+                else
+                    log_fail "unsupported distro: ${ID:-unknown} (${PRETTY_NAME:-?})"
+                    log_info "supported families: debian/ubuntu, fedora, arch/artix"
+                    log_info "re-run with --force-unknown-distro or --package-manager apt|dnf|pacman"
+                    return 1
+                fi ;;
+        esac
+    fi
+
+    if [[ ${SKIP_SYSTEM_DEPS} -eq 0 ]] && ! package_manager_available "${PKG_MANAGER}"; then
+        log_fail "${PKG_MANAGER} was selected but its command is not on PATH"
+        return 1
+    fi
+    if [[ -n "${PKG_MANAGER}" ]]; then
+        log_ok "distro family: ${DISTRO_FAMILY} (pkg manager: ${PKG_MANAGER})"
+    else
+        log_ok "distro family: ${DISTRO_FAMILY} (system packages skipped)"
+    fi
 
     # Display server.
     local session_type=""
     if [[ -n "${XDG_SESSION_ID:-}" ]] && command -v loginctl >/dev/null 2>&1; then
         session_type="$(loginctl show-session "${XDG_SESSION_ID}" -p Type --value 2>/dev/null || true)"
     fi
-    session_type="${session_type:-${XDG_SESSION_TYPE:-unknown}}"
+    session_type="${session_type:-${XDG_SESSION_TYPE:-}}"
+    local normalized_session_type="${session_type//[[:space:]]/}"
+    local wayland_display="${WAYLAND_DISPLAY:-}"
+    local display="${DISPLAY:-}"
+    local wayland_session=0
+    if [[ -n "${normalized_session_type}" ]]; then
+        if [[ "${normalized_session_type,,}" == "wayland" ]]; then wayland_session=1; fi
+    elif [[ -n "${wayland_display//[[:space:]]/}" ]]; then
+        wayland_session=1
+    fi
 
-    case "${session_type}" in
+    X11_KEYBOARD_BACKEND_REQUIRED=0
+    if [[ ${wayland_session} -eq 0 && -n "${display//[[:space:]]/}" ]]; then
+        X11_KEYBOARD_BACKEND_REQUIRED=1
+    fi
+
+    if [[ ${wayland_session} -eq 1 ]]; then
+        SESSION_TYPE="wayland"
+    elif [[ ${X11_KEYBOARD_BACKEND_REQUIRED} -eq 1 ]]; then
+        SESSION_TYPE="x11"
+    else
+        SESSION_TYPE="${normalized_session_type:-unknown}"
+    fi
+
+    case "${SESSION_TYPE}" in
         wayland) log_ok "display server: Wayland" ;;
         x11)     log_warn "display server: X11 — supported but degraded (some features need Wayland)" ;;
-        *)       log_warn "display server: ${session_type} (unrecognised — proceeding anyway)" ;;
+        *)       log_warn "display server: ${SESSION_TYPE} (unrecognised — proceeding anyway)" ;;
     esac
 
     local desktop="${XDG_CURRENT_DESKTOP:-unknown}"
@@ -179,6 +272,37 @@ detect_distro() {
 # Step 2: system package install
 # -----------------------------------------------------------------------------
 
+ydotool_package_available() {
+    case "${PKG_MANAGER}" in
+        apt)    apt-cache show ydotool >/dev/null 2>&1 ;;
+        dnf)    dnf info -q ydotool >/dev/null 2>&1 ;;
+        pacman) pacman -Si ydotool >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+install_optional_ydotool() {
+    if command -v ydotool >/dev/null 2>&1 && command -v ydotoold >/dev/null 2>&1; then
+        log_ok "optional ydotool fallback already installed"
+        return 0
+    fi
+    if ! ydotool_package_available; then
+        log_warn "optional ydotool package is unavailable from configured ${PKG_MANAGER} repositories"
+        log_info "a RemoteDesktop portal on Wayland or xdotool on X11 may still satisfy doctor"
+        return 0
+    fi
+
+    log_info "installing optional ydotool fallback"
+    case "${PKG_MANAGER}" in
+        apt)    sudo apt-get install -y ydotool ;;
+        dnf)    sudo dnf install -y ydotool ;;
+        pacman) sudo pacman -S --needed --noconfirm ydotool ;;
+    esac || {
+        log_warn "optional ydotool install failed — doctor will require a keyboard-capable portal or xdotool backend"
+        return 0
+    }
+}
+
 install_system_deps() {
     log_section "Step 2/9 — system packages"
     if [[ ${SKIP_SYSTEM_DEPS} -eq 1 ]]; then log_skip "--skip-system-deps"; return 0; fi
@@ -186,10 +310,9 @@ install_system_deps() {
     local desktop="${XDG_CURRENT_DESKTOP:-}"
     case "${PKG_MANAGER}" in
         apt)
-            local pkgs=(build-essential pkg-config libdbus-1-dev libssl-dev curl ydotool at-spi2-core)
-            if [[ "${desktop,,}" == *niri* ]]; then
-                pkgs+=(gstreamer1.0-tools gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-good)
-            fi
+            local pkgs=(build-essential pkg-config libdbus-1-dev libssl-dev curl at-spi2-core)
+            if [[ "${desktop,,}" == *niri* ]]; then pkgs+=(gstreamer1.0-tools gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-good); fi
+            if [[ ${X11_KEYBOARD_BACKEND_REQUIRED} -eq 1 ]]; then pkgs+=(xdotool); fi
             sudo apt-get update -qq
             if [[ "${desktop}" == *GNOME* ]] && ! command -v gnome-extensions >/dev/null 2>&1; then
                 if apt-cache show gnome-shell >/dev/null 2>&1; then
@@ -202,23 +325,22 @@ install_system_deps() {
             sudo apt-get install -y "${pkgs[@]}" || { log_fail "apt-get install failed"; return 1; }
             ;;
         dnf)
-            local pkgs=(gcc pkgconfig dbus-devel openssl-devel curl ydotool at-spi2-core)
-            if [[ "${desktop,,}" == *niri* ]]; then
-                pkgs+=(gstreamer1 gstreamer1-plugin-pipewire gstreamer1-plugins-base gstreamer1-plugins-good)
-            fi
+            local pkgs=(gcc pkgconfig dbus-devel openssl-devel curl at-spi2-core)
+            if [[ "${desktop,,}" == *niri* ]]; then pkgs+=(gstreamer1 gstreamer1-plugin-pipewire gstreamer1-plugins-base gstreamer1-plugins-good); fi
+            if [[ ${X11_KEYBOARD_BACKEND_REQUIRED} -eq 1 ]]; then pkgs+=(xdotool); fi
             log_info "sudo dnf install -y ${pkgs[*]}"
             sudo dnf install -y "${pkgs[@]}" || { log_fail "dnf install failed"; return 1; }
             ;;
         pacman)
-            local pkgs=(base-devel pkgconf dbus openssl curl ydotool at-spi2-core)
-            if [[ "${desktop,,}" == *niri* ]]; then
-                pkgs+=(gstreamer gst-plugin-pipewire gst-plugins-base gst-plugins-good)
-            fi
+            local pkgs=(base-devel pkgconf dbus openssl curl at-spi2-core)
+            if [[ "${desktop,,}" == *niri* ]]; then pkgs+=(gstreamer gst-plugin-pipewire gst-plugins-base gst-plugins-good); fi
+            if [[ ${X11_KEYBOARD_BACKEND_REQUIRED} -eq 1 ]]; then pkgs+=(xdotool); fi
             log_info "sudo pacman -S --needed --noconfirm ${pkgs[*]}"
             sudo pacman -S --needed --noconfirm "${pkgs[@]}" || { log_fail "pacman install failed"; return 1; }
             ;;
     esac
-    log_ok "system packages installed"
+    log_ok "required system packages installed"
+    install_optional_ydotool
 }
 
 # -----------------------------------------------------------------------------
@@ -315,27 +437,55 @@ enable_atspi() {
 }
 
 # -----------------------------------------------------------------------------
-# Step 6: ydotoold systemd --user service
+# Step 6: ydotoold user service
 # -----------------------------------------------------------------------------
+
+systemd_user_manager_available() {
+    command -v systemctl >/dev/null 2>&1 &&
+        systemctl --user show-environment >/dev/null 2>&1
+}
+
+show_manual_ydotoold_guidance() {
+    local ydotoold_path runtime_dir user_gid
+    ydotoold_path="$(command -v ydotoold 2>/dev/null || true)"
+    runtime_dir="${XDG_RUNTIME_DIR:-/run/user/${UID}}"
+    user_gid="$(id -g)"
+    if [[ -z "${ydotoold_path}" ]]; then
+        log_info "ydotool is optional; install it only if doctor needs that fallback"
+        return 0
+    fi
+    log_info "configure your per-user supervisor to run:"
+    log_info "  ${ydotoold_path} --socket-path=${runtime_dir}/.ydotool_socket --socket-own=${UID}:${user_gid}"
+    log_info "do not run ydotoold as root or expose its socket to other users"
+}
 
 setup_ydotoold() {
     log_section "Step 6/9 — ydotoold user service"
     if [[ ${SKIP_YDOTOOL} -eq 1 ]]; then log_skip "--skip-ydotool"; return 0; fi
 
-    command -v ydotoold >/dev/null 2>&1 || { log_fail "ydotoold not found in PATH (install via system deps step)"; return 1; }
+    if ! command -v ydotoold >/dev/null 2>&1; then
+        log_warn "optional ydotoold fallback is not installed — skipping its user service"
+        return 0
+    fi
 
     # /dev/uinput permissions check.
-    if [[ ! -e /dev/uinput ]]; then
-        log_warn "/dev/uinput does not exist — kernel module may need loading"
+    if [[ ! -e "${UINPUT_DEVICE}" ]]; then
+        log_warn "${UINPUT_DEVICE} does not exist — kernel module may need loading"
         log_info "  sudo modprobe uinput"
-    elif [[ ! -w /dev/uinput || ! -r /dev/uinput ]]; then
-        log_warn "/dev/uinput exists but is not user-accessible"
+    elif [[ ! -w "${UINPUT_DEVICE}" || ! -r "${UINPUT_DEVICE}" ]]; then
+        log_warn "${UINPUT_DEVICE} exists but is not user-accessible"
         log_info "Remediation (pick one, then log out/in):"
         log_info "  sudo usermod -aG input \$USER"
         log_info "OR write a udev rule:"
         log_info "  echo 'KERNEL==\"uinput\", MODE=\"0660\", GROUP=\"input\", OPTIONS+=\"static_node=uinput\"' | sudo tee /etc/udev/rules.d/60-uinput.rules"
         log_info "  sudo udevadm control --reload-rules && sudo udevadm trigger"
         log_warn "skipping systemd enable — fix uinput first then re-run"
+        return 0
+    fi
+
+    if ! systemd_user_manager_available; then
+        log_warn "systemd --user is unavailable — skipping automatic ydotoold service setup"
+        show_manual_ydotoold_guidance
         return 0
     fi
 
@@ -444,6 +594,15 @@ install_gnome_extension() {
 # Step 8: doctor readiness check
 # -----------------------------------------------------------------------------
 
+doctor_install_prerequisites_ready_raw() {
+    local out="$1" field
+    for field in can_register_mcp_tools can_build_accessibility_tree can_send_development_input; do
+        if ! printf '%s' "${out}" | grep -qE "\"${field}\"[[:space:]]*:[[:space:]]*true([[:space:],}]|$)"; then
+            return 1
+        fi
+    done
+}
+
 run_doctor() {
     log_section "Step 8/9 — doctor readiness"
     if [[ ${SKIP_DOCTOR} -eq 1 ]]; then log_skip "--skip-doctor"; return 0; fi
@@ -458,30 +617,59 @@ run_doctor() {
     fi
 
     if command -v jq >/dev/null 2>&1 && printf '%s' "${out}" | jq -e . >/dev/null 2>&1; then
-        local blockers
+        local blockers readiness_status
         blockers="$(printf '%s' "${out}" | jq -r '.readiness.blockers | if type == "array" then length else -1 end')"
+        readiness_status="$(printf '%s' "${out}" | jq -r '
+            .readiness as $r |
+            if ($r | type) != "object"
+                or ($r.blockers | type) != "array"
+                or ($r.can_register_mcp_tools | type) != "boolean"
+                or ($r.can_build_accessibility_tree | type) != "boolean"
+                or ($r.can_send_development_input | type) != "boolean"
+            then "invalid"
+            elif $r.can_register_mcp_tools != true
+                or $r.can_build_accessibility_tree != true
+                or $r.can_send_development_input != true
+            then "blocked"
+            elif ($r.blockers | length) == 0 then "ready"
+            else "degraded"
+            end
+        ')"
         printf '%s\n' "${out}" | jq -r '
             .readiness as $r |
-            "ready: \($r.blockers | type == "array" and length == 0)\n" +
+            "fully ready: \($r.blockers | type == "array" and length == 0)\n" +
             ((($r.blockers // []) | map("  - \(.)") | join("\n")))
         '
-        if [[ "${blockers}" -eq 0 ]]; then
-            log_ok "doctor reports ready"
-        elif [[ "${blockers}" -eq -1 ]]; then
-            log_fail "doctor output missing blockers field — unexpected JSON structure"
-            return 1
-        else
-            log_fail "doctor reports NOT ready"
-            while IFS= read -r line; do
-                FAILED_CHECKS+=("${line}")
-            done < <(printf '%s' "${out}" | jq -r '.readiness.blockers[]?')
-            return 1
-        fi
+        case "${readiness_status}" in
+            ready)
+                log_ok "doctor reports ready"
+                ;;
+            degraded)
+                local capability_verb="capabilities are"
+                if [[ "${blockers}" -eq 1 ]]; then capability_verb="capability is"; fi
+                log_ok "installation prerequisites are ready"
+                log_warn "installation succeeded; ${blockers} platform ${capability_verb} unavailable on this desktop/compositor"
+                ;;
+            blocked)
+                log_fail "doctor reports NOT ready"
+                while IFS= read -r line; do
+                    FAILED_CHECKS+=("${line}")
+                done < <(printf '%s' "${out}" | jq -r '.readiness.blockers[]?')
+                return 1
+                ;;
+            *)
+                log_fail "doctor output is missing required readiness fields — unexpected JSON structure"
+                return 1
+                ;;
+        esac
     else
         # Raw fallback.
         printf '%s\n' "${out}"
         if printf '%s' "${out}" | grep -qiE '"blockers"[[:space:]]*:[[:space:]]*\[\]'; then
             log_ok "doctor reports ready (raw)"
+        elif doctor_install_prerequisites_ready_raw "${out}"; then
+            log_ok "installation prerequisites are ready (raw)"
+            log_warn "installation succeeded; platform capabilities are unavailable on this desktop/compositor"
         else
             log_fail "doctor did not report ready (install jq for a structured summary)"
             return 1
@@ -516,4 +704,6 @@ main() {
     fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

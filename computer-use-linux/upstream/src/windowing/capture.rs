@@ -87,17 +87,24 @@ async fn capture_hyprland_window_exact(
     }
 
     let window = window.clone();
+    let scale_window = window.clone();
     let capture_id = tokio::task::spawn_blocking(move || hyprland::exact_capture_id(&window))
         .await
         .context("Hyprland capture-ID resolution task failed")??;
     let Some(capture_id) = capture_id else {
         return Ok(None);
     };
+    let scale =
+        tokio::task::spawn_blocking(move || hyprland::capture_coordinate_scales(&scale_window))
+            .await
+            .context("Hyprland capture scale query failed")??;
     let temporary = TemporaryCapture::new(temp_png_path("hyprland-window"));
     let mut command = Command::new("grim");
     command
         .arg("-T")
         .arg(capture_id)
+        .arg("-s")
+        .arg(scale.0.to_string())
         .arg(temporary.path())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);

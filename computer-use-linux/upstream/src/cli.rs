@@ -10,6 +10,7 @@ pub(crate) async fn run_from_env() -> Result<()> {
             crate::windowing::shutdown_backends().await;
             result
         }
+        Some("guard-accessibility") => crate::accessibility_guard::run().await,
         Some("doctor") => {
             let report = diagnostics::doctor_report();
             println!(
@@ -61,7 +62,7 @@ pub(crate) async fn run_from_env() -> Result<()> {
             let cap = screenshot::capture_screenshot_raw().await?;
             eprintln!("desktop logical size: {}x{}", cap.width, cap.height);
             let mut p = abs_pointer::AbsPointer::create(cap.width as i32, cap.height as i32)?;
-            p.click(x, y, abs_pointer::PointerButton::Left, 1)?;
+            let _landing = p.click(x, y, abs_pointer::PointerButton::Left, 1)?;
             println!(
                 "{}",
                 serde_json::json!({"ok": true, "x": x, "y": y, "w": cap.width, "h": cap.height})

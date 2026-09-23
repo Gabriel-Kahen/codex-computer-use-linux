@@ -6,6 +6,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::{collections::HashMap, time::Duration};
 use xkeysym::Keysym;
 use zbus::{
@@ -19,6 +23,8 @@ const PORTAL_DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 const PORTAL_REMOTE_DESKTOP_INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
 const PORTAL_SCREEN_CAST_INTERFACE: &str = "org.freedesktop.portal.ScreenCast";
 const PORTAL_REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
+const INPUT_TIMEOUT: Duration = Duration::from_secs(5);
+const PORTAL_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 const DEVICE_KEYBOARD: u32 = 1;
@@ -42,6 +48,7 @@ pub struct PortalSession {
     session_handle: OwnedObjectPath,
     devices: u32,
     streams: Vec<PortalStream>,
+    valid: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +59,16 @@ struct PortalStream {
 }
 
 impl PortalSession {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.valid.load(Ordering::Acquire)
+    }
+    fn ensure_valid(&self) -> Result<()> {
+        if !self.is_valid() {
+            bail!("remote desktop portal session is no longer valid");
+        }
+        Ok(())
+    }
+
     pub(crate) fn has_pointer(&self) -> bool {
         self.devices & DEVICE_POINTER != 0
     }
@@ -65,7 +82,98 @@ impl PortalSession {
     }
 
     fn map_desktop_point(&self, x: i32, y: i32) -> Result<(u32, f64, f64)> {
+        self.ensure_valid()?;
         map_desktop_point(&self.streams, x, y)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PressedInput {
+    Button(i32),
+    Keysym(i32),
+    Keycode(i32),
+}
+
+struct InputReleaseGuard {
+    session: PortalSession,
+    pressed: Vec<PressedInput>,
+}
+impl InputReleaseGuard {
+    fn new(session: &PortalSession) -> Result<Self> {
+        session.ensure_valid()?;
+        Ok(Self {
+            session: session.clone(),
+            pressed: Vec::new(),
+        })
+    }
+    fn arm(&mut self, input: PressedInput) {
+        self.pressed.push(input);
+    }
+    fn released(&mut self) {
+        self.pressed.pop();
+    }
+}
+impl Drop for InputReleaseGuard {
+    fn drop(&mut self) {
+        if self.pressed.is_empty() {
+            return;
+        }
+        self.session.valid.store(false, Ordering::Release);
+        let session = self.session.clone();
+        let pressed = std::mem::take(&mut self.pressed);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = tokio::time::timeout(INPUT_TIMEOUT, async {
+                    if let Ok(proxy) = remote_desktop_proxy(&session.connection).await {
+                        for input in pressed.into_iter().rev() {
+                            let _ = match input {
+                                PressedInput::Button(code) => {
+                                    notify_pointer_button(
+                                        &proxy,
+                                        &session.session_handle,
+                                        code,
+                                        KEY_RELEASED,
+                                    )
+                                    .await
+                                }
+                                PressedInput::Keysym(code) => {
+                                    notify_keyboard_keysym(
+                                        &proxy,
+                                        &session.session_handle,
+                                        code,
+                                        KEY_RELEASED,
+                                    )
+                                    .await
+                                }
+                                PressedInput::Keycode(code) => {
+                                    notify_keyboard_keycode(
+                                        &proxy,
+                                        &session.session_handle,
+                                        code,
+                                        KEY_RELEASED,
+                                    )
+                                    .await
+                                }
+                            };
+                        }
+                    }
+                })
+                .await;
+                let _ = tokio::time::timeout(INPUT_TIMEOUT, async {
+                    if let Ok(proxy) = Proxy::new(
+                        &session.connection,
+                        PORTAL_DESKTOP_SERVICE,
+                        session.session_handle.as_str(),
+                        "org.freedesktop.portal.Session",
+                    )
+                    .await
+                    {
+                        let _: zbus::Result<()> = proxy.call("Close", &()).await;
+                    }
+                })
+                .await;
+            });
+        }
     }
 }
 
@@ -172,6 +280,7 @@ pub async fn start_portal_session(stream_mapping: PortalStreamMapping) -> Result
         session_handle,
         devices: started.devices,
         streams: started.streams,
+        valid: Arc::new(AtomicBool::new(true)),
     })
 }
 
@@ -217,6 +326,9 @@ pub async fn scroll(
         .await
         .map_err(PortalActionError::PreDispatch)?;
 
+    session
+        .ensure_valid()
+        .map_err(PortalActionError::PreDispatch)?;
     let (axis, steps) = scroll_axis_and_steps(direction, steps);
 
     notify_pointer_axis_discrete(&proxy, &session.session_handle, axis, steps)
@@ -240,6 +352,9 @@ pub async fn scroll_at(
     notify_pointer_motion_absolute(&proxy, &session.session_handle, target)
         .await
         .map_err(PortalActionError::MayHaveDelivered)?;
+    session
+        .ensure_valid()
+        .map_err(PortalActionError::PreDispatch)?;
     let (axis, steps) = scroll_axis_and_steps(direction, steps);
     notify_pointer_axis_discrete(&proxy, &session.session_handle, axis, steps)
         .await
@@ -263,7 +378,9 @@ pub async fn click(
     notify_pointer_motion_absolute(&proxy, &session.session_handle, target)
         .await
         .map_err(PortalActionError::MayHaveDelivered)?;
+    let mut release = InputReleaseGuard::new(session).map_err(PortalActionError::PreDispatch)?;
     for _ in 0..count.clamp(1, 10) {
+        release.arm(PressedInput::Button(button));
         if let Err(error) =
             notify_pointer_button(&proxy, &session.session_handle, button, KEY_PRESSED).await
         {
@@ -278,6 +395,7 @@ pub async fn click(
                 notify_pointer_button(&proxy, &session.session_handle, button, KEY_RELEASED).await;
             return Err(PortalActionError::MayHaveDelivered(error));
         }
+        release.released();
     }
     Ok(())
 }
@@ -407,10 +525,13 @@ pub async fn type_text_with_keysyms(
     keysyms: &[i32],
 ) -> Result<()> {
     let proxy = remote_desktop_proxy(&session.connection).await?;
+    let mut release = InputReleaseGuard::new(session)?;
     for keysym in keysyms {
+        release.arm(PressedInput::Keysym(*keysym));
         notify_keyboard_keysym(&proxy, &session.session_handle, *keysym, KEY_PRESSED).await?;
         tokio::time::sleep(Duration::from_millis(5)).await;
         notify_keyboard_keysym(&proxy, &session.session_handle, *keysym, KEY_RELEASED).await?;
+        release.released();
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     Ok(())
@@ -422,14 +543,19 @@ pub async fn press_keycode_chord(
     keycode: i32,
 ) -> Result<()> {
     let proxy = remote_desktop_proxy(&session.connection).await?;
+    let mut release = InputReleaseGuard::new(session)?;
     for modifier in modifiers {
+        release.arm(PressedInput::Keycode(*modifier));
         notify_keyboard_keycode(&proxy, &session.session_handle, *modifier, KEY_PRESSED).await?;
     }
+    release.arm(PressedInput::Keycode(keycode));
     notify_keyboard_keycode(&proxy, &session.session_handle, keycode, KEY_PRESSED).await?;
     tokio::time::sleep(Duration::from_millis(35)).await;
     notify_keyboard_keycode(&proxy, &session.session_handle, keycode, KEY_RELEASED).await?;
+    release.released();
     for modifier in modifiers.iter().rev() {
         notify_keyboard_keycode(&proxy, &session.session_handle, *modifier, KEY_RELEASED).await?;
+        release.released();
     }
     Ok(())
 }
@@ -446,10 +572,13 @@ async fn create_remote_desktop_session(connection: &Connection) -> Result<OwnedO
     );
     options.insert("session_handle_token", Value::from(session_token.as_str()));
 
-    let handle: OwnedObjectPath = remote_proxy
-        .call("CreateSession", &(options))
-        .await
-        .context("RemoteDesktop CreateSession call failed")?;
+    let handle: OwnedObjectPath = tokio::time::timeout(
+        PORTAL_CALL_TIMEOUT,
+        remote_proxy.call("CreateSession", &(options)),
+    )
+    .await
+    .context("RemoteDesktop CreateSession call failed (timed out)")?
+    .context("RemoteDesktop CreateSession call failed")?;
     let (response_code, results) =
         await_portal_response(connection, handle, &request_path, &mut response_stream).await?;
     if response_code != 0 {
@@ -499,10 +628,13 @@ async fn select_devices(
         | (false, PortalPersistence::Enabled { .. }) => {}
     }
 
-    let handle: OwnedObjectPath = remote_proxy
-        .call("SelectDevices", &(session, options))
-        .await
-        .context("RemoteDesktop SelectDevices call failed")?;
+    let handle: OwnedObjectPath = tokio::time::timeout(
+        PORTAL_CALL_TIMEOUT,
+        remote_proxy.call("SelectDevices", &(session, options)),
+    )
+    .await
+    .context("RemoteDesktop SelectDevices call failed (timed out)")?
+    .context("RemoteDesktop SelectDevices call failed")?;
     let (response_code, _) =
         await_portal_response(connection, handle, &request_path, &mut response_stream).await?;
     if response_code != 0 {
@@ -526,10 +658,13 @@ async fn select_monitor_sources(
     );
     options.insert("types", Value::from(SOURCE_MONITOR));
     options.insert("multiple", Value::from(true));
-    let handle: OwnedObjectPath = screen_cast_proxy
-        .call("SelectSources", &(session, options))
-        .await
-        .context("ScreenCast SelectSources call failed")?;
+    let handle: OwnedObjectPath = tokio::time::timeout(
+        PORTAL_CALL_TIMEOUT,
+        screen_cast_proxy.call("SelectSources", &(session, options)),
+    )
+    .await
+    .context("ScreenCast SelectSources call failed (timed out)")?
+    .context("ScreenCast SelectSources call failed")?;
     let (response_code, _) =
         await_portal_response(connection, handle, &request_path, &mut response_stream).await?;
     if response_code != 0 {
@@ -556,10 +691,13 @@ async fn start_remote_desktop_session(
         Value::from(last_path_component(&request_path)),
     );
 
-    let handle: OwnedObjectPath = remote_proxy
-        .call("Start", &(session, "", options))
-        .await
-        .context("RemoteDesktop Start call failed")?;
+    let handle: OwnedObjectPath = tokio::time::timeout(
+        PORTAL_CALL_TIMEOUT,
+        remote_proxy.call("Start", &(session, "", options)),
+    )
+    .await
+    .context("RemoteDesktop Start call failed (timed out)")?
+    .context("RemoteDesktop Start call failed")?;
     let (response_code, results) =
         await_portal_response(connection, handle, &request_path, &mut response_stream).await?;
     if response_code != 0 {
@@ -617,13 +755,16 @@ async fn notify_pointer_axis_discrete(
     steps: i32,
 ) -> Result<()> {
     let options: HashMap<&str, Value<'_>> = HashMap::new();
-    let _: () = proxy
-        .call(
+    let _: () = tokio::time::timeout(
+        INPUT_TIMEOUT,
+        proxy.call(
             "NotifyPointerAxisDiscrete",
             &(session, options, axis, steps),
-        )
-        .await
-        .context("RemoteDesktop NotifyPointerAxisDiscrete failed")?;
+        ),
+    )
+    .await
+    .context("RemoteDesktop NotifyPointerAxisDiscrete failed (timed out)")?
+    .context("RemoteDesktop NotifyPointerAxisDiscrete failed")?;
     Ok(())
 }
 
@@ -633,13 +774,16 @@ async fn notify_pointer_motion_absolute(
     target: (u32, f64, f64),
 ) -> Result<()> {
     let options: HashMap<&str, Value<'_>> = HashMap::new();
-    let _: () = proxy
-        .call(
+    let _: () = tokio::time::timeout(
+        INPUT_TIMEOUT,
+        proxy.call(
             "NotifyPointerMotionAbsolute",
             &(session, options, target.0, target.1, target.2),
-        )
-        .await
-        .context("RemoteDesktop NotifyPointerMotionAbsolute failed")?;
+        ),
+    )
+    .await
+    .context("RemoteDesktop NotifyPointerMotionAbsolute failed (timed out)")?
+    .context("RemoteDesktop NotifyPointerMotionAbsolute failed")?;
     Ok(())
 }
 
@@ -650,10 +794,13 @@ async fn notify_pointer_button(
     state: u32,
 ) -> Result<()> {
     let options: HashMap<&str, Value<'_>> = HashMap::new();
-    let _: () = proxy
-        .call("NotifyPointerButton", &(session, options, button, state))
-        .await
-        .context("RemoteDesktop NotifyPointerButton failed")?;
+    let _: () = tokio::time::timeout(
+        INPUT_TIMEOUT,
+        proxy.call("NotifyPointerButton", &(session, options, button, state)),
+    )
+    .await
+    .context("RemoteDesktop NotifyPointerButton failed (timed out)")?
+    .context("RemoteDesktop NotifyPointerButton failed")?;
     Ok(())
 }
 
@@ -664,10 +811,13 @@ async fn notify_keyboard_keysym(
     state: u32,
 ) -> Result<()> {
     let options: HashMap<&str, Value<'_>> = HashMap::new();
-    let _: () = proxy
-        .call("NotifyKeyboardKeysym", &(session, options, keysym, state))
-        .await
-        .context("RemoteDesktop NotifyKeyboardKeysym failed")?;
+    let _: () = tokio::time::timeout(
+        INPUT_TIMEOUT,
+        proxy.call("NotifyKeyboardKeysym", &(session, options, keysym, state)),
+    )
+    .await
+    .context("RemoteDesktop NotifyKeyboardKeysym failed (timed out)")?
+    .context("RemoteDesktop NotifyKeyboardKeysym failed")?;
     Ok(())
 }
 
@@ -678,10 +828,13 @@ async fn notify_keyboard_keycode(
     state: u32,
 ) -> Result<()> {
     let options: HashMap<&str, Value<'_>> = HashMap::new();
-    let _: () = proxy
-        .call("NotifyKeyboardKeycode", &(session, options, keycode, state))
-        .await
-        .context("RemoteDesktop NotifyKeyboardKeycode failed")?;
+    let _: () = tokio::time::timeout(
+        INPUT_TIMEOUT,
+        proxy.call("NotifyKeyboardKeycode", &(session, options, keycode, state)),
+    )
+    .await
+    .context("RemoteDesktop NotifyKeyboardKeycode failed (timed out)")?
+    .context("RemoteDesktop NotifyKeyboardKeycode failed")?;
     Ok(())
 }
 

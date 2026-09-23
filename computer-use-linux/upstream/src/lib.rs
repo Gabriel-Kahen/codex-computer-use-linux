@@ -1,4 +1,5 @@
 mod abs_pointer;
+mod accessibility_guard;
 mod accessibility_snapshot;
 mod action_batch;
 #[path = "atspi_tree.rs"]
@@ -6,6 +7,7 @@ mod atspi_tree_impl;
 mod claim_coordination;
 mod claim_lifecycle;
 mod cli;
+mod command_runner;
 mod coordination_identity;
 #[doc(hidden)]
 pub mod coordination_protocol;

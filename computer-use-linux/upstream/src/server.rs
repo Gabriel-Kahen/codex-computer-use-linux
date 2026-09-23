@@ -42,6 +42,7 @@ use crate::screenshot::{
     RawScreenshotCapture, ScreenshotCapture, ScreenshotOutputFormat, ScreenshotPayloadOptions,
 };
 use crate::scroll_target::{resolve_observed_scroll_target, ScrollTargetRequest};
+use crate::terminal::uses_terminal_paste_shortcut;
 use crate::windowing::backends::hyprland;
 use crate::windowing::capture_window_exact;
 use crate::windowing::registry;
@@ -54,7 +55,7 @@ use crate::ydotool;
 use anyhow::Result;
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock as Content},
     schemars::JsonSchema,
     service::RequestContext,
     tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt,
@@ -70,7 +71,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child as TokioChild, Command as TokioCommand},
     time::{sleep, timeout},
 };
@@ -528,7 +528,6 @@ impl ComputerUseLinux {
     #[tool(
         name = "get_app_state",
         description = "Start an app use session if needed, then get bounded screenshot and accessibility state. Successful accessibility snapshots include an opaque observation_id that must be echoed for element-targeted clicks, element-targeted scrolls, and direct semantic actions. Legacy calls return a full visual observation. observation_mode=adaptive returns a full screenshot checkpoint unless base_checkpoint_id matches the caller's last adaptive result; matching calls return unchanged summaries or changed regions relative to that checkpoint. Targeted screenshots use window-local coordinates; add coordinate_origin_x/y when an off-screen window was clipped. AT-SPI bounds remain in desktop coordinates.",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<GetAppStateOutput>(),
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -571,8 +570,8 @@ impl ComputerUseLinux {
         let diagnostics = diagnostics.map_err(|error| {
             ErrorData::internal_error(format!("diagnostics task failed: {error}"), None)
         })?;
-        let max_nodes = params.max_nodes.unwrap_or(120).clamp(1, 500);
-        let max_depth = params.max_depth.unwrap_or(12).min(12);
+        let max_nodes = params.max_nodes.unwrap_or(120).clamp(1, 2000);
+        let max_depth = params.max_depth.unwrap_or(32).min(64);
         let include_screenshot = params.include_screenshot.unwrap_or(true);
         let _claim_guard = if include_screenshot {
             self.mutation_claim_guard(
@@ -657,15 +656,24 @@ impl ComputerUseLinux {
                 let app_filter = self
                     .resolve_accessibility_app_filter(&params, window_context.as_ref())
                     .await;
-                let target_pid = window_context.as_ref().and_then(|window| window.pid);
+                let target_pid = window_context
+                    .as_ref()
+                    .and_then(|window| window.pid)
+                    .or(params.pid);
                 match snapshot_compact_tree(app_filter.as_deref(), target_pid, max_nodes, max_depth)
                     .await
                 {
-                    Ok(nodes) => {
-                        let raw_count = nodes.len();
-                        (compact_accessibility_tree(nodes), raw_count, None)
+                    Ok(snapshot) => {
+                        let raw_count = snapshot.nodes.len();
+                        (
+                            compact_accessibility_tree(snapshot.nodes),
+                            raw_count,
+                            None,
+                            snapshot.scoped,
+                            snapshot.truncated,
+                        )
                     }
-                    Err(error) => (Vec::new(), 0, Some(format!("{error:#}"))),
+                    Err(error) => (Vec::new(), 0, Some(format!("{error:#}")), false, false),
                 }
             } else {
                 (
@@ -675,12 +683,20 @@ impl ComputerUseLinux {
                         "GNOME accessibility is disabled; call setup_accessibility first."
                             .to_string(),
                     ),
+                    false,
+                    false,
                 )
             }
         };
         let (
             (raw_screenshot_with_origin, mut screenshot_error),
-            (accessibility_tree, accessibility_tree_raw_count, accessibility_error),
+            (
+                accessibility_tree,
+                accessibility_tree_raw_count,
+                accessibility_error,
+                tree_scoped,
+                accessibility_tree_truncated,
+            ),
         ) = tokio::join!(screenshot_future, accessibility_future);
         let (raw_screenshot, screenshot_origin) = raw_screenshot_with_origin
             .map_or((None, (0, 0)), |(capture, origin)| (Some(capture), origin));
@@ -873,6 +889,18 @@ impl ComputerUseLinux {
             message.push_str(&format!(" Window target resolution failed: {error}"));
         }
 
+        if let Some(warning) = unscoped_accessibility_tree_warning(
+            tree_scoped,
+            accessibility_error.is_none(),
+            params.window_target().has_target() || params.app_name_or_bundle_identifier.is_some(),
+        ) {
+            message.push(' ');
+            message.push_str(warning);
+        }
+        if let Some(note) = truncated_accessibility_tree_note(accessibility_tree_truncated) {
+            message.push(' ');
+            message.push_str(note);
+        }
         // Full diagnostics are huge (portal/process dumps); emit them only on
         // request. The compact readiness block always travels, and failures get
         // a pointer to verbose=true instead of an automatic dump.
@@ -899,6 +927,8 @@ impl ComputerUseLinux {
             screenshot_error,
             accessibility_tree,
             accessibility_tree_raw_count,
+            tree_scoped,
+            accessibility_tree_truncated,
             observation_id,
             accessibility_coordinate_space: "desktop".to_string(),
             accessibility_error,
@@ -1137,7 +1167,9 @@ impl ComputerUseLinux {
         if !self.ensure_abs_pointer().await {
             return Ok(None);
         }
-        let btn = crate::abs_pointer::PointerButton::from_name(button);
+        let Some(btn) = crate::abs_pointer::PointerButton::from_name(button) else {
+            return Ok(None);
+        };
         let abs_pointer = Arc::clone(&self.abs_pointer);
         run_verified_pointer_dispatch(
             PointerDispatchBoundary::AbsolutePointer,
@@ -1480,7 +1512,6 @@ impl ComputerUseLinux {
     #[tool(
         name = "run_action_batch_and_observe",
         description = "Run the same validated, ordered, fail-fast input batch as run_action_batch, then return a window-scoped adaptive observation in the same call. Validation failures do not capture state; once execution starts, post-action state is captured even if an action fails so the caller can recover.",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ActionBatchAndObserveOutput>(),
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2299,7 +2330,11 @@ impl ComputerUseLinux {
             match self.ensure_portal_keyboard_session().await {
                 Ok(Some(session)) => {
                     let _clipboard_guard = self.kde_clipboard_lock.lock().await;
-                    match run_kde_clipboard_paste_text(&session, &params.text).await {
+                    let use_terminal_paste =
+                        kde_clipboard_uses_terminal_paste(&window_target, focus.as_ref()).await;
+                    match run_kde_clipboard_paste_text(&session, &params.text, use_terminal_paste)
+                        .await
+                    {
                         Ok(message) => {
                             let notes = self.input_landing_notes(focus.as_ref(), true).await;
                             return Json(with_notes(
@@ -2366,13 +2401,11 @@ impl ComputerUseLinux {
         // ydotool's raw scancodes get re-mapped by X11 and mangle symbols and
         // digits (`_` → `%`, `1` → `+`) even on a plain US layout (issue #58).
         if self.should_prefer_xdotool_keyboard() {
-            let args = vec![
-                "type".to_string(),
-                "--clearmodifiers".to_string(),
-                "--".to_string(),
-                params.text.clone(),
-            ];
-            match run_xdotool(&args).await {
+            let delay_ms = xdotool_type_delay_ms();
+            let args = xdotool_type_args_with_delay(&params.text, delay_ms);
+            match run_xdotool_with_timeout(&args, xdotool_type_timeout(&params.text, delay_ms))
+                .await
+            {
                 Ok(output) => {
                     let mut result = action_result_with_focus(
                         "type_text",
@@ -2399,6 +2432,41 @@ impl ComputerUseLinux {
                     ));
                 }
             }
+        }
+        if prefer_wtype_keyboard(
+            env_flag_enabled("COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD"),
+            self.is_wayland_session(),
+            !env_contains("XDG_CURRENT_DESKTOP", "gnome")
+                && !env_contains("XDG_CURRENT_DESKTOP", "kde")
+                && !env_contains("XDG_CURRENT_DESKTOP", "plasma")
+                && !env_contains("XDG_CURRENT_DESKTOP", "cosmic"),
+            which_in_path("wtype"),
+        ) {
+            let mut command = TokioCommand::new("wtype");
+            command.arg("-");
+            let result = crate::command_runner::output_with_stdin(
+                command,
+                "run wtype",
+                ydotool_type_timeout(&params.text),
+                params.text.as_bytes().to_vec(),
+            )
+            .await
+            .map_err(|error| {
+                format!("wtype may have delivered input; text was not replayed: {error:#}")
+            })
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(vec![output])
+                } else {
+                    Err(command_output_error("wtype", output))
+                }
+            });
+            return Json(action_result_with_focus(
+                "type_text",
+                result,
+                received,
+                focus,
+            ));
         }
         let result = run_ydotool_type_text(&params.text)
             .await
@@ -2494,7 +2562,28 @@ fn app_state_tool_result(
             ));
         }
     }
+    preserve_media_for_stock_hosts(&mut result);
     Ok(result)
+}
+
+fn preserve_media_for_stock_hosts(result: &mut CallToolResult) {
+    if result
+        .content
+        .iter()
+        .any(|content| content.as_image().is_some())
+    {
+        result.structured_content = None;
+    }
+}
+
+fn tool_result_metadata(result: &CallToolResult) -> Option<serde_json::Value> {
+    result.structured_content.clone().or_else(|| {
+        result.content.iter().find_map(|content| {
+            content
+                .as_text()
+                .and_then(|text| serde_json::from_str(&text.text).ok())
+        })
+    })
 }
 
 fn action_batch_and_observation_tool_result(
@@ -2503,7 +2592,7 @@ fn action_batch_and_observation_tool_result(
 ) -> Result<CallToolResult, ErrorData> {
     let (mut observation, observation_error, mut images) = match observation_result {
         PostActionObservationResult::Completed(result) => {
-            let observation = result.structured_content.ok_or_else(|| {
+            let observation = tool_result_metadata(&result).ok_or_else(|| {
                 ErrorData::internal_error(
                     "get_app_state returned no structured post-action observation",
                     None,
@@ -2512,7 +2601,7 @@ fn action_batch_and_observation_tool_result(
             let images = result
                 .content
                 .into_iter()
-                .filter(|content| content.raw.as_image().is_some())
+                .filter(|content| content.as_image().is_some())
                 .collect::<Vec<_>>();
             (Some(observation), None, images)
         }
@@ -2570,6 +2659,7 @@ fn action_batch_and_observation_tool_result(
     }
     let mut result = CallToolResult::structured(value);
     result.content.extend(images);
+    preserve_media_for_stock_hosts(&mut result);
     Ok(result)
 }
 
@@ -2601,7 +2691,7 @@ enum PostActionObservationResult {
     // The rmcp tool_handler macro only accepts a string literal here, so this
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
-    version = "0.5.0",
+    version = "0.7.1",
     instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate click/drag through absolute uinput or ydotool, send targeted scroll through ydotool, map targeted logical pointer coordinates through a shared ScreenCast/RemoteDesktop portal session, send untargeted relative scroll and layout-safe key input through that portal, and send literal type_text through KDE clipboard integration on Plasma Wayland. The portal uses selected monitor stream geometry for logical AT-SPI/window coordinates; it still refuses screenshot-derived click, scroll, and drag pixels on ambiguous mixed-scale layouts instead of guessing a transform. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. When readiness.window_claims.supports_shared_lifecycle is true, exhaust list_window_claims pages before sustained exact-window work, create a claim, keep its token private, renew before expiry, and release it in finally-style cleanup; lifecycle calls still verify the current session identity, host _meta.threadId is authoritative, and lost tokens cannot be recovered from listing. Hyprland continues to use its same-session companion claims during migration. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted click and scroll, perform_action, and set_value calls, pass observation_id from the get_app_state result that supplied the element_index, object_ref, or semantic selector; stale or target-mismatched observations are rejected. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. Use run_action_batch for short, ordered click/type_text/press_key sequences against one exact window_id; use run_action_batch_and_observe when post-action state is needed so the batch and adaptive observation share one model round trip. Batches are fully prevalidated, stop at the first failure, and allow at most one leading click because clicks can invalidate later coordinates or element indices. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when no editable element holds focus — treat that warning as the input not landing. Screenshot results warn when a target window is partially or fully off-screen, and coordinate input outside the captured desktop bounds is rejected; use move_window/resize_window (GNOME Shell extension backend) to bring it fully on-screen before retrying. Coordinate scrolls accept the same window targeting and relative coordinates as click; element-targeted scrolls require observation_id and use verified absolute element bounds. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
 )]
 impl ServerHandler for ComputerUseLinux {
@@ -3213,6 +3303,8 @@ struct GetAppStateOutput {
     screenshot_error: Option<String>,
     accessibility_tree: Vec<AccessibilityNode>,
     accessibility_tree_raw_count: usize,
+    tree_scoped: bool,
+    accessibility_tree_truncated: bool,
     /// Opaque ID for this bounded accessibility snapshot.
     observation_id: Option<String>,
     accessibility_coordinate_space: String,
@@ -3936,7 +4028,7 @@ impl ComputerUseLinux {
             .lock()
             .ok()
             .and_then(|cached| cached.clone())
-            .filter(PortalSession::has_pointer)
+            .filter(|session| session.is_valid() && session.has_pointer())
     }
 
     async fn portal_pointer_session_for_action(
@@ -3997,7 +4089,7 @@ impl ComputerUseLinux {
             .lock()
             .ok()
             .and_then(|cached| cached.clone())
-            .filter(PortalSession::has_keyboard)
+            .filter(|session| session.is_valid() && session.has_keyboard())
     }
 
     fn clear_portal_keyboard_session(&self) {
@@ -4016,8 +4108,9 @@ impl ComputerUseLinux {
             .ok()
             .and_then(|cached| cached.clone())
             .filter(|session| {
-                stream_mapping == PortalStreamMapping::NotRequired
-                    || session.has_absolute_pointer_mapping()
+                session.is_valid()
+                    && (stream_mapping == PortalStreamMapping::NotRequired
+                        || session.has_absolute_pointer_mapping())
             })
         {
             return Ok(session);
@@ -4030,8 +4123,9 @@ impl ComputerUseLinux {
             .ok()
             .and_then(|cached| cached.clone())
             .filter(|session| {
-                stream_mapping == PortalStreamMapping::NotRequired
-                    || session.has_absolute_pointer_mapping()
+                session.is_valid()
+                    && (stream_mapping == PortalStreamMapping::NotRequired
+                        || session.has_absolute_pointer_mapping())
             })
         {
             return Ok(session);
@@ -4904,6 +4998,28 @@ fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
     ))
 }
 
+fn unscoped_accessibility_tree_warning(
+    tree_scoped: bool,
+    tree_ok: bool,
+    target_requested: bool,
+) -> Option<&'static str> {
+    if !tree_ok || tree_scoped {
+        return None;
+    }
+    Some(if target_requested {
+        "WARNING: the requested target matched no AT-SPI application root, so the accessibility tree covers the whole desktop and can flood context. The target app may expose no accessibility tree (Electron apps need --force-renderer-accessibility); check list_apps for its AT-SPI name and pass that as app_name_or_bundle_identifier, or lower max_nodes to bound the cost."
+    } else {
+        "WARNING: no app target scoped the accessibility tree, so it covers the whole desktop and can flood context. Pass app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title) to limit it."
+    })
+}
+
+/// Note appended when raw traversal hit max_nodes; the tree is incomplete.
+fn truncated_accessibility_tree_note(truncated: bool) -> Option<&'static str> {
+    truncated.then_some(
+        "The node, depth, or read budget stopped traversal with unread elements left. To recover missing elements, scope to a narrower app or window target and raise max_nodes or max_depth (hard caps 2000 and 64); lowering max_nodes would drop more.",
+    )
+}
+
 fn compact_accessibility_tree(nodes: Vec<AccessibilityNode>) -> Vec<AccessibilityNode> {
     if nodes.is_empty() {
         return nodes;
@@ -5676,109 +5792,60 @@ async fn run_ydotool_sequence(
 }
 
 async fn run_ydotool(args: &[String]) -> std::result::Result<Output, String> {
-    ydotool::ensure_supported()?;
-    let mut command = TokioCommand::new("ydotool");
+    let support = ydotool::ensure_supported_async().await?;
+    let mut command = TokioCommand::new(&support.executable);
     command.args(args);
     if let Some(socket) = ydotool_socket() {
         command.env("YDOTOOL_SOCKET", socket);
     }
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    match command.spawn() {
-        Ok(child) => match wait_for_ydotool_output(child).await {
-            Ok(output) if output.status.success() => {
-                if let Some(error) = ydotool::cli_error(&output.stderr) {
-                    Err(error)
-                } else {
-                    Ok(output)
-                }
-            }
-            Ok(output) => Err(ydotool_output_error(output)),
-            Err(error) => Err(error),
-        },
-        Err(error) => Err(format!("failed to run ydotool: {error}")),
+    let output =
+        crate::command_runner::output_with_timeout(command, "run ydotool", YDOTOOL_TIMEOUT)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+    if output.status.success() {
+        if let Some(error) = ydotool::cli_error(&output.stderr) {
+            Err(error)
+        } else {
+            Ok(output)
+        }
+    } else {
+        Err(ydotool_output_error(output))
     }
 }
 
 async fn run_ydotool_type_text(text: &str) -> std::result::Result<Output, String> {
-    ydotool::ensure_supported()?;
-    let mut command = TokioCommand::new("ydotool");
+    let support = ydotool::ensure_supported_async().await?;
+    let mut command = TokioCommand::new(&support.executable);
     command.args(["type", "--file", "-"]);
     if let Some(socket) = ydotool_socket() {
         command.env("YDOTOOL_SOCKET", socket);
     }
-    command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    match command.spawn() {
-        Ok(mut child) => {
-            if let Some(mut stdin) = child.stdin.take() {
-                if let Err(error) = stdin.write_all(text.as_bytes()).await {
-                    let _ = child.kill().await;
-                    return Err(format!("failed to write text to ydotool stdin: {error}"));
-                }
-            }
-            let output =
-                wait_for_ydotool_output_with_timeout(child, ydotool_type_timeout(text)).await?;
-            if output.status.success() {
-                if let Some(error) = ydotool::cli_error(&output.stderr) {
-                    Err(error)
-                } else {
-                    Ok(output)
-                }
-            } else {
-                Err(ydotool_output_error(output))
-            }
+    let output = crate::command_runner::output_with_stdin(
+        command,
+        "run ydotool type",
+        ydotool_type_timeout(text),
+        text.as_bytes().to_vec(),
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))?;
+    if output.status.success() {
+        if let Some(error) = ydotool::cli_error(&output.stderr) {
+            Err(error)
+        } else {
+            Ok(output)
         }
-        Err(error) => Err(format!("failed to run ydotool: {error}")),
+    } else {
+        Err(ydotool_output_error(output))
     }
 }
 
-async fn wait_for_ydotool_output(child: TokioChild) -> std::result::Result<Output, String> {
-    wait_for_ydotool_output_with_timeout(child, YDOTOOL_TIMEOUT).await
-}
-
 async fn wait_for_ydotool_output_with_timeout(
-    mut child: TokioChild,
+    child: TokioChild,
     timeout_duration: Duration,
 ) -> std::result::Result<Output, String> {
-    let stdout_reader = read_child_pipe(child.stdout.take());
-    let stderr_reader = read_child_pipe(child.stderr.take());
-    let status = match timeout(timeout_duration, child.wait()).await {
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            stdout_reader.abort();
-            stderr_reader.abort();
-            return Err(format!(
-                "ydotool timed out after {}s",
-                timeout_duration.as_secs()
-            ));
-        }
-        Ok(result) => result.map_err(|error| format!("failed to wait for ydotool: {error}"))?,
-    };
-    let stdout = stdout_reader.await.unwrap_or_default();
-    let stderr = stderr_reader.await.unwrap_or_default();
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn read_child_pipe<R>(pipe: Option<R>) -> tokio::task::JoinHandle<Vec<u8>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut output = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut output).await;
-        }
-        output
-    })
+    crate::command_runner::output_child(child, "input command", timeout_duration)
+        .await
+        .map_err(|error| format!("{error:#}"))
 }
 
 fn ydotool_type_timeout(text: &str) -> Duration {
@@ -5790,6 +5857,7 @@ const EVDEV_KEY_LEFTCTRL: i32 = 29;
 const EVDEV_KEY_V: i32 = 47;
 const KDE_CLIPBOARD_RESTORE_MIN_DELAY_MS: u64 = 1_500;
 const KDE_CLIPBOARD_RESTORE_MAX_DELAY_MS: u64 = 5_000;
+const EVDEV_KEY_LEFTSHIFT: i32 = 42;
 const KDE_CLIPBOARD_RESTORE_CHARS_PER_SECOND: u64 = 250;
 
 fn kde_clipboard_restore_delay(text: &str) -> Duration {
@@ -5830,6 +5898,7 @@ impl KdeClipboardPasteError {
 async fn run_kde_clipboard_paste_text(
     session: &PortalKeyboardSession,
     text: &str,
+    use_terminal_paste: bool,
 ) -> std::result::Result<String, KdeClipboardPasteError> {
     let previous = kde_clipboard_contents()
         .await
@@ -5838,9 +5907,13 @@ async fn run_kde_clipboard_paste_text(
         .await
         .map_err(KdeClipboardPasteError::before_text_input)?;
 
-    let paste_result = press_keycode_chord(session, &[EVDEV_KEY_LEFTCTRL], EVDEV_KEY_V)
-        .await
-        .map_err(|error| format!("{error:#}"));
+    let paste_result = press_keycode_chord(
+        session,
+        kde_clipboard_paste_modifiers(use_terminal_paste),
+        EVDEV_KEY_V,
+    )
+    .await
+    .map_err(|error| format!("{error:#}"));
 
     sleep(kde_clipboard_restore_delay(text)).await;
     let restore_result = kde_set_clipboard_contents(&previous).await;
@@ -5854,6 +5927,38 @@ async fn run_kde_clipboard_paste_text(
         (Err(error), Err(restore_error)) => Err(KdeClipboardPasteError::after_portal_input(
             format!("{error}; previous KDE clipboard contents could not be restored: {restore_error}"),
         )),
+    }
+}
+
+async fn kde_clipboard_uses_terminal_paste(
+    target: &WindowTarget,
+    focus: Option<&WindowFocusResult>,
+) -> bool {
+    if let Some(focus) = focus {
+        let window = focus
+            .focused_window
+            .as_ref()
+            .unwrap_or(&focus.requested_window);
+        return kde_clipboard_target_is_terminal(target, Some(window));
+    }
+    if let Ok(Some(current)) = focused_window().await {
+        return kde_clipboard_target_is_terminal(target, Some(&current));
+    }
+    kde_clipboard_target_is_terminal(target, None)
+}
+
+fn kde_clipboard_target_is_terminal(target: &WindowTarget, window: Option<&WindowInfo>) -> bool {
+    match window {
+        Some(window) => uses_terminal_paste_shortcut(window),
+        None => target.has_terminal_target(),
+    }
+}
+
+fn kde_clipboard_paste_modifiers(use_terminal_paste: bool) -> &'static [i32] {
+    if use_terminal_paste {
+        &[EVDEV_KEY_LEFTCTRL, EVDEV_KEY_LEFTSHIFT]
+    } else {
+        &[EVDEV_KEY_LEFTCTRL]
     }
 }
 
@@ -5936,13 +6041,21 @@ fn ydotool_output_error(output: Output) -> String {
 /// symbols/digits (`_` → `%`, `1` → `+`). XTEST resolves keysyms against the
 /// live layout, which is what X11 clients actually expect. See issue #58.
 async fn run_xdotool(args: &[String]) -> std::result::Result<Output, PortalActionError> {
+    run_xdotool_with_timeout(args, YDOTOOL_TIMEOUT).await
+}
+
+async fn run_xdotool_with_timeout(
+    args: &[String],
+    command_timeout: Duration,
+) -> std::result::Result<Output, PortalActionError> {
     let mut command = TokioCommand::new("xdotool");
     command.args(args);
+    command.kill_on_drop(true);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
     match command.spawn() {
-        Ok(child) => match wait_for_ydotool_output(child).await {
+        Ok(child) => match wait_for_ydotool_output_with_timeout(child, command_timeout).await {
             Ok(output) if output.status.success() => Ok(output),
             Ok(output) => Err(PortalActionError::MayHaveDelivered(anyhow::anyhow!(
                 command_output_error("xdotool", output)
@@ -5958,6 +6071,43 @@ async fn run_xdotool(args: &[String]) -> std::result::Result<Output, PortalActio
 /// True when `xdotool` can drive this session: an X11 session with `DISPLAY`
 /// set and the binary present. `COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD=1`
 /// opts out; `COMPUTER_USE_LINUX_FORCE_XDOTOOL_KEYBOARD=1` forces it on.
+const XDOTOOL_TYPE_DELAY_MS: u64 = 12;
+const XDOTOOL_TYPE_DELAY_ENV: &str = "COMPUTER_USE_LINUX_XDOTOOL_TYPE_DELAY_MS";
+
+fn prefer_wtype_keyboard(
+    force_ydotool: bool,
+    is_wayland: bool,
+    compatible_desktop: bool,
+    available: bool,
+) -> bool {
+    !force_ydotool && is_wayland && compatible_desktop && available
+}
+
+fn xdotool_type_delay_ms() -> u64 {
+    env::var(XDOTOOL_TYPE_DELAY_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(XDOTOOL_TYPE_DELAY_MS)
+}
+
+fn xdotool_type_args_with_delay(text: &str, delay_ms: u64) -> Vec<String> {
+    vec![
+        "type".to_string(),
+        "--clearmodifiers".to_string(),
+        "--delay".to_string(),
+        delay_ms.to_string(),
+        "--".to_string(),
+        text.to_string(),
+    ]
+}
+
+/// `xdotool type` spends about `delay_ms` per character, so long inputs need
+/// more than the flat input timeout.
+fn xdotool_type_timeout(text: &str, delay_ms: u64) -> Duration {
+    let chars = text.chars().count() as u64;
+    YDOTOOL_TIMEOUT.saturating_add(Duration::from_millis(chars.saturating_mul(delay_ms)))
+}
+
 fn xdotool_available() -> bool {
     which_in_path("xdotool")
 }
@@ -6580,10 +6730,13 @@ mod tests {
             .into_iter()
             .find(|tool| tool.name == "get_app_state")
             .unwrap();
-        let schema = serde_json::to_string(&tool.output_schema).unwrap();
+        let schema = serde_json::to_string(&rmcp::handler::server::tool::schema_for_type::<
+            GetAppStateOutput,
+        >())
+        .unwrap();
         let input_schema = serde_json::to_string(&tool.input_schema).unwrap();
 
-        assert!(tool.output_schema.is_some());
+        assert!(tool.output_schema.is_none());
         assert!(schema.contains("coordinate_width"));
         assert!(schema.contains("checkpoint_id"));
         assert!(schema.contains("observation_id"));
@@ -6602,9 +6755,12 @@ mod tests {
             .find(|tool| tool.name == "run_action_batch_and_observe")
             .unwrap();
         let input_schema = serde_json::to_string(&tool.input_schema).unwrap();
-        let output_schema = serde_json::to_string(&tool.output_schema).unwrap();
+        let output_schema = serde_json::to_string(&rmcp::handler::server::tool::schema_for_type::<
+            ActionBatchAndObserveOutput,
+        >())
+        .unwrap();
 
-        assert!(tool.output_schema.is_some());
+        assert!(tool.output_schema.is_none());
         assert!(input_schema.contains("window_id"));
         assert!(input_schema.contains("actions"));
         assert!(input_schema.contains("observation"));
@@ -6684,6 +6840,7 @@ mod tests {
             .content
             .push(Content::image("BBBB", "image/png"));
 
+        preserve_media_for_stock_hosts(&mut observation_result);
         let result = action_batch_and_observation_tool_result(
             batch.clone(),
             PostActionObservationResult::Completed(observation_result),
@@ -6696,12 +6853,11 @@ mod tests {
         });
         let serialized = serde_json::to_string(&result).unwrap();
 
-        assert_eq!(result.structured_content.as_ref(), Some(&expected));
+        assert_eq!(tool_result_metadata(&result).as_ref(), Some(&expected));
+        assert!(result.structured_content.is_none());
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                &result.content[0].raw.as_text().unwrap().text
-            )
-            .unwrap(),
+            serde_json::from_str::<serde_json::Value>(&result.content[0].as_text().unwrap().text)
+                .unwrap(),
             expected
         );
         assert_eq!(result.content.len(), 3);
@@ -6734,12 +6890,12 @@ mod tests {
             PostActionObservationResult::Completed(observation_result),
         )
         .unwrap();
-        let structured = result.structured_content.as_ref().unwrap();
+        let structured = tool_result_metadata(&result).unwrap();
         let retained_nodes = structured["observation"]["accessibility_tree"]
             .as_array()
             .unwrap();
 
-        assert!(serde_json::to_vec(structured).unwrap().len() <= 8 * 1024);
+        assert!(serde_json::to_vec(&structured).unwrap().len() <= 8 * 1024);
         assert!(!retained_nodes.is_empty());
         assert!(retained_nodes.len() < 128);
         assert!(retained_nodes
@@ -7181,7 +7337,7 @@ mod tests {
     }
 
     #[test]
-    fn app_state_result_carries_each_image_once_and_only_metadata_in_structured_content() {
+    fn app_state_result_keeps_images_visible_to_stock_codex_without_structured_content() {
         let capture = ScreenshotCapture {
             mime_type: "image/png".to_string(),
             data_url: "data:image/png;base64,AAAA".to_string(),
@@ -7210,6 +7366,8 @@ mod tests {
             screenshot_error: None,
             accessibility_tree: Vec::new(),
             accessibility_tree_raw_count: 0,
+            tree_scoped: true,
+            accessibility_tree_truncated: false,
             observation_id: None,
             accessibility_coordinate_space: "desktop".to_string(),
             accessibility_error: None,
@@ -7222,10 +7380,9 @@ mod tests {
         let mut second_capture = capture.clone();
         second_capture.data_url = "data:image/png;base64,BBBB".to_string();
         let result = app_state_tool_result(output, &[&capture, &second_capture]).unwrap();
-        let structured = result.structured_content.as_ref().unwrap();
+        let structured = tool_result_metadata(&result).unwrap();
         let text: serde_json::Value = serde_json::from_str(
             result.content[0]
-                .raw
                 .as_text()
                 .expect("first content block should be text")
                 .text
@@ -7234,7 +7391,8 @@ mod tests {
         .unwrap();
         let serialized = serde_json::to_string(&result).unwrap();
 
-        assert_eq!(&text, structured);
+        assert_eq!(text, structured);
+        assert!(result.structured_content.is_none());
         assert_eq!(structured["screenshot"]["coordinate_width"], 4);
         assert_eq!(structured["screenshot"]["coordinate_space"], "desktop");
         assert_eq!(structured["screenshot"]["coordinate_origin_x"], 0);
@@ -7288,6 +7446,8 @@ mod tests {
             ),
             accessibility_tree: Vec::new(),
             accessibility_tree_raw_count: 0,
+            tree_scoped: true,
+            accessibility_tree_truncated: false,
             observation_id: None,
             accessibility_coordinate_space: "desktop".to_string(),
             accessibility_error: None,
@@ -8352,6 +8512,40 @@ mod tests {
         assert_eq!(
             key_sequence("Super"),
             Some(vec!["125:1".to_string(), "125:0".to_string()])
+        );
+    }
+
+    #[test]
+    fn xdotool_type_keeps_a_per_character_delay_so_xtest_events_stay_ordered() {
+        // Issue #147: `--delay 0` delivers characters out of order on some X
+        // servers. The default must stay non-zero.
+        const { assert!(XDOTOOL_TYPE_DELAY_MS > 0) };
+        let text = "x".repeat(10_000);
+        let args = xdotool_type_args_with_delay(&text, XDOTOOL_TYPE_DELAY_MS);
+
+        assert_eq!(
+            &args[..5],
+            ["type", "--clearmodifiers", "--delay", "12", "--"]
+        );
+        assert_eq!(args[3], XDOTOOL_TYPE_DELAY_MS.to_string());
+        assert_eq!(args[5], text);
+    }
+
+    #[test]
+    fn xdotool_type_timeout_grows_with_text_length() {
+        assert_eq!(xdotool_type_timeout("", 12), YDOTOOL_TIMEOUT);
+        assert_eq!(
+            xdotool_type_timeout(&"x".repeat(1_000), 12),
+            YDOTOOL_TIMEOUT + Duration::from_secs(12)
+        );
+        assert_eq!(xdotool_type_timeout(&"x".repeat(1_000), 0), YDOTOOL_TIMEOUT);
+    }
+
+    #[test]
+    fn kde_clipboard_uses_terminal_paste_shortcut_for_terminals() {
+        assert_eq!(
+            kde_clipboard_paste_modifiers(true),
+            &[EVDEV_KEY_LEFTCTRL, EVDEV_KEY_LEFTSHIFT]
         );
     }
 

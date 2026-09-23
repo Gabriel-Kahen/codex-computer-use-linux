@@ -1,3 +1,4 @@
+use crate::command_runner;
 use crate::cosmic_helper_protocol::{
     read_cosmic_service_message, CosmicServiceCommand, CosmicServiceRequest, CosmicServiceResponse,
     COSMIC_SERVICE_PROTOCOL_VERSION,
@@ -10,7 +11,7 @@ use std::io::{BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{
     env,
     path::{Path, PathBuf},
@@ -34,6 +35,17 @@ pub struct CosmicHelperProbe {
 pub struct CosmicHelperActivation {
     pub ok: bool,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+// Retained upstream geometry API; our unified portal session supplies stream geometry.
+#[allow(dead_code)]
+pub struct CosmicMonitor {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub scale: f64,
 }
 
 pub fn resolve_helper_binary() -> Result<PathBuf> {
@@ -93,6 +105,17 @@ pub fn activate_window(window_id: u64) -> Result<CosmicHelperActivation> {
     )
 }
 
+#[allow(dead_code)]
+pub async fn monitor_layout() -> Result<Vec<CosmicMonitor>> {
+    tokio::task::spawn_blocking(|| {
+        let helper = resolve_helper_binary()?;
+        let value = run_one_shot(&helper, &["monitor-layout".to_string()])?;
+        serde_json::from_value(value).context("failed to parse COSMIC monitor layout")
+    })
+    .await
+    .context("COSMIC monitor query task failed")?
+}
+
 pub fn capture_window(window_id: u64, output_path: &Path) -> Result<()> {
     let output_path = output_path.to_path_buf();
     let result = run_command(
@@ -144,36 +167,13 @@ fn run_command(command: CosmicServiceCommand, fallback_args: Vec<String>) -> Res
 }
 
 fn run_one_shot(helper: &Path, args: &[String]) -> Result<Value> {
-    let mut child = Command::new(helper)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to run {}", helper.display()))?;
-    let deadline = Instant::now() + SERVICE_RESPONSE_TIMEOUT;
-    loop {
-        if child
-            .try_wait()
-            .with_context(|| format!("failed to poll {}", helper.display()))?
-            .is_some()
-        {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "{} {} timed out after {} ms",
-                helper.display(),
-                args.join(" "),
-                SERVICE_RESPONSE_TIMEOUT.as_millis()
-            );
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed to collect {} output", helper.display()))?;
+    let mut command = Command::new(helper);
+    command.args(args);
+    let output = command_runner::output_blocking_with_timeout(
+        &mut command,
+        &format!("run {}", helper.display()),
+        SERVICE_RESPONSE_TIMEOUT,
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();

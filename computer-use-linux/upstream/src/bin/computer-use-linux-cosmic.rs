@@ -22,11 +22,14 @@ use wayland_client::{
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1, ext_foreign_toplevel_list_v1,
 };
+use wayland_protocols_wlr::output_management::v1::client::{
+    zwlr_output_head_v1, zwlr_output_manager_v1, zwlr_output_mode_v1,
+};
 
 #[path = "computer-use-linux-cosmic/cosmic_capture.rs"]
 mod cosmic_capture;
 
-const HELP: &str = "computer-use-linux-cosmic\n\nUsage:\n  computer-use-linux-cosmic probe\n  computer-use-linux-cosmic list-windows\n  computer-use-linux-cosmic focused-window\n  computer-use-linux-cosmic activate-window --window-id <id>\n  computer-use-linux-cosmic capture-window --window-id <id> --output <path>\n  computer-use-linux-cosmic serve";
+const HELP: &str = "computer-use-linux-cosmic\n\nUsage:\n  computer-use-linux-cosmic probe\n  computer-use-linux-cosmic list-windows\n  computer-use-linux-cosmic focused-window\n  computer-use-linux-cosmic monitor-layout\n  computer-use-linux-cosmic activate-window --window-id <id>\n  computer-use-linux-cosmic capture-window --window-id <id> --output <path>\n  computer-use-linux-cosmic serve";
 const BACKEND: &str = "cosmic-wayland";
 const DIRECT_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -65,6 +68,31 @@ struct ProbeOutput {
 struct ActivationOutput {
     ok: bool,
     detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct MonitorInfo {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    scale: f64,
+}
+
+#[derive(Debug, Default)]
+struct OutputHeadState {
+    enabled: bool,
+    finished: bool,
+    position: Option<(i32, i32)>,
+    transform: Option<u32>,
+    scale: Option<f64>,
+    current_mode: Option<u32>,
+}
+
+#[derive(Debug, Default)]
+struct OutputModeState {
+    finished: bool,
+    size: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,6 +139,11 @@ struct AppData {
     records: HashMap<u32, ToplevelRecord>,
     by_cosmic_id: HashMap<u32, u32>,
     capture: cosmic_capture::CaptureRuntime,
+    output_manager: Option<zwlr_output_manager_v1::ZwlrOutputManagerV1>,
+    output_layout_ready: bool,
+    output_manager_finished: bool,
+    output_heads: HashMap<u32, OutputHeadState>,
+    output_modes: HashMap<u32, OutputModeState>,
 }
 
 fn main() -> Result<()> {
@@ -118,6 +151,7 @@ fn main() -> Result<()> {
         Command::Probe => print_json(&probe()?),
         Command::ListWindows => print_json(&collect_windows()?),
         Command::FocusedWindow => print_json(&focused_window()?),
+        Command::MonitorLayout => print_json(&monitor_layout()?),
         Command::ActivateWindow { window_id } => print_json(&activate_window(window_id)?),
         Command::CaptureWindow {
             window_id,
@@ -140,6 +174,7 @@ enum Command {
         output_path: std::path::PathBuf,
     },
     Serve,
+    MonitorLayout,
 }
 
 impl Command {
@@ -149,6 +184,7 @@ impl Command {
             [command] if command == "list-windows" => Ok(Self::ListWindows),
             [command] if command == "focused-window" => Ok(Self::FocusedWindow),
             [command] if command == "serve" => Ok(Self::Serve),
+            [command] if command == "monitor-layout" => Ok(Self::MonitorLayout),
             [command, flag, value] if command == "activate-window" && flag == "--window-id" => {
                 Ok(Self::ActivateWindow {
                     window_id: value
@@ -176,7 +212,7 @@ impl Command {
                 println!("{HELP}");
                 std::process::exit(0);
             }
-            _ => bail!("unknown arguments. Expected one of: probe, list-windows, focused-window, activate-window --window-id <id>, capture-window --window-id <id> --output <path>, serve"),
+            _ => bail!("unknown arguments. Expected one of: probe, list-windows, focused-window, monitor-layout, activate-window --window-id <id>, capture-window --window-id <id> --output <path>, serve"),
         }
     }
 }
@@ -307,6 +343,10 @@ fn write_service_response(stdout: &mut impl Write, response: &CosmicServiceRespo
         .context("failed to flush COSMIC service response")
 }
 
+fn monitor_layout() -> Result<Vec<MonitorInfo>> {
+    Snapshot::collect()?.monitor_layout()
+}
+
 struct Snapshot {
     event_queue: wayland_client::EventQueue<AppData>,
     app_data: AppData,
@@ -329,6 +369,9 @@ impl Snapshot {
             .bind::<zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1, _, _>(&qh, 1..=4, ())
             .ok();
         snapshot.app_data.capture.bind_initial(&globals, &qh);
+        snapshot.app_data.output_manager = globals
+            .bind::<zwlr_output_manager_v1::ZwlrOutputManagerV1, _, _>(&qh, 1..=4, ())
+            .ok();
         globals.contents().with_list(|entries| {
             for global in entries {
                 if global.interface == "wl_seat" {
@@ -421,6 +464,17 @@ impl Snapshot {
             })
     }
 
+    fn monitor_layout(&self) -> Result<Vec<MonitorInfo>> {
+        if self.app_data.output_manager.is_none() {
+            bail!("COSMIC output management protocol is unavailable");
+        }
+        if self.app_data.output_manager_finished || !self.app_data.output_layout_ready {
+            bail!("COSMIC output management did not finish an atomic layout snapshot");
+        }
+        monitor_layout_from_state(&self.app_data.output_heads, &self.app_data.output_modes)
+            .ok_or_else(|| anyhow!("COSMIC output management returned an incomplete layout"))
+    }
+
     fn activate(&mut self, window_id: u64) -> Result<ActivationOutput> {
         if !self.can_activate_windows() {
             return Ok(ActivationOutput {
@@ -486,6 +540,145 @@ impl Snapshot {
             window_id,
             output_path,
         )
+    }
+}
+
+fn monitor_layout_from_state(
+    heads: &HashMap<u32, OutputHeadState>,
+    modes: &HashMap<u32, OutputModeState>,
+) -> Option<Vec<MonitorInfo>> {
+    let mut layout = heads
+        .values()
+        .filter(|head| head.enabled && !head.finished)
+        .map(|head| {
+            let (x, y) = head.position?;
+            let scale = head.scale?;
+            let mode = modes.get(&head.current_mode?)?;
+            if mode.finished || !scale.is_finite() || scale <= 0.0 {
+                return None;
+            }
+            let (mut width, mut height) = mode.size?;
+            if head.transform? % 2 == 1 {
+                std::mem::swap(&mut width, &mut height);
+            }
+            if width <= 0 || height <= 0 {
+                return None;
+            }
+            let width = (f64::from(width) / scale).round() as i32;
+            let height = (f64::from(height) / scale).round() as i32;
+            (width > 0 && height > 0).then_some(MonitorInfo {
+                x,
+                y,
+                width,
+                height,
+                scale,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    layout.sort_by_key(|monitor| (monitor.x, monitor.y, monitor.width, monitor.height));
+    (!layout.is_empty()).then_some(layout)
+}
+
+impl Dispatch<zwlr_output_manager_v1::ZwlrOutputManagerV1, ()> for AppData {
+    fn event(
+        app_data: &mut Self,
+        _manager: &zwlr_output_manager_v1::ZwlrOutputManagerV1,
+        event: zwlr_output_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_output_manager_v1::Event::Head { head } => {
+                app_data.output_layout_ready = false;
+                app_data
+                    .output_heads
+                    .entry(head.id().protocol_id())
+                    .or_default();
+            }
+            zwlr_output_manager_v1::Event::Done { .. } => {
+                app_data.output_layout_ready = true;
+            }
+            zwlr_output_manager_v1::Event::Finished => {
+                app_data.output_layout_ready = false;
+                app_data.output_manager_finished = true;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    event_created_child!(
+        AppData,
+        zwlr_output_manager_v1::ZwlrOutputManagerV1,
+        [
+            zwlr_output_manager_v1::EVT_HEAD_OPCODE => (zwlr_output_head_v1::ZwlrOutputHeadV1, ()),
+        ]
+    );
+}
+
+impl Dispatch<zwlr_output_head_v1::ZwlrOutputHeadV1, ()> for AppData {
+    fn event(
+        app_data: &mut Self,
+        head: &zwlr_output_head_v1::ZwlrOutputHeadV1,
+        event: zwlr_output_head_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        app_data.output_layout_ready = false;
+        let head_id = head.id().protocol_id();
+        let state = app_data.output_heads.entry(head_id).or_default();
+        match event {
+            zwlr_output_head_v1::Event::Mode { mode } => {
+                app_data
+                    .output_modes
+                    .entry(mode.id().protocol_id())
+                    .or_default();
+            }
+            zwlr_output_head_v1::Event::Enabled { enabled } => state.enabled = enabled != 0,
+            zwlr_output_head_v1::Event::CurrentMode { mode } => {
+                state.current_mode = Some(mode.id().protocol_id());
+            }
+            zwlr_output_head_v1::Event::Position { x, y } => state.position = Some((x, y)),
+            zwlr_output_head_v1::Event::Transform { transform } => {
+                state.transform = Some(transform.into());
+            }
+            zwlr_output_head_v1::Event::Scale { scale } => state.scale = Some(scale),
+            zwlr_output_head_v1::Event::Finished => state.finished = true,
+            _ => {}
+        }
+    }
+
+    event_created_child!(
+        AppData,
+        zwlr_output_head_v1::ZwlrOutputHeadV1,
+        [
+            zwlr_output_head_v1::EVT_MODE_OPCODE => (zwlr_output_mode_v1::ZwlrOutputModeV1, ()),
+        ]
+    );
+}
+
+impl Dispatch<zwlr_output_mode_v1::ZwlrOutputModeV1, ()> for AppData {
+    fn event(
+        app_data: &mut Self,
+        mode: &zwlr_output_mode_v1::ZwlrOutputModeV1,
+        event: zwlr_output_mode_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        app_data.output_layout_ready = false;
+        let state = app_data
+            .output_modes
+            .entry(mode.id().protocol_id())
+            .or_default();
+        match event {
+            zwlr_output_mode_v1::Event::Size { width, height } => {
+                state.size = Some((width, height));
+            }
+            zwlr_output_mode_v1::Event::Finished => state.finished = true,
+            _ => {}
+        }
     }
 }
 
@@ -714,11 +907,9 @@ impl Dispatch<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, ()> for AppDa
                 record.cosmic_state_received = true;
                 record.focused = false;
                 record.hidden = false;
-                for value in state.chunks_exact(4) {
+                for value in state.as_chunks::<4>().0 {
                     if let Ok(parsed) =
-                        zcosmic_toplevel_handle_v1::State::try_from(u32::from_ne_bytes([
-                            value[0], value[1], value[2], value[3],
-                        ]))
+                        zcosmic_toplevel_handle_v1::State::try_from(u32::from_ne_bytes(*value))
                     {
                         if parsed == zcosmic_toplevel_handle_v1::State::Activated {
                             record.focused = true;
@@ -819,6 +1010,111 @@ mod tests {
         .to_string();
 
         assert!(error.contains("invalid window id"));
+    }
+
+    #[test]
+    fn parses_monitor_layout_command() {
+        assert!(matches!(
+            Command::parse(vec!["monitor-layout".to_string()]).unwrap(),
+            Command::MonitorLayout
+        ));
+    }
+
+    #[test]
+    fn monitor_layout_uses_fractional_scale_and_transform() {
+        let heads = HashMap::from([
+            (
+                1,
+                OutputHeadState {
+                    enabled: true,
+                    position: Some((-1080, 0)),
+                    transform: Some(1),
+                    scale: Some(2.0),
+                    current_mode: Some(11),
+                    ..Default::default()
+                },
+            ),
+            (
+                2,
+                OutputHeadState {
+                    enabled: true,
+                    position: Some((0, 0)),
+                    transform: Some(0),
+                    scale: Some(1.25),
+                    current_mode: Some(22),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let modes = HashMap::from([
+            (
+                11,
+                OutputModeState {
+                    size: Some((3840, 2160)),
+                    ..Default::default()
+                },
+            ),
+            (
+                22,
+                OutputModeState {
+                    size: Some((2560, 1440)),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            monitor_layout_from_state(&heads, &modes).unwrap(),
+            vec![
+                MonitorInfo {
+                    x: -1080,
+                    y: 0,
+                    width: 1080,
+                    height: 1920,
+                    scale: 2.0,
+                },
+                MonitorInfo {
+                    x: 0,
+                    y: 0,
+                    width: 2048,
+                    height: 1152,
+                    scale: 1.25,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn monitor_layout_rejects_an_incomplete_enabled_head() {
+        let heads = HashMap::from([
+            (
+                1,
+                OutputHeadState {
+                    enabled: true,
+                    position: Some((0, 0)),
+                    transform: Some(0),
+                    scale: Some(1.0),
+                    current_mode: Some(11),
+                    ..Default::default()
+                },
+            ),
+            (
+                2,
+                OutputHeadState {
+                    enabled: true,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let modes = HashMap::from([(
+            11,
+            OutputModeState {
+                size: Some((1920, 1080)),
+                ..Default::default()
+            },
+        )]);
+
+        assert!(monitor_layout_from_state(&heads, &modes).is_none());
     }
 
     #[test]

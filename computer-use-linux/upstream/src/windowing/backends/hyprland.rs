@@ -1,3 +1,4 @@
+use crate::command_runner;
 use crate::terminal::enrich_terminal_windows;
 use crate::windowing::registry::BackendProbe;
 use crate::windowing::types::{WindowBounds, WindowInfo};
@@ -7,9 +8,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Command as StdCommand;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::process::Command;
 
 pub const HYPRLAND_BACKEND: &str = "hyprland";
 const STABLE_CAPTURE_ID_TTL: Duration = Duration::from_secs(1);
@@ -59,8 +61,10 @@ pub fn probe() -> BackendProbe {
     }
 }
 
-pub fn list_windows() -> Result<Vec<WindowInfo>> {
-    let output = hyprctl_output(&["clients", "-j"]).context("failed to run hyprctl clients -j")?;
+pub async fn list_windows() -> Result<Vec<WindowInfo>> {
+    let output = hyprctl_output_async(&["clients", "-j"])
+        .await
+        .context("failed to run hyprctl clients -j")?;
     if !output.status.success() {
         bail!(
             "hyprctl clients -j failed: {}",
@@ -69,14 +73,22 @@ pub fn list_windows() -> Result<Vec<WindowInfo>> {
     }
 
     let clients_json = String::from_utf8_lossy(&output.stdout);
-    let monitors_output = hyprctl_output(&["monitors", "-j"]).ok();
+    let monitors_output = hyprctl_output_async(&["monitors", "-j"]).await.ok();
     match monitors_output.filter(|output| output.status.success()) {
         Some(monitors) => parse_hyprland_clients_with_monitors(&clients_json, &monitors.stdout),
-        None => parse_hyprland_clients(&clients_json),
+        None => parse_hyprland_clients_without_bounds(&clients_json),
     }
 }
 
 pub(crate) fn native_coordinate_scales(window: &WindowInfo) -> Result<(f64, f64)> {
+    coordinate_scales(window, true)
+}
+
+pub(crate) fn capture_coordinate_scales(window: &WindowInfo) -> Result<(f64, f64)> {
+    coordinate_scales(window, false)
+}
+
+fn coordinate_scales(window: &WindowInfo, require_wayland: bool) -> Result<(f64, f64)> {
     let output = hyprctl_output(&["clients", "-j"])
         .context("failed to re-resolve Hyprland window scale before native input")?;
     if !output.status.success() {
@@ -94,78 +106,171 @@ pub(crate) fn native_coordinate_scales(window: &WindowInfo) -> Result<(f64, f64)
         .iter()
         .find(|client| parse_hyprland_address(&client.address).ok() == Some(window.window_id))
         .context("Hyprland window disappeared before native input")?;
-    if !client.mapped.unwrap_or(true) || client.xwayland.unwrap_or(false) {
+    if !client.mapped.unwrap_or(true) || (require_wayland && client.xwayland.unwrap_or(false)) {
         bail!("Hyprland window is not an eligible mapped Wayland target");
     }
-    native_coordinate_scales_for_size(
-        window
-            .bounds
-            .as_ref()
-            .context("Hyprland window has no bounds")?,
-        client.size.context("Hyprland window has no size")?,
-    )
-    .context("Hyprland window scale changed before native input")
-}
-
-fn native_coordinate_scales_for_size(
-    bounds: &WindowBounds,
-    [logical_width, logical_height]: [u32; 2],
-) -> Option<(f64, f64)> {
-    if logical_width == 0 || logical_height == 0 {
-        return None;
+    let monitors = hyprctl_output(&["monitors", "-j"])?;
+    if !monitors.status.success() {
+        bail!("failed to re-resolve Hyprland monitor layout before capture or input");
     }
-    let x = f64::from(bounds.width) / f64::from(logical_width);
-    let y = f64::from(bounds.height) / f64::from(logical_height);
-    let rounding_tolerance =
-        0.5 / f64::from(logical_width) + 0.5 / f64::from(logical_height) + f64::EPSILON;
-    (x.is_finite()
-        && y.is_finite()
-        && (0.25..=8.0).contains(&x)
-        && (0.25..=8.0).contains(&y)
-        && (x - y).abs() <= rounding_tolerance)
-        .then_some((x, y))
+    let monitors: Vec<HyprlandMonitor> =
+        serde_json::from_slice(&monitors.stdout).context("invalid Hyprland monitor layout")?;
+    let layout = HyprlandCaptureLayout::from_monitors(&monitors)
+        .context("Hyprland has no valid monitor layout")?;
+    let bounds = window
+        .bounds
+        .as_ref()
+        .context("Hyprland window has no bounds")?;
+    layout
+        .coordinate_scales_for_bounds(
+            client.at.context("Hyprland window has no position")?,
+            client.size.context("Hyprland window has no size")?,
+            bounds,
+        )
+        .context("Hyprland window geometry or monitor scale changed before capture or input")
 }
 
 fn parse_hyprland_clients_with_monitors(
     clients_json: &str,
     monitors_json: &[u8],
 ) -> Result<Vec<WindowInfo>> {
-    let monitors: Vec<HyprlandMonitor> = serde_json::from_slice(monitors_json)
-        .context("failed to parse hyprctl monitors -j output")?;
-    let monitors = monitors
-        .into_iter()
-        .map(|monitor| (monitor.id, monitor))
-        .collect::<std::collections::HashMap<_, _>>();
     let mut clients: Vec<HyprlandClient> =
         serde_json::from_str(clients_json).context("failed to parse hyprctl clients -j output")?;
+    let Ok(monitors) = serde_json::from_slice::<Vec<HyprlandMonitor>>(monitors_json) else {
+        clear_hyprland_client_bounds(&mut clients);
+        return windows_from_hyprland_clients(clients);
+    };
+    let Some(layout) = HyprlandCaptureLayout::from_monitors(&monitors) else {
+        clear_hyprland_client_bounds(&mut clients);
+        return windows_from_hyprland_clients(clients);
+    };
+    let monitor_ids = monitors
+        .iter()
+        .map(|monitor| monitor.id)
+        .collect::<std::collections::HashSet<_>>();
     for client in &mut clients {
-        let Some(monitor) = client.monitor.and_then(|id| monitors.get(&id)) else {
+        if !client
+            .monitor
+            .is_some_and(|monitor_id| monitor_ids.contains(&monitor_id))
+        {
+            client.at = None;
+            client.size = None;
+            continue;
+        }
+        let Some((at, size)) = client
+            .at
+            .zip(client.size)
+            .and_then(|(at, size)| layout.map_bounds(at, size))
+        else {
+            client.at = None;
+            client.size = None;
             continue;
         };
-        if let Some(at) = client.at.as_mut() {
-            at[0] = scale_i32(at[0] - monitor.x, monitor.scale);
-            at[1] = scale_i32(at[1] - monitor.y, monitor.scale);
-        }
-        if let Some(size) = client.size.as_mut() {
-            size[0] = scale_u32(size[0], monitor.scale);
-            size[1] = scale_u32(size[1], monitor.scale);
-        }
+        client.at = Some(at);
+        client.size = Some(size);
     }
     windows_from_hyprland_clients(clients)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_hyprland_clients(json: &str) -> Result<Vec<WindowInfo>> {
     let clients: Vec<HyprlandClient> =
         serde_json::from_str(json).context("failed to parse hyprctl clients -j output")?;
     windows_from_hyprland_clients(clients)
 }
 
-fn scale_i32(value: i32, scale: f64) -> i32 {
-    (f64::from(value) * scale).round() as i32
+fn parse_hyprland_clients_without_bounds(json: &str) -> Result<Vec<WindowInfo>> {
+    let mut clients: Vec<HyprlandClient> =
+        serde_json::from_str(json).context("failed to parse hyprctl clients -j output")?;
+    clear_hyprland_client_bounds(&mut clients);
+    windows_from_hyprland_clients(clients)
 }
 
-fn scale_u32(value: u32, scale: f64) -> u32 {
-    (f64::from(value) * scale).round() as u32
+fn clear_hyprland_client_bounds(clients: &mut [HyprlandClient]) {
+    for client in clients {
+        client.at = None;
+        client.size = None;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HyprlandCaptureLayout {
+    origin_x: i32,
+    origin_y: i32,
+    scale: f64,
+}
+
+impl HyprlandCaptureLayout {
+    fn from_monitors(monitors: &[HyprlandMonitor]) -> Option<Self> {
+        let first = monitors.first()?;
+        if monitors
+            .iter()
+            .any(|monitor| !monitor.scale.is_finite() || monitor.scale <= 0.0)
+        {
+            return None;
+        }
+        Some(Self {
+            origin_x: monitors
+                .iter()
+                .map(|monitor| monitor.x)
+                .min()
+                .unwrap_or(first.x),
+            origin_y: monitors
+                .iter()
+                .map(|monitor| monitor.y)
+                .min()
+                .unwrap_or(first.y),
+            scale: monitors
+                .iter()
+                .map(|monitor| monitor.scale)
+                .fold(first.scale, f64::max),
+        })
+    }
+
+    fn coordinate_scales_for_bounds(
+        &self,
+        at: [i32; 2],
+        size: [u32; 2],
+        bounds: &WindowBounds,
+    ) -> Option<(f64, f64)> {
+        let (at, size) = self.map_bounds(at, size)?;
+        ((bounds.x, bounds.y, bounds.width, bounds.height)
+            == (Some(at[0]), Some(at[1]), size[0], size[1]))
+            .then_some((self.scale, self.scale))
+    }
+
+    fn map_bounds(&self, at: [i32; 2], size: [u32; 2]) -> Option<([i32; 2], [u32; 2])> {
+        if size[0] == 0 || size[1] == 0 {
+            return None;
+        }
+        let left = ((i64::from(at[0]) - i64::from(self.origin_x)) as f64 * self.scale).floor();
+        let top = ((i64::from(at[1]) - i64::from(self.origin_y)) as f64 * self.scale).floor();
+        let right = ((i64::from(at[0]) + i64::from(size[0]) - i64::from(self.origin_x)) as f64
+            * self.scale)
+            .ceil();
+        let bottom = ((i64::from(at[1]) + i64::from(size[1]) - i64::from(self.origin_y)) as f64
+            * self.scale)
+            .ceil();
+        if !left.is_finite()
+            || !top.is_finite()
+            || !right.is_finite()
+            || !bottom.is_finite()
+            || left < f64::from(i32::MIN)
+            || left > f64::from(i32::MAX)
+            || top < f64::from(i32::MIN)
+            || top > f64::from(i32::MAX)
+            || right <= left
+            || bottom <= top
+            || right - left > f64::from(u32::MAX)
+            || bottom - top > f64::from(u32::MAX)
+        {
+            return None;
+        }
+        Some((
+            [left as i32, top as i32],
+            [(right - left) as u32, (bottom - top) as u32],
+        ))
+    }
 }
 
 fn windows_from_hyprland_clients(clients: Vec<HyprlandClient>) -> Result<Vec<WindowInfo>> {
@@ -180,24 +285,26 @@ fn windows_from_hyprland_clients(clients: Vec<HyprlandClient>) -> Result<Vec<Win
     Ok(windows)
 }
 
-pub fn activate_window(window_id: u64) -> Result<()> {
+pub async fn activate_window(window_id: u64) -> Result<()> {
     let address = format!("address:0x{window_id:x}");
     let lua_dispatch = lua_focus_dispatch(&address);
-    let lua_output = hyprctl_output(&["dispatch", &lua_dispatch])
+    let lua_output = hyprctl_output_async(&["dispatch", &lua_dispatch])
+        .await
         .with_context(|| format!("failed to run Hyprland Lua focus dispatcher for {address}"))?;
-    if lua_output.status.success() {
+    if dispatch_succeeded(&lua_output) {
         return Ok(());
     }
 
-    let legacy_output = hyprctl_output(&["dispatch", "focuswindow", &address])
+    let legacy_output = hyprctl_output_async(&["dispatch", "focuswindow", &address])
+        .await
         .with_context(|| format!("failed to run hyprctl dispatch focuswindow {address}"))?;
-    if legacy_output.status.success() {
+    if dispatch_succeeded(&legacy_output) {
         Ok(())
     } else {
         bail!(
             "Hyprland window focus failed for {address}; Lua dispatcher: {}; legacy dispatcher: {}",
-            String::from_utf8_lossy(&lua_output.stderr).trim(),
-            String::from_utf8_lossy(&legacy_output.stderr).trim()
+            command_detail(&lua_output),
+            command_detail(&legacy_output)
         );
     }
 }
@@ -329,11 +436,48 @@ fn stable_capture_id(window_id: u64) -> Option<u64> {
         .map(|(stable_id, _)| *stable_id)
 }
 
+fn dispatch_succeeded(output: &std::process::Output) -> bool {
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "ok"
+}
+
+fn command_detail(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    if detail.is_empty() {
+        format!("exit status {}", output.status)
+    } else {
+        detail.to_string()
+    }
+}
+
 fn lua_focus_dispatch(address: &str) -> String {
     format!("hl.dsp.focus({{ window = \"{address}\" }})")
 }
 
-fn hyprctl_output(args: &[&str]) -> std::io::Result<std::process::Output> {
+fn hyprctl_output(args: &[&str]) -> Result<std::process::Output> {
+    let mut command = StdCommand::new("hyprctl");
+    let has_signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    if !has_signature {
+        if let Some(signature) = infer_hyprland_instance_signature() {
+            command.args(["-i", &signature]);
+        }
+    }
+    command.args(args);
+    command_runner::output_blocking_with_timeout(
+        &mut command,
+        "run hyprctl",
+        Duration::from_secs(2),
+    )
+}
+
+async fn hyprctl_output_async(args: &[&str]) -> Result<std::process::Output> {
     let mut command = Command::new("hyprctl");
     let has_signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
         .ok()
@@ -343,7 +487,8 @@ fn hyprctl_output(args: &[&str]) -> std::io::Result<std::process::Output> {
             command.args(["-i", &signature]);
         }
     }
-    command.args(args).output()
+    command.args(args);
+    command_runner::output(command, "run hyprctl").await
 }
 
 fn infer_hyprland_instance_signature() -> Option<String> {
@@ -506,6 +651,7 @@ fn parse_hyprland_address(address: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
 
     #[test]
@@ -526,11 +672,90 @@ mod tests {
         let windows = parse_hyprland_clients_with_monitors(clients, monitors).unwrap();
 
         let bounds = windows[0].bounds.as_ref().unwrap();
-        assert_eq!((bounds.x, bounds.y), (Some(1741), Some(97)));
-        assert_eq!((bounds.width, bounds.height), (1676, 2023));
-        let scales = native_coordinate_scales_for_size(bounds, [931, 1124]).unwrap();
-        assert!((scales.0 - 1.8).abs() < 0.001);
-        assert!((scales.1 - 1.8).abs() < 0.001);
+        assert_eq!((bounds.x, bounds.y), (Some(1934), Some(2988)));
+        assert_eq!((bounds.width, bounds.height), (1862, 2248));
+    }
+
+    #[test]
+    fn global_union_accounts_for_negative_monitor_origins() {
+        let clients = r#"[{
+            "address":"0x1234",
+            "at":[-1800,100],
+            "size":[600,400],
+            "monitor":0,
+            "class":"foot",
+            "title":"Shell"
+        }]"#;
+        let monitors = br#"[
+            {"id":0,"x":-1920,"y":0,"scale":1.0},
+            {"id":1,"x":0,"y":0,"scale":2.0}
+        ]"#;
+        let windows = parse_hyprland_clients_with_monitors(clients, monitors).unwrap();
+
+        let bounds = windows[0].bounds.as_ref().unwrap();
+        assert_eq!((bounds.x, bounds.y), (Some(240), Some(200)));
+        assert_eq!((bounds.width, bounds.height), (1200, 800));
+    }
+
+    #[test]
+    fn fractional_scale_rounds_crop_edges_outward() {
+        let clients = r#"[{
+            "address":"0x1234",
+            "at":[1,1],
+            "size":[1,1],
+            "monitor":0,
+            "class":"foot",
+            "title":"Shell"
+        }]"#;
+        let monitors = br#"[{"id":0,"x":0,"y":0,"scale":1.25}]"#;
+        let windows = parse_hyprland_clients_with_monitors(clients, monitors).unwrap();
+
+        let bounds = windows[0].bounds.as_ref().unwrap();
+        assert_eq!((bounds.x, bounds.y), (Some(1), Some(1)));
+        assert_eq!((bounds.width, bounds.height), (2, 2));
+    }
+
+    #[test]
+    fn bounds_are_omitted_without_valid_monitor_metadata() {
+        let clients = r#"[{
+            "address":"0x1234",
+            "at":[100,100],
+            "size":[600,400],
+            "monitor":7,
+            "class":"foot",
+            "title":"Shell"
+        }]"#;
+
+        for monitors in [
+            br#"[]"#.as_slice(),
+            br#"[{"id":7,"x":0,"y":0,"scale":0.0}]"#.as_slice(),
+            b"not json".as_slice(),
+        ] {
+            let windows = parse_hyprland_clients_with_monitors(clients, monitors).unwrap();
+            assert!(windows[0].bounds.is_none());
+        }
+        let windows = parse_hyprland_clients_without_bounds(clients).unwrap();
+        assert!(windows[0].bounds.is_none());
+    }
+
+    #[test]
+    fn native_scale_uses_layout_scale_instead_of_rounded_pixel_ratio() {
+        let layout = HyprlandCaptureLayout {
+            origin_x: 0,
+            origin_y: 0,
+            scale: 1.8,
+        };
+        let (at, size) = layout.map_bounds([10, 20], [931, 1124]).unwrap();
+        let bounds = WindowBounds {
+            x: Some(at[0]),
+            y: Some(at[1]),
+            width: size[0],
+            height: size[1],
+        };
+        assert_eq!(
+            layout.coordinate_scales_for_bounds([10, 20], [931, 1124], &bounds),
+            Some((1.8, 1.8))
+        );
     }
 
     #[test]
@@ -541,9 +766,13 @@ mod tests {
             width: 1500,
             height: 900,
         };
-
+        let layout = HyprlandCaptureLayout {
+            origin_x: 0,
+            origin_y: 0,
+            scale: 1.5,
+        };
         assert_eq!(
-            native_coordinate_scales_for_size(&bounds, [1000, 500]),
+            layout.coordinate_scales_for_bounds([0, 0], [1000, 500], &bounds),
             None
         );
     }
@@ -597,6 +826,29 @@ mod tests {
         let error = exact_capture_id_from_clients(&window, &live_clients).unwrap_err();
 
         assert!(error.to_string().contains("has no active output"));
+    }
+
+    #[test]
+    fn dispatch_rejects_exit_zero_error_output() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"Invalid dispatcher\n".to_vec(),
+            stderr: Vec::new(),
+        };
+
+        assert!(!dispatch_succeeded(&output));
+        assert_eq!(command_detail(&output), "Invalid dispatcher");
+    }
+
+    #[test]
+    fn dispatch_accepts_ok_output() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"ok\n".to_vec(),
+            stderr: Vec::new(),
+        };
+
+        assert!(dispatch_succeeded(&output));
     }
 
     #[test]

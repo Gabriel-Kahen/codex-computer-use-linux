@@ -1,3 +1,4 @@
+use crate::command_runner;
 use crate::terminal::enrich_terminal_windows;
 use crate::windowing::backends::i3_ipc::I3Ipc;
 use crate::windowing::registry::BackendProbe;
@@ -13,6 +14,7 @@ use std::{
     sync::{Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant},
 };
+use tokio::process::Command as TokioCommand;
 
 pub const I3_BACKEND: &str = "i3";
 const PID_MISS_TTL: Duration = Duration::from_secs(2);
@@ -32,7 +34,13 @@ pub fn probe() -> BackendProbe {
 }
 
 fn probe_with_i3_msg() -> BackendProbe {
-    match i3_msg_command().args(["-t", "get_tree"]).output() {
+    let mut command = i3_msg_command();
+    command.args(["-t", "get_tree"]);
+    match command_runner::output_blocking_with_timeout(
+        &mut command,
+        "probe i3",
+        Duration::from_secs(2),
+    ) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let ok = matches!(
@@ -75,18 +83,13 @@ fn probe_with_i3_msg() -> BackendProbe {
     }
 }
 
-pub fn list_windows() -> Result<Vec<WindowInfo>> {
+pub async fn list_windows() -> Result<Vec<WindowInfo>> {
     if let Ok(windows) = with_persistent_session(PersistentI3::list_windows) {
         return Ok(windows);
     }
-    list_windows_with_i3_msg()
-}
-
-fn list_windows_with_i3_msg() -> Result<Vec<WindowInfo>> {
-    let output = i3_msg_command()
-        .args(["-t", "get_tree"])
-        .output()
-        .context("failed to run i3-msg -t get_tree")?;
+    let mut command = i3_msg_command_async();
+    command.args(["-t", "get_tree"]);
+    let output = command_runner::output(command, "run i3-msg -t get_tree").await?;
     if !output.status.success() {
         bail!(
             "i3-msg -t get_tree failed: {}",
@@ -95,7 +98,7 @@ fn list_windows_with_i3_msg() -> Result<Vec<WindowInfo>> {
     }
 
     let mut windows = parse_i3_tree(&String::from_utf8_lossy(&output.stdout))?;
-    hydrate_i3_window_pids(&mut windows);
+    hydrate_i3_window_pids(&mut windows).await;
     enrich_terminal_windows(&mut windows);
     Ok(windows)
 }
@@ -109,19 +112,14 @@ pub(crate) fn parse_i3_tree(json: &str) -> Result<Vec<WindowInfo>> {
     Ok(windows)
 }
 
-pub fn activate_window(window_id: u64) -> Result<()> {
+pub async fn activate_window(window_id: u64) -> Result<()> {
     if with_persistent_session(|session| session.activate_window(window_id)).is_ok() {
         return Ok(());
     }
-    activate_window_with_i3_msg(window_id)
-}
-
-fn activate_window_with_i3_msg(window_id: u64) -> Result<()> {
     let selector = format!(r#"[id="0x{window_id:x}"] focus"#);
-    let output = i3_msg_command()
-        .arg(&selector)
-        .output()
-        .with_context(|| format!("failed to run i3-msg {selector}"))?;
+    let mut command = i3_msg_command_async();
+    command.arg(&selector);
+    let output = command_runner::output(command, &format!("run i3-msg {selector}")).await?;
     if !output.status.success() {
         bail!(
             "i3-msg {selector} failed: {}",
@@ -252,7 +250,7 @@ impl PersistentI3 {
                 window.pid = cached.pid;
                 continue;
             }
-            window.pid = i3_window_pid(window.window_id);
+            window.pid = i3_window_pid_blocking(window.window_id);
             self.pid_cache.insert(
                 window.window_id,
                 CachedPid {
@@ -314,18 +312,35 @@ fn collect_i3_windows(
     }
 }
 
-fn hydrate_i3_window_pids(windows: &mut [WindowInfo]) {
+async fn hydrate_i3_window_pids(windows: &mut [WindowInfo]) {
     for window in windows {
         if window.pid.is_none() {
-            window.pid = i3_window_pid(window.window_id);
+            window.pid = i3_window_pid(window.window_id).await;
         }
     }
 }
 
-fn i3_window_pid(window_id: u64) -> Option<u32> {
-    let output = Command::new("xprop")
-        .args(["-id", &window_id.to_string(), "_NET_WM_PID"])
-        .output()
+fn i3_window_pid_blocking(window_id: u64) -> Option<u32> {
+    let mut command = Command::new("xprop");
+    command.args(["-id", &window_id.to_string(), "_NET_WM_PID"]);
+    let output = command_runner::output_blocking_with_timeout(
+        &mut command,
+        "query X11 window pid",
+        Duration::from_secs(2),
+    )
+    .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_xprop_pid(&String::from_utf8_lossy(&output.stdout)))
+        .flatten()
+}
+
+async fn i3_window_pid(window_id: u64) -> Option<u32> {
+    let mut command = TokioCommand::new("xprop");
+    command.args(["-id", &window_id.to_string(), "_NET_WM_PID"]);
+    let output = command_runner::output(command, "query X11 window pid")
+        .await
         .ok()?;
     if !output.status.success() {
         return None;
@@ -339,6 +354,14 @@ pub(crate) fn parse_xprop_pid(output: &str) -> Option<u32> {
 
 fn i3_msg_command() -> Command {
     let mut command = Command::new("i3-msg");
+    if let Some(socket_path) = i3_socket_path() {
+        command.arg("-s").arg(socket_path);
+    }
+    command
+}
+
+fn i3_msg_command_async() -> TokioCommand {
+    let mut command = TokioCommand::new("i3-msg");
     if let Some(socket_path) = i3_socket_path() {
         command.arg("-s").arg(socket_path);
     }
