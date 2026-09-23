@@ -1,0 +1,50 @@
+name: hyprland-native-e2e
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/hyprland-native-e2e.yml"
+      - "contrib/hyprland-background-computer-use/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/hyprland-native-e2e.yml"
+      - "contrib/hyprland-background-computer-use/**"
+  schedule:
+    - cron: "23 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hyprland-native-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-e2e:
+    name: Real Hyprland capture and input
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Configure Hyprland binary cache
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: hyprland
+          skipPush: true
+
+      - name: Run compositor-in-the-loop smoke test
+        run: |
+          nix build \
+            --file contrib/hyprland-background-computer-use/tests/native-e2e.nix \
+            --print-build-logs \
+            --extra-substituters https://hyprland.cachix.org

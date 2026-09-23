@@ -1,0 +1,38 @@
+{
+  "name": "same-session-computer-use",
+  "version": "0.3.0",
+  "description": "Add resilient background capture and window-targeted input for Codex on Hyprland.",
+  "author": {
+    "name": "Gabe",
+    "url": "https://github.com/Gabriel-Kahen"
+  },
+  "homepage": "https://github.com/Gabriel-Kahen/codex-computer-use-linux/tree/main/contrib/hyprland-background-computer-use",
+  "repository": "https://github.com/Gabriel-Kahen/codex-computer-use-linux",
+  "license": "Apache-2.0",
+  "keywords": [
+    "computer-use",
+    "hyprland",
+    "linux",
+    "wayland",
+    "desktop-control"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Hyprland Codex Background Computer Use",
+    "shortDescription": "Parallel background control for Hyprland apps.",
+    "longDescription": "Extends the bundled Computer Use plugin on Hyprland with task-owned window claims, exact background capture, monitor-off continuity, targeted shortcuts, and window-local click, scroll, and drag controls. Independent agents can operate different windows concurrently while same-window and broker global-seat operations remain coordinated.",
+    "developerName": "Gabe",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write",
+      "Local Desktop"
+    ],
+    "defaultPrompt": [
+      "Use my existing logged-in app to complete this task in the background.",
+      "Show me an exact screenshot of one of my real application windows.",
+      "Operate this app without moving my pointer or changing my workspace."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

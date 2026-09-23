@@ -1,0 +1,640 @@
+use crate::windowing::registry::{self, WindowListPolicy, WINDOW_PERMISSION_HINT};
+use crate::windowing::types::{WindowFocusResult, WindowInfo, WindowTarget};
+use anyhow::{bail, Result};
+use tokio::time::{sleep, Duration};
+
+const FOCUS_VERIFY_ATTEMPTS: usize = 21;
+const FOCUS_VERIFY_DELAY: Duration = Duration::from_millis(50);
+
+/// Supplies the window operations used while resolving and focusing a target.
+///
+/// The production implementation delegates to the backend registry, while tests can provide
+/// deterministic window-list responses and observe activation requests.
+trait WindowRegistry {
+    fn list_windows(
+        &self,
+        policy: WindowListPolicy,
+    ) -> impl std::future::Future<Output = Result<Vec<WindowInfo>>> + Send;
+
+    fn activate_window(
+        &self,
+        window: &WindowInfo,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    fn focused_window_override(&self) -> Option<WindowInfo>;
+}
+
+struct BackendRegistry;
+
+impl WindowRegistry for BackendRegistry {
+    async fn list_windows(&self, policy: WindowListPolicy) -> Result<Vec<WindowInfo>> {
+        registry::list_windows_with_policy(policy).await
+    }
+
+    async fn activate_window(&self, window: &WindowInfo) -> Result<()> {
+        registry::activate_window(window).await
+    }
+
+    fn focused_window_override(&self) -> Option<WindowInfo> {
+        registry::focused_window_override()
+    }
+}
+
+pub async fn list_windows() -> Result<Vec<WindowInfo>> {
+    registry::list_windows().await
+}
+
+pub async fn focused_window() -> Result<Option<WindowInfo>> {
+    current_focused_window(&BackendRegistry).await
+}
+
+pub async fn focus_window_target(target: &WindowTarget) -> Result<WindowFocusResult> {
+    focus_window_target_with_registry(target, &BackendRegistry).await
+}
+
+async fn focus_window_target_with_registry(
+    target: &WindowTarget,
+    window_registry: &impl WindowRegistry,
+) -> Result<WindowFocusResult> {
+    if !target.has_target() {
+        bail!("Pass window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd to target a window.");
+    }
+
+    let windows = window_registry
+        .list_windows(WindowListPolicy::Cached)
+        .await?;
+    let requested_window = resolve_window_target(&windows, target)?.clone();
+    ensure_backend_can_focus_target(target, &requested_window)?;
+
+    let already_focused = if listed_target_appears_focused(&windows, &requested_window) {
+        current_focused_window(window_registry)
+            .await
+            .ok()
+            .flatten()
+            .filter(|focused_window| requested_window.window_id == focused_window.window_id)
+    } else {
+        None
+    };
+    if let Some(focused_window) = already_focused {
+        return Ok(window_focus_result(
+            requested_window,
+            Some(focused_window),
+            "Computer Use verified through a fresh window query that the requested target was already focused, so it skipped window activation.",
+        ));
+    }
+
+    window_registry.activate_window(&requested_window).await?;
+
+    let focused_window = wait_for_focused_window(window_registry, &requested_window).await;
+    Ok(window_focus_result(
+        requested_window,
+        focused_window,
+        "Computer Use activated the requested window through the available window backend, then verified focus through a fresh window query.",
+    ))
+}
+
+pub(crate) fn ensure_backend_can_focus_target(
+    target: &WindowTarget,
+    window: &WindowInfo,
+) -> Result<()> {
+    if target.requires_exact_focus() && !registry::backend_can_exact_focus(&window.backend) {
+        bail!(
+            "Exact window targeting requires an exact-focus window backend; {} can list the matched window but cannot activate a specific window safely.",
+            window.backend
+        );
+    }
+    Ok(())
+}
+
+async fn current_focused_window(
+    window_registry: &impl WindowRegistry,
+) -> Result<Option<WindowInfo>> {
+    if let Some(window) = window_registry.focused_window_override() {
+        return Ok(Some(window));
+    }
+
+    Ok(window_registry
+        .list_windows(WindowListPolicy::Fresh)
+        .await?
+        .into_iter()
+        .find(|window| window.focused))
+}
+
+async fn wait_for_focused_window(
+    window_registry: &impl WindowRegistry,
+    requested_window: &WindowInfo,
+) -> Option<WindowInfo> {
+    let mut last_focused_window = None;
+    for attempt in 0..FOCUS_VERIFY_ATTEMPTS {
+        if let Ok(focused_window) = current_focused_window(window_registry).await {
+            if focused_window
+                .as_ref()
+                .is_some_and(|window| window.window_id == requested_window.window_id)
+            {
+                return focused_window;
+            }
+            if focused_window.is_some() {
+                last_focused_window = focused_window;
+            }
+        }
+
+        if attempt + 1 < FOCUS_VERIFY_ATTEMPTS {
+            sleep(FOCUS_VERIFY_DELAY).await;
+        }
+    }
+    last_focused_window
+}
+
+fn listed_target_appears_focused(windows: &[WindowInfo], requested_window: &WindowInfo) -> bool {
+    windows
+        .iter()
+        .any(|window| window.focused && window.window_id == requested_window.window_id)
+}
+
+fn window_focus_result(
+    requested_window: WindowInfo,
+    focused_window: Option<WindowInfo>,
+    note: &str,
+) -> WindowFocusResult {
+    let exact_window_focused = focused_window
+        .as_ref()
+        .is_some_and(|window| window.window_id == requested_window.window_id);
+    let app_focused = focused_window
+        .as_ref()
+        .is_some_and(|window| same_optional_string(&window.app_id, &requested_window.app_id));
+
+    WindowFocusResult {
+        backend: requested_window.backend.clone(),
+        requested_window,
+        focused_window,
+        exact_window_focused,
+        app_focused,
+        note: note.to_string(),
+    }
+}
+
+pub fn resolve_window_target<'a>(
+    windows: &'a [WindowInfo],
+    target: &WindowTarget,
+) -> Result<&'a WindowInfo> {
+    if let Some(window_id) = target.window_id {
+        return resolve_window_id_target(windows, target, window_id);
+    }
+
+    if target.has_terminal_target() {
+        let matches = windows
+            .iter()
+            .filter(|window| window_matches_terminal_target(window, target))
+            .filter(|window| target.pid.is_none_or(|pid| window.pid == Some(pid)))
+            .filter(|window| optional_exact_match(&window.app_id, target.app_id.as_deref()))
+            .filter(|window| optional_exact_match(&window.wm_class, target.wm_class.as_deref()))
+            .filter(|window| optional_title_match(&window.title, target.title.as_deref()))
+            .collect::<Vec<_>>();
+        return unique_window_match(matches, "terminal target");
+    }
+
+    if let Some(pid) = target.pid {
+        let matches = windows
+            .iter()
+            .filter(|window| window.pid == Some(pid))
+            .filter(|window| optional_exact_match(&window.app_id, target.app_id.as_deref()))
+            .filter(|window| optional_exact_match(&window.wm_class, target.wm_class.as_deref()))
+            .filter(|window| optional_title_match(&window.title, target.title.as_deref()))
+            .collect::<Vec<_>>();
+        return unique_window_match(matches, &format!("pid {pid}"));
+    }
+
+    if let Some(app_id) = normalized_target(target.app_id.as_deref()) {
+        let matches = windows
+            .iter()
+            .filter(|window| {
+                window
+                    .app_id
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&app_id))
+            })
+            .filter(|window| optional_exact_match(&window.wm_class, target.wm_class.as_deref()))
+            .filter(|window| optional_title_match(&window.title, target.title.as_deref()))
+            .collect::<Vec<_>>();
+        return unique_window_match(matches, &format!("app_id {app_id}"));
+    }
+
+    if let Some(wm_class) = normalized_target(target.wm_class.as_deref()) {
+        let matches = windows
+            .iter()
+            .filter(|window| {
+                window
+                    .wm_class
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&wm_class))
+            })
+            .filter(|window| optional_title_match(&window.title, target.title.as_deref()))
+            .collect::<Vec<_>>();
+        return unique_window_match(matches, &format!("wm_class {wm_class}"));
+    }
+
+    if let Some(title) = normalized_target(target.title.as_deref()) {
+        let title_lower = title.to_ascii_lowercase();
+        let matches = windows
+            .iter()
+            .filter(|window| {
+                window
+                    .title
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&title_lower))
+            })
+            .collect::<Vec<_>>();
+        return unique_window_match(matches, &format!("window title containing {title}"));
+    }
+
+    bail!("Pass window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd to target a window.");
+}
+
+fn resolve_window_id_target<'a>(
+    windows: &'a [WindowInfo],
+    target: &WindowTarget,
+    window_id: u64,
+) -> Result<&'a WindowInfo> {
+    if let Some(window) = windows.iter().find(|window| window.window_id == window_id) {
+        return Ok(window);
+    }
+
+    let matches = windows
+        .iter()
+        .filter(|window| window_id_matches_json_number(window.window_id, window_id))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [window] => Ok(*window),
+        [] => Err(anyhow::anyhow!("No window matched window_id {window_id}.")),
+        windows => resolve_rounded_window_id_matches(windows, target, window_id),
+    }
+}
+
+fn resolve_rounded_window_id_matches<'a>(
+    windows: &[&'a WindowInfo],
+    target: &WindowTarget,
+    window_id: u64,
+) -> Result<&'a WindowInfo> {
+    let ids = windows
+        .iter()
+        .map(|window| window.window_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if has_window_id_disambiguator(target) {
+        let matches = windows
+            .iter()
+            .copied()
+            .filter(|window| window_id_disambiguators_match(window, target))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [window] => return Ok(*window),
+            [] => bail!(
+                "window_id {window_id} matched multiple windows after JSON number rounding ({ids}), but none matched the provided title, pid, app_id, or wm_class disambiguators."
+            ),
+            _ => {}
+        }
+    }
+
+    bail!(
+        "window_id {window_id} matched multiple windows after JSON number rounding ({ids}); add title, pid, app_id, or wm_class to disambiguate."
+    );
+}
+
+fn has_window_id_disambiguator(target: &WindowTarget) -> bool {
+    target.pid.is_some()
+        || normalized_target(target.app_id.as_deref()).is_some()
+        || normalized_target(target.wm_class.as_deref()).is_some()
+        || normalized_target(target.title.as_deref()).is_some()
+}
+
+fn window_id_disambiguators_match(window: &WindowInfo, target: &WindowTarget) -> bool {
+    target.pid.is_none_or(|pid| window.pid == Some(pid))
+        && optional_exact_match(&window.app_id, target.app_id.as_deref())
+        && optional_exact_match(&window.wm_class, target.wm_class.as_deref())
+        && optional_title_match(&window.title, target.title.as_deref())
+}
+
+fn window_id_matches_json_number(actual: u64, requested: u64) -> bool {
+    const JS_SAFE_INTEGER_MAX: u64 = (1_u64 << 53) - 1;
+    (actual > JS_SAFE_INTEGER_MAX || requested > JS_SAFE_INTEGER_MAX)
+        && (actual as f64) == (requested as f64)
+}
+
+fn unique_window_match<'a>(
+    matches: Vec<&'a WindowInfo>,
+    description: &str,
+) -> Result<&'a WindowInfo> {
+    match matches.as_slice() {
+        [window] => Ok(*window),
+        [] => bail!("No window matched {description}."),
+        windows => {
+            let ids = windows
+                .iter()
+                .map(|window| window.window_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "{description} matched multiple windows ({ids}); add window_id, tty, title, or terminal_command to disambiguate."
+            );
+        }
+    }
+}
+
+fn window_matches_terminal_target(window: &WindowInfo, target: &WindowTarget) -> bool {
+    let Some(terminal) = &window.terminal else {
+        return false;
+    };
+
+    if let Some(tty) = normalized_target(target.tty.as_deref()) {
+        if !tty_matches(&terminal.tty, &tty) {
+            return false;
+        }
+    }
+
+    if let Some(pid) = target.terminal_pid {
+        let active_pid = terminal.active_process.as_ref().map(|process| process.pid);
+        if active_pid != Some(pid) && terminal.root_process.pid != pid {
+            return false;
+        }
+    }
+
+    if let Some(command) = normalized_target(target.terminal_command.as_deref()) {
+        let command = command.to_ascii_lowercase();
+        let active_matches = terminal
+            .active_process
+            .as_ref()
+            .is_some_and(|process| terminal_process_matches_command(process, &command));
+        if !active_matches && !terminal_process_matches_command(&terminal.root_process, &command) {
+            return false;
+        }
+    }
+
+    if let Some(cwd) = normalized_target(target.terminal_cwd.as_deref()) {
+        let active_matches = terminal
+            .active_process
+            .as_ref()
+            .is_some_and(|process| terminal_process_matches_cwd(process, &cwd));
+        if !active_matches && !terminal_process_matches_cwd(&terminal.root_process, &cwd) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn terminal_process_matches_command(
+    process: &crate::terminal::TerminalProcess,
+    command_lower: &str,
+) -> bool {
+    process
+        .command_name
+        .to_ascii_lowercase()
+        .contains(command_lower)
+        || process
+            .command_line
+            .to_ascii_lowercase()
+            .contains(command_lower)
+}
+
+fn terminal_process_matches_cwd(process: &crate::terminal::TerminalProcess, cwd: &str) -> bool {
+    let requested = cwd.trim_end_matches('/');
+    process.cwd.as_deref().is_some_and(|value| {
+        let actual = value.trim_end_matches('/');
+        actual == requested
+            || (!requested.starts_with('/')
+                && actual
+                    .strip_suffix(requested)
+                    .is_some_and(|prefix| prefix.ends_with('/')))
+    })
+}
+
+fn tty_matches(actual: &str, requested: &str) -> bool {
+    actual == requested
+        || actual
+            .strip_prefix("/dev/")
+            .is_some_and(|value| value == requested)
+        || actual
+            .strip_prefix("/dev/pts/")
+            .is_some_and(|value| value == requested)
+}
+
+fn optional_exact_match(actual: &Option<String>, requested: Option<&str>) -> bool {
+    normalized_target(requested).is_none_or(|requested| {
+        actual
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(&requested))
+    })
+}
+
+fn optional_title_match(actual: &Option<String>, requested: Option<&str>) -> bool {
+    normalized_target(requested).is_none_or(|requested| {
+        let requested = requested.to_ascii_lowercase();
+        actual
+            .as_deref()
+            .is_some_and(|value| value.to_ascii_lowercase().contains(&requested))
+    })
+}
+
+pub fn window_permission_hint(error: &str) -> Option<String> {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("accessdenied")
+        || lower.contains("access denied")
+        || lower.contains("not allowed")
+        || lower.contains("operation not permitted")
+        || lower.contains("failed to connect to session bus")
+    {
+        Some(WINDOW_PERMISSION_HINT.to_string())
+    } else {
+        None
+    }
+}
+
+fn normalized_target(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn same_optional_string(left: &Option<String>, right: &Option<String>) -> bool {
+    match (left.as_deref(), right.as_deref()) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    type FakeWindowList = std::result::Result<Vec<WindowInfo>, &'static str>;
+
+    struct FakeWindowRegistry {
+        window_lists: Mutex<VecDeque<FakeWindowList>>,
+        list_policies: Mutex<Vec<WindowListPolicy>>,
+        activated_window_ids: Mutex<Vec<u64>>,
+    }
+
+    impl FakeWindowRegistry {
+        fn new(window_lists: Vec<FakeWindowList>) -> Self {
+            Self {
+                window_lists: Mutex::new(window_lists.into()),
+                list_policies: Mutex::new(Vec::new()),
+                activated_window_ids: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl WindowRegistry for FakeWindowRegistry {
+        async fn list_windows(&self, policy: WindowListPolicy) -> Result<Vec<WindowInfo>> {
+            self.list_policies.lock().unwrap().push(policy);
+            self.window_lists
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fake registry should have another window-list response")
+                .map_err(anyhow::Error::msg)
+        }
+
+        async fn activate_window(&self, window: &WindowInfo) -> Result<()> {
+            self.activated_window_ids
+                .lock()
+                .unwrap()
+                .push(window.window_id);
+            Ok(())
+        }
+
+        fn focused_window_override(&self) -> Option<WindowInfo> {
+            None
+        }
+    }
+
+    fn window(window_id: u64, app_id: Option<&str>) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            title: None,
+            app_id: app_id.map(ToOwned::to_owned),
+            wm_class: None,
+            pid: None,
+            bounds: None,
+            workspace: None,
+            focused: false,
+            hidden: false,
+            client_type: None,
+            backend: registry::X11_BACKEND.to_string(),
+            terminal: None,
+        }
+    }
+
+    fn focused_test_window(window_id: u64) -> WindowInfo {
+        WindowInfo {
+            focused: true,
+            ..window(window_id, Some("org.example.App"))
+        }
+    }
+
+    fn test_target() -> WindowTarget {
+        WindowTarget {
+            window_id: Some(10),
+            ..WindowTarget::default()
+        }
+    }
+
+    #[test]
+    fn focus_verification_allows_workspace_transition_latency() {
+        let verification_budget = FOCUS_VERIFY_DELAY * (FOCUS_VERIFY_ATTEMPTS - 1) as u32;
+        assert!(verification_budget >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn list_gate_requires_the_resolved_window_to_be_marked_focused() {
+        let requested = window(10, Some("org.example.App"));
+        let mut requested_in_list = requested.clone();
+
+        assert!(!listed_target_appears_focused(
+            &[requested_in_list.clone()],
+            &requested
+        ));
+
+        requested_in_list.focused = true;
+        assert!(listed_target_appears_focused(
+            &[requested_in_list],
+            &requested
+        ));
+
+        let mut same_app = window(11, Some("org.example.App"));
+        same_app.focused = true;
+        assert!(!listed_target_appears_focused(&[same_app], &requested));
+    }
+
+    #[tokio::test]
+    async fn exact_fresh_focus_skips_activation() {
+        let requested = focused_test_window(10);
+        let registry = FakeWindowRegistry::new(vec![
+            Ok(vec![requested.clone()]),
+            Ok(vec![requested.clone()]),
+        ]);
+
+        let result = focus_window_target_with_registry(&test_target(), &registry)
+            .await
+            .unwrap();
+
+        assert!(result.exact_window_focused);
+        assert!(result.note.contains("skipped window activation"));
+        assert_eq!(
+            *registry.activated_window_ids.lock().unwrap(),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            *registry.list_policies.lock().unwrap(),
+            vec![WindowListPolicy::Cached, WindowListPolicy::Fresh]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_different_or_failed_fresh_focus_activates_normally() {
+        let mut different = focused_test_window(11);
+        different.app_id = Some("org.example.Other".to_string());
+        let cases: [(&str, FakeWindowList); 3] = [
+            ("stale", Ok(vec![window(10, Some("org.example.App"))])),
+            ("different", Ok(vec![different])),
+            ("failed", Err("fresh focus lookup failed")),
+        ];
+
+        for (case, fresh_focus) in cases {
+            let requested = focused_test_window(10);
+            let registry = FakeWindowRegistry::new(vec![
+                Ok(vec![requested.clone()]),
+                fresh_focus,
+                Ok(vec![requested]),
+            ]);
+
+            let result = focus_window_target_with_registry(&test_target(), &registry)
+                .await
+                .unwrap();
+
+            assert!(result.exact_window_focused, "{case}");
+            assert!(
+                result.note.contains("activated the requested window"),
+                "{case}"
+            );
+            assert_eq!(
+                *registry.activated_window_ids.lock().unwrap(),
+                vec![10],
+                "{case}"
+            );
+            assert_eq!(
+                *registry.list_policies.lock().unwrap(),
+                vec![
+                    WindowListPolicy::Cached,
+                    WindowListPolicy::Fresh,
+                    WindowListPolicy::Fresh,
+                ],
+                "{case}"
+            );
+        }
+    }
+}

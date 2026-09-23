@@ -1,0 +1,2 @@
+[mcp_servers.x11-same-session-computer-use]
+command = "./bin/x11-same-session-computer-use-mcp"

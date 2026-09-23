@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "gnome-same-session-computer-use": {
+      "command": "./bin/gnome-same-session-computer-use-mcp",
+      "args": [],
+      "cwd": "."
+    }
+  }
+}

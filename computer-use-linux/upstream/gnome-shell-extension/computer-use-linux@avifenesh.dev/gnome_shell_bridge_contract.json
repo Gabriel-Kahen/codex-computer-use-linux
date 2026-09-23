@@ -1,0 +1,7 @@
+{
+  "family": "org.openai.codex.gnome-shell-bridge",
+  "contract_version": 1,
+  "window_identity": "meta-stable-sequence-v1",
+  "operation_identity": "shell-instance+window+operation-generation-v1",
+  "claim_fence": "dbus-caller+capability+lease-generation+deadline-v1"
+}
