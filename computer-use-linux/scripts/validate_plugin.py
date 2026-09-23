@@ -31,6 +31,7 @@ def read_skill(path: Path) -> tuple[dict[str, str], str]:
 
 def main() -> None:
     manifest = read_json(PLUGIN_ROOT / ".codex-plugin/plugin.json")
+    assert (PLUGIN_ROOT / "rust-toolchain.toml").read_bytes() == (REPO_ROOT / "rust-toolchain.toml").read_bytes(), "packaged Rust toolchain differs from repository"
     assert PLUGIN_ROOT.name == manifest["name"]
     prebuilt_version = (PLUGIN_ROOT / "PREBUILT_VERSION").read_text(encoding="utf-8").strip()
     assert manifest["version"] == prebuilt_version
@@ -91,6 +92,17 @@ def main() -> None:
         )
 
     marketplace = read_json(REPO_ROOT / ".agents/plugins/marketplace.json")
+    for package in marketplace["plugins"]:
+        package_root = (REPO_ROOT / package["source"]["path"]).resolve()
+        assert package_root.is_relative_to(REPO_ROOT), "plugin path leaves repository"
+        package_manifest = read_json(package_root / ".codex-plugin/plugin.json")
+        assert package_manifest["name"] == package["name"]
+        assert package_manifest["version"] == prebuilt_version, "release package versions differ"
+        package_mcp = read_json(package_root / package_manifest["mcpServers"])
+        for config in package_mcp["mcpServers"].values():
+            command = package_root / config["command"]
+            assert command.is_file() and os.access(command, os.X_OK), str(command)
+        assert (package_root / package_manifest["skills"]).is_dir()
     entry = next(item for item in marketplace["plugins"] if item["name"] == manifest["name"])
     assert entry["source"] == {"source": "local", "path": "./computer-use-linux"}
     assert entry["policy"]["installation"] == "AVAILABLE"

@@ -24,7 +24,7 @@ from .native_plugin import plugin_identity
 from .native_plugin import run_target_pointer_action
 
 
-SERVER_INFO = {"name": "same-session-computer-use", "version": "0.3.0"}
+SERVER_INFO = {"name": "same-session-computer-use", "version": json.loads((Path(__file__).resolve().parents[2] / ".codex-plugin/plugin.json").read_text())["version"]}
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", PROTOCOL_VERSION})
 # Base64 expansion must stay below the rmcp client's 8 MiB stdio line cap.

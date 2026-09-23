@@ -31,7 +31,7 @@ class McpSmokeTests(TestCase):
             check=True,
         )
         responses = {response["id"]: response for response in map(json.loads, proc.stdout.splitlines())}
-        self.assertEqual(responses[1]["result"]["serverInfo"], {"name": "plasma-same-session-computer-use", "version": "0.2.0"})
+        self.assertEqual(responses[1]["result"]["serverInfo"], {"name": "plasma-same-session-computer-use", "version": json.loads((ROOT / ".codex-plugin/plugin.json").read_text())["version"]})
         self.assertEqual(responses[1]["result"]["protocolVersion"], "2025-11-25")
         self.assertEqual(responses[3]["result"], {})
         tools = responses[2]["result"]["tools"]

@@ -6,8 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: computer-use-upstream-sync
@@ -18,9 +17,11 @@ jobs:
     if: github.repository == 'Gabriel-Kahen/codex-computer-use-linux'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      SYNC_BRANCH: codex/computer-use-upstream-sync
-      GH_TOKEN: ${{ github.token }}
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      revision: ${{ steps.candidate.outputs.revision }}
     steps:
       - name: Checkout main
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -30,69 +31,143 @@ jobs:
 
       - name: Prepare three-way upstream merge
         id: sync
+        shell: bash
         run: |
           set -euo pipefail
-          python3 -m unittest discover \
-            -s computer-use-linux/scripts/tests \
-            -p 'test_*.py' \
-            -v
-          computer-use-linux/scripts/sync_upstream.py prepare
+          mkdir -p "$RUNNER_TEMP/engine-update-diagnostics"
+          python3 -m unittest discover -s computer-use-linux/scripts/tests -p 'test_*.py' -v
+          python3 computer-use-linux/scripts/sync_upstream.py prepare 2>&1 | tee "$RUNNER_TEMP/engine-update-diagnostics/prepare.log"
           if [[ -z "$(git status --porcelain -- computer-use-linux)" ]]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install Rust
-        if: steps.sync.outputs.changed == 'true'
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Save merge diagnostics
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/engine-update-diagnostics"
+          git diff -- computer-use-linux > "$RUNNER_TEMP/engine-update-diagnostics/candidate.patch"
+          git status --short > "$RUNNER_TEMP/engine-update-diagnostics/status.txt"
+
+      - name: Upload merge diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          components: clippy,rustfmt
+          name: engine-update-diagnostics
+          path: ${{ runner.temp }}/engine-update-diagnostics/
+          retention-days: 14
 
-      - name: Install Linux build dependencies
+      - name: Stage candidate for complete verification
         if: steps.sync.outputs.changed == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libdbus-1-dev pkg-config
-
-      - name: Verify merged backend
-        if: steps.sync.outputs.changed == 'true'
-        run: |
-          cargo fmt --manifest-path computer-use-linux/upstream/Cargo.toml --all -- --check
-          cargo clippy --locked --manifest-path computer-use-linux/upstream/Cargo.toml --all-targets -- -D warnings
-          cargo test --locked --manifest-path computer-use-linux/upstream/Cargo.toml --all-targets
-          cargo build --locked --manifest-path computer-use-linux/upstream/Cargo.toml --bin computer-use-linux
-          python3 computer-use-linux/upstream/scripts/mcp_safety_check.py \
-            --repo computer-use-linux/upstream \
-            --binary computer-use-linux/upstream/target/debug/computer-use-linux
-
-      - name: Open or update draft review PR
-        if: steps.sync.outputs.changed == 'true'
+        id: candidate
+        env:
+          CANDIDATE_BRANCH: automation/engine-upstream-candidate
         run: |
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git switch -C "$SYNC_BRANCH"
+          git switch -C "$CANDIDATE_BRANCH"
           git add computer-use-linux
-          git commit -m 'chore(computer-use): sync agent-sh upstream'
+          git commit -m 'chore(engine): update pinned agent-sh upstream'
+          lease="$(git ls-remote --heads origin "refs/heads/$CANDIDATE_BRANCH" | cut -f1)"
+          git push --force-with-lease="refs/heads/$CANDIDATE_BRANCH:$lease" origin "HEAD:refs/heads/$CANDIDATE_BRANCH"
+          revision="$(git rev-parse HEAD)"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "Candidate revision: $revision" >> "$GITHUB_STEP_SUMMARY"
 
-          if git ls-remote --exit-code --heads origin "refs/heads/$SYNC_BRANCH" >/dev/null; then
-            git fetch origin "$SYNC_BRANCH:refs/remotes/origin/$SYNC_BRANCH"
-            lease="$(git rev-parse "refs/remotes/origin/$SYNC_BRANCH")"
-            git push --force-with-lease="refs/heads/$SYNC_BRANCH:$lease" origin "HEAD:refs/heads/$SYNC_BRANCH"
-          else
-            git push origin "HEAD:refs/heads/$SYNC_BRANCH"
-          fi
+  verify:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    uses: ./.github/workflows/computer-use-ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.revision }}
 
-          body='This draft was prepared by the repository-owned three-way updater. It merges the latest `agent-sh/computer-use-linux` source with the Codex Linux patch set and passed backend format, Clippy, tests, and MCP schema safety checks. It is never merged automatically. Review Linux behavior and the pinned revision in `computer-use-linux/UPSTREAM.toml`.'
+  verify-hyprland:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    uses: ./.github/workflows/hyprland-native-e2e.yml
+    with:
+      ref: ${{ needs.prepare.outputs.revision }}
+
+  verify-stock-codex:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    uses: ./.github/workflows/stock-codex-compat.yml
+    with:
+      ref: ${{ needs.prepare.outputs.revision }}
+
+  publish:
+    needs: [prepare, verify, verify-hyprland, verify-stock-codex]
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      SYNC_BRANCH: automation/engine-upstream-sync
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout verified candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.revision }}
+
+      - name: Open or update draft review PR
+        env:
+          VERIFIED_REVISION: ${{ needs.prepare.outputs.revision }}
+        run: |
+          set -euo pipefail
+          lease="$(git ls-remote --heads origin "refs/heads/$SYNC_BRANCH" | cut -f1)"
+          git push --force-with-lease="refs/heads/$SYNC_BRANCH:$lease" origin "HEAD:refs/heads/$SYNC_BRANCH"
+          cat > "$RUNNER_TEMP/upstream-pr.md" <<'EOF'
+          Updates the pinned `agent-sh/computer-use-linux` engine using a three-way merge that retains this project's local patches.
+
+          The candidate passed backend formatting, Clippy, tests, MCP contract checks, desktop companion tests, native X11/Plasma checks, the real Hyprland VM test, and stock Codex compatibility. These checks run explicitly before publication because PRs created with `GITHUB_TOKEN` do not trigger pull-request workflows.
+
+          Review the local patch behavior and `computer-use-linux/UPSTREAM.toml`. This update is never merged automatically.
+          EOF
+          printf '\nVerified commit: `%s`\n\n[Validation run](%s/%s/actions/runs/%s).\n' "$VERIFIED_REVISION" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> "$RUNNER_TEMP/upstream-pr.md"
           pr="$(gh pr list --state open --head "$SYNC_BRANCH" --json number --jq '.[0].number // empty')"
           if [[ -z "$pr" ]]; then
-            gh pr create \
-              --draft \
-              --base main \
-              --head "$SYNC_BRANCH" \
-              --title 'chore(computer-use): sync agent-sh upstream' \
-              --body "$body"
+            gh pr create --draft --base main --head "$SYNC_BRANCH" \
+              --title 'chore(engine): update pinned agent-sh upstream' --body-file "$RUNNER_TEMP/upstream-pr.md"
           else
-            gh pr edit "$pr" --title 'chore(computer-use): sync agent-sh upstream' --body "$body"
+            if [[ "$(gh pr view "$pr" --json isDraft --jq .isDraft)" == "false" ]]; then
+              gh pr ready "$pr" --undo
+            fi
+            gh pr edit "$pr" --title 'chore(engine): update pinned agent-sh upstream' --body-file "$RUNNER_TEMP/upstream-pr.md"
           fi
+
+      - name: Dispatch checks on the PR commit
+        run: |
+          # Reusable verification above attaches checks to the caller's main SHA.
+          # Explicit dispatch attaches required checks to the actual PR branch.
+          gh workflow run computer-use-ci.yml --ref "$SYNC_BRANCH"
+          gh workflow run hyprland-native-e2e.yml --ref "$SYNC_BRANCH"
+          gh workflow run stock-codex-compat.yml --ref "$SYNC_BRANCH"
+
+  report-health:
+    needs: [prepare, verify, verify-hyprland, verify-stock-codex, publish]
+    if: always() && github.repository == 'Gabriel-Kahen/codex-computer-use-linux'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout maintenance reporter
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: main
+
+      - name: Report failure or close recovered issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_JOB_RESULTS: ${{ toJSON(needs) }}
+          UPDATE_FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: python3 scripts/report_upstream_health.py --failed "$UPDATE_FAILED"

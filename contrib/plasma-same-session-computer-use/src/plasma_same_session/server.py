@@ -12,7 +12,7 @@ from . import focus_lease
 from . import kwin
 
 
-SERVER_INFO = {"name": "plasma-same-session-computer-use", "version": "0.2.0"}
+SERVER_INFO = {"name": "plasma-same-session-computer-use", "version": json.loads((Path(__file__).resolve().parents[2] / ".codex-plugin/plugin.json").read_text())["version"]}
 PROTOCOL_VERSION = "2025-11-25"
 # Base64 expansion must stay below the rmcp client's 8 MiB stdio line cap.
 MAX_CAPTURE_BYTES = 5 * 1024 * 1024

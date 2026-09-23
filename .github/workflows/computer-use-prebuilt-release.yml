@@ -6,6 +6,11 @@ on:
       - .agents/plugins/marketplace.json
       - .github/workflows/computer-use-prebuilt-release.yml
       - computer-use-linux/**
+      - contrib/**
+      - scripts/**
+      - .github/workflows/stock-codex-compat.yml
+      - .github/workflows/computer-use-ci.yml
+      - .github/workflows/hyprland-native-e2e.yml
   push:
     tags:
       - computer-use-v*
@@ -18,6 +23,13 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  shared-ci:
+    uses: ./.github/workflows/computer-use-ci.yml
+  stock-codex:
+    uses: ./.github/workflows/stock-codex-compat.yml
+  hyprland:
+    uses: ./.github/workflows/hyprland-native-e2e.yml
+
   metadata:
     name: Validate release metadata
     runs-on: ubuntu-22.04
@@ -62,7 +74,7 @@ jobs:
 
   build:
     name: Build bundle (${{ matrix.target }})
-    needs: metadata
+    needs: [metadata, shared-ci, stock-codex, hyprland]
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     strategy:
@@ -130,6 +142,7 @@ jobs:
             contrib/plasma-same-session-computer-use \
             contrib/x11-background-computer-use \
             .agents/plugins/marketplace.json \
+            LICENSE NOTICE README.md MIGRATION.md CHANGELOG.md rust-toolchain.toml docs scripts/install_release.py scripts/stock-codex/package.json \
             | tar -x -C "$stage/root"
           prebuilt="$stage/root/computer-use-linux/prebuilt/$TARGET"
           mkdir -p "$prebuilt"
@@ -141,7 +154,9 @@ jobs:
             sha256sum computer-use-linux computer-use-linux-cosmic > SHA256SUMS
           )
           archive="codex-computer-use-linux-$VERSION-$TARGET.tar.gz"
-          tar --owner=0 --group=0 --numeric-owner -czf "$archive" -C "$stage/root" .
+          epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+            -cf - -C "$stage/root" . | gzip -n > "$archive"
           sha256sum "$archive" > "$archive.sha256"
           mkdir dist
           mv "$archive" "$archive.sha256" dist/
@@ -222,6 +237,9 @@ jobs:
       - attest
       - metadata
       - build
+      - shared-ci
+      - stock-codex
+      - hyprland
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:

@@ -36,7 +36,7 @@ except (ImportError, ValueError):
     GLib = None
 
 
-SERVER_INFO = {"name": "gnome-same-session-computer-use", "version": "0.2.0"}
+SERVER_INFO = {"name": "gnome-same-session-computer-use", "version": json.loads((Path(__file__).resolve().parents[2] / ".codex-plugin/plugin.json").read_text())["version"]}
 PROTOCOL_VERSION = "2025-11-25"
 MAX_MCP_STDOUT_LINE_BYTES = 8 * 1024 * 1024
 MAX_CAPTURE_PNG_BYTES = 5 * 1024 * 1024

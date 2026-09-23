@@ -1,6 +1,6 @@
 {
   "name": "x11-background-computer-use",
-  "version": "0.2.0",
+  "version": "0.6.0",
   "description": "Parallel claimed-window capture and guarded same-session input for EWMH Xorg desktops.",
   "author": {
     "name": "Gabe",

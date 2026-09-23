@@ -1,7 +1,6 @@
 # Linux Computer Use for Codex
 
-This directory is the source-owned Linux Computer Use plugin for this Codex
-fork. It keeps the generic Linux engine, Codex packaging, and Codex-only browser
+This directory is the source-owned Linux Computer Use plugin for stock Codex. It keeps the generic Linux engine, Codex packaging, and Codex-only browser
 integration in explicit layers:
 
 | Path | Ownership | Purpose |

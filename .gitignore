@@ -1,0 +1,11 @@
+**/target/
+**/__pycache__/
+*.py[cod]
+*.so
+.venv/
+dist/
+.cache/
+work/
+**/node_modules/
+result
+result-*

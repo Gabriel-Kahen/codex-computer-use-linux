@@ -1,6 +1,6 @@
 {
   "name": "same-session-computer-use",
-  "version": "0.3.0",
+  "version": "0.6.0",
   "description": "Add resilient background capture and window-targeted input for Codex on Hyprland.",
   "author": {
     "name": "Gabe",

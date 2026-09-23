@@ -1,0 +1,85 @@
+name: stock-codex-compat
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 7 * * 1"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact candidate revision to validate
+        type: string
+        default: ""
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stock-codex-compat-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  official-codex:
+    name: Official Codex MCP and model-visible images
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        codex: [pinned, latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "22.22.0"
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Install build dependencies and official Codex
+        id: codex
+        env:
+          CHANNEL: ${{ matrix.codex }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libdbus-1-dev pkg-config
+          if [[ "$CHANNEL" == pinned ]]; then
+            npm ci --prefix scripts/stock-codex --ignore-scripts --no-audit --no-fund
+            version="$(node -p 'require("./scripts/stock-codex/package.json").dependencies["@openai/codex"]')"
+            binary="$PWD/scripts/stock-codex/node_modules/.bin/codex"
+          else
+            version="$(npm view @openai/codex version)"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            npm install --prefix "$RUNNER_TEMP/latest-codex" --save-exact \
+              --ignore-scripts --no-audit --no-fund "@openai/codex@$version"
+            binary="$RUNNER_TEMP/latest-codex/node_modules/.bin/codex"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+      - name: Build real plugin engine
+        env:
+          CODEX_COMPUTER_USE_LINUX_TARGET_DIR: ${{ runner.temp }}/computer-use-target
+        run: computer-use-linux/bin/codex-computer-use --build-only
+      - name: Test official Codex with real plugin and synthetic image
+        env:
+          CODEX_BINARY: ${{ steps.codex.outputs.binary }}
+          EXPECTED_VERSION: ${{ steps.codex.outputs.version }}
+          CODEX_COMPUTER_USE_LINUX_TARGET_DIR: ${{ runner.temp }}/computer-use-target
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_stock_codex_compat.py' -v
+          python3 scripts/stock_codex_compat.py \
+            --codex "$CODEX_BINARY" --expected-version "$EXPECTED_VERSION" \
+            | tee stock-codex-compat.json
+      - name: Save compatibility evidence
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: stock-codex-compat-${{ github.run_id }}-${{ matrix.codex }}
+          path: stock-codex-compat.json
+          if-no-files-found: error

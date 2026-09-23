@@ -1,10 +1,15 @@
 Codex Computer Use on Linux
 Copyright 2026 Gabriel Kahen
 
-This product includes software derived from OpenAI Codex.
-OpenAI Codex
-Copyright 2025 OpenAI
+Extracted from Gabriel-Kahen/codex-computer-use-linux at
+e8d4ff733c6caf04f16c47260c708000270050d7. The original Codex fork is retained
+at Gabriel-Kahen/codex-computer-use-linux-legacy. The Codex CLI, TUI, and
+app-server sources are not distributed in this standalone repository.
 
-This project includes code derived from [Ratatui](https://github.com/ratatui/ratatui), licensed under the MIT license.
-Copyright (c) 2016-2022 Florian Dehau
-Copyright (c) 2023-2025 The Ratatui Developers
+Linux engine and selected native integration code are derived from
+agent-sh/computer-use-linux (Avi Fenesh and contributors) and
+ilysenko/codex-desktop-linux, under their retained MIT license and notices.
+See computer-use-linux/LICENSE and computer-use-linux/UPSTREAM.toml.
+
+Codex-specific integration has lineage from OpenAI Codex, Copyright 2025 OpenAI.
+All original copyright and license notices remain applicable to their code.

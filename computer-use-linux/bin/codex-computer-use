@@ -18,13 +18,13 @@ build_from_source() {
         exit 1
     fi
 
-    CARGO_TARGET_DIR="$target_dir" cargo build \
+    (cd "$root" && CARGO_TARGET_DIR="$target_dir" cargo build \
         --locked \
         --release \
         --manifest-path "$manifest" \
         --bin computer-use-linux \
         --bin computer-use-linux-cosmic \
-        --quiet
+        --quiet)
 }
 
 if [ "${1:-}" = "--build-only" ]; then

@@ -29,7 +29,7 @@ from .coordination import MIN_LEASE_SECONDS
 from .coordination import WindowClaimStore
 
 
-SERVER_INFO = {"name": "x11-same-session-computer-use", "version": "0.2.0"}
+SERVER_INFO = {"name": "x11-same-session-computer-use", "version": json.loads((Path(__file__).resolve().parents[2] / ".codex-plugin/plugin.json").read_text())["version"]}
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2024-11-05", "2025-03-26", "2025-06-18", PROTOCOL_VERSION})
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "x11-same-session-computer-use"

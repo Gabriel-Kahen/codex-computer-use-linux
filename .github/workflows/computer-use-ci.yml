@@ -6,54 +6,22 @@ on:
     branches:
       - main
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact candidate revision to validate
+        type: string
+        default: ""
+        required: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: computer-use-ci-${{ github.ref }}
+  group: computer-use-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  codex-sync:
-    name: Codex sync integration
-    if: >-
-      (github.event_name == 'pull_request' &&
-        (github.head_ref == 'automation/upstream-sync' || startsWith(github.head_ref, 'codex/upstream-sync-'))) ||
-      (github.event_name == 'workflow_dispatch' &&
-        (github.ref_name == 'automation/upstream-sync' || startsWith(github.ref_name, 'codex/upstream-sync-')))
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: codex-rs
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - uses: ./.github/actions/setup-ci
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-
-      - name: Install nextest
-        uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
-        with:
-          tool: nextest
-          version: 0.9.103
-
-      - name: Test sync conflict resolutions
-        run: |
-          just test -p codex-protocol
-          just test -p codex-utils-output-truncation
-          just test -p codex-core -E 'test(for_prompt_strips_media_when_model_does_not_support_it) | test(record_items_preserves_supported_audio_tool_output) | test(record_items_hard_caps_oversized_audio_tool_output) | test(audio_data_url_payload_uses_decoded_audio_estimate) | test(for_prompt_removes_pairs_with_oversized_output_envelopes)'
-
-      - name: Test upstream conflict notification policy
-        working-directory: .
-        run: python3 .github/scripts/tests/test_upstream_sync_conflict_policy.py -v
-
   linux-backend:
     name: Linux backend and plugin
     runs-on: ubuntu-latest
@@ -63,6 +31,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
@@ -73,6 +42,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libdbus-1-dev pkg-config
+
+      - name: Test maintenance failure reporting
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
 
       - name: Validate plugin and provenance
         run: |
@@ -110,6 +82,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Compile and test Hyprland computer use
         env:

@@ -632,7 +632,7 @@ class StatusTests(TestCase):
         self.assertEqual(
             result["versions"],
             {
-                "companion": "0.3.0",
+                "companion": server.SERVER_INFO["version"],
                 "native_extension_expected": native_plugin.NATIVE_PLUGIN_VERSION,
                 "native_extension_loaded": native_plugin.NATIVE_PLUGIN_VERSION,
                 "native_source_sha256_expected": expected["source_sha256"],
@@ -772,7 +772,7 @@ class StatusTests(TestCase):
                 "note": "Availability is unknown because semantic actions are provided by a separate MCP server.",
             },
         )
-        self.assertEqual(result["versions"]["companion"], "0.3.0")
+        self.assertEqual(result["versions"]["companion"], server.SERVER_INFO["version"])
         self.assertEqual(
             result["versions"]["native_extension_expected"],
             native_plugin.NATIVE_PLUGIN_VERSION,

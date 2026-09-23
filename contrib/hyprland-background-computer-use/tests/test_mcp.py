@@ -46,7 +46,7 @@ class RepositorySmokeTests(TestCase):
         responses = {response["id"]: response for response in map(json.loads, proc.stdout.splitlines())}
 
         self.assertEqual(responses[1]["result"]["protocolVersion"], "2025-11-25")
-        self.assertEqual(responses[1]["result"]["serverInfo"]["version"], "0.3.0")
+        self.assertEqual(responses[1]["result"]["serverInfo"]["version"], server.SERVER_INFO["version"])
         self.assertIn("separate Computer Use plugin", responses[1]["result"]["instructions"])
         self.assertEqual(responses[3]["result"], {})
         tools = responses[2]["result"]["tools"]

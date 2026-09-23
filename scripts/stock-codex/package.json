@@ -1,0 +1,9 @@
+{
+  "name": "computer-use-stock-codex-compat",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Official Codex binary used only by compatibility CI",
+  "dependencies": {
+    "@openai/codex": "0.156.1"
+  }
+}
