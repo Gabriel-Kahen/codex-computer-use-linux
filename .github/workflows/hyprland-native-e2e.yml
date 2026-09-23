@@ -2,15 +2,9 @@ name: hyprland-native-e2e
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/hyprland-native-e2e.yml"
-      - "contrib/hyprland-background-computer-use/**"
   push:
     branches:
       - main
-    paths:
-      - ".github/workflows/hyprland-native-e2e.yml"
-      - "contrib/hyprland-background-computer-use/**"
   schedule:
     - cron: "23 8 * * 1"
   workflow_dispatch:

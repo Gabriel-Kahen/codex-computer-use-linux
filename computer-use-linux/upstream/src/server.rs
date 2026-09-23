@@ -2461,12 +2461,12 @@ impl ComputerUseLinux {
                     Err(command_output_error("wtype", output))
                 }
             });
-            return Json(action_result_with_focus(
-                "type_text",
-                result,
-                received,
-                focus,
-            ));
+            let mut output = action_result_with_focus("type_text", result, received, focus.clone());
+            if output.ok && focus.is_some() {
+                let notes = self.input_landing_notes(focus.as_ref(), true).await;
+                output = with_notes(output, notes);
+            }
+            return Json(output);
         }
         let result = run_ydotool_type_text(&params.text)
             .await
@@ -6051,6 +6051,7 @@ async fn run_xdotool_with_timeout(
     let mut command = TokioCommand::new("xdotool");
     command.args(args);
     command.kill_on_drop(true);
+    command.process_group(0);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
